@@ -1,0 +1,33 @@
+# TP_tester: mount projects and TP_tester, optional X11 for viewer
+# Usage:
+#   docker-compose run --rm tp_tester ./run_baseline.sh
+#   docker-compose run --rm tp_tester ./run_test.sh
+#   docker-compose run --rm -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix tp_tester ./run_viewer.sh
+
+version: "3"
+
+services:
+  tp_tester:
+    build: .
+    image: tp_tester:latest
+    # ホストの UID/GID で実行し、作成される baseline_results / test_results をホスト側でそのまま使えるようにする
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - "${HOME}/projects:/home/nissan/projects"
+      - "${HOME}/TP_tester:/home/nissan/TP_tester"
+      - "/media/nissan:/media/nissan"
+    environment:
+      - DISPLAY=${DISPLAY}
+      - TP_TESTER_ROOT=/home/nissan/TP_tester
+      - NRC_WS_DEVEL=/home/nissan/projects/nrc_ws/devel/setup.bash
+      # Docker イメージに nrc_ws のビルド依存（PCL 等）が入っていないため 1 でスキップ。commit とバイナリを一致させるには実行直前にホストで catkin_make --pkg nrc_wm_svcs すること。
+      - TP_SKIP_BUILD=1
+      # ホストで run_baseline.sh/run_test.sh が取得した commit をコンテナに渡す（environment 指定時は明示しないと渡らない）
+      - TP_BASELINE_COMMIT=${TP_BASELINE_COMMIT:-}
+      - TP_TEST_COMMIT=${TP_TEST_COMMIT:-}
+      # 非 root 実行時も .ros 等を書き込めるよう HOME をマウント先に
+      - HOME=/home/nissan/TP_tester
+    working_dir: /home/nissan/TP_tester
+    stdin_open: true
+    tty: true
+    command: ["./run_viewer.sh"]

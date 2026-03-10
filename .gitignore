@@ -1,0 +1,26 @@
+# ignore contents of test directories but keep the directory
+test_bags*/**
+baseline_results*/**
+test_results*/**
+
+# keep the directories themselves
+!test_bags*/
+!baseline_results*/
+!test_results*/
+
+# keep a placeholder file
+!test_bags*/.gitkeep
+!baseline_results*/.gitkeep
+!test_results*/.gitkeep
+
+# ROS runtime
+.ros/
+
+# catkin / colcon build
+build/
+devel/
+install/
+log/
+
+# logs
+*.log

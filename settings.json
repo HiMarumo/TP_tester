@@ -1,0 +1,31 @@
+{
+  "rosparam": {
+    "use_sim_time": true,
+    "map_name": "new_MM_map"
+  },
+  "record_topics": [
+    "/WM/tracked_object_set_with_prediction",
+    "/WM/along_object_set_with_prediction",
+    "/WM/crossing_object_set_with_prediction",
+    "/WM/oncoming_object_set_with_prediction",
+    "/WM/other_object_set_with_prediction",
+    "/viz/su/multi_lane_ids_set",
+    "/viz/su/crossing_lane_ids_set",
+    "/viz/su/opposite_lane_ids_set",
+    "/viz/su/ym0_converted_traffic_light_state"
+  ],
+  "paths": {
+    "nrc_ws_devel": "/home/nissan/projects/nrc_ws/devel/setup.bash",
+    "test_bags": "test_bags",
+    "baseline_results": "baseline_results",
+    "test_results": "test_results"
+  },
+  "node": {
+    "trajectory_predictor_repo": "nrc_wm",
+    "trajectory_predictor_pkg": "nrc_wm_svcs",
+    "trajectory_predictor_node": "trajectory_predictor_sim",
+    "viewer_pkg": "nrc_svcs",
+    "viewer_node": "TrajectoryPredictorViewer",
+    "viewer_validation_node": "TrajectoryPredictorViewer_validation"
+  }
+}
