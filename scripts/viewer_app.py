@@ -100,7 +100,15 @@ DISPLAY_MODE_LABELS = [
     "Diff opposite path",
     "Diff crossing path",
     "Diff other path",
+    "Observed",
+    "Compare obs-baseline along",
+    "Compare obs-test along",
+    "Compare obs-baseline opposite",
+    "Compare obs-test opposite",
+    "Compare obs-baseline crossing",
+    "Compare obs-test crossing",
 ]
+VALIDATION_OBSERVED_NS = "/validation/observed"
 
 
 class KeepSelectionColorDelegate(QStyledItemDelegate):
@@ -665,6 +673,8 @@ class ViewerAppPyQt(QMainWindow):
             if param:
                 viewer_args.append(f"_{param}:={VALIDATION_BASELINE_NS}{topic}")
                 viewer_args.append(f"_test_{param}:={VALIDATION_TEST_NS}{topic}")
+                if topic.startswith("/WM/"):
+                    viewer_args.append(f"_observed_{param}:={VALIDATION_OBSERVED_NS}{topic}")
         self.viewer_proc = subprocess.Popen(
             viewer_args,
             env=os.environ.copy(),
@@ -737,6 +747,7 @@ class ViewerAppPyQt(QMainWindow):
         self.current_rel = rel
         set_viewer_rosparams(self.settings)
         baseline_bag = self.baseline_root / rel / "result_baseline.bag"
+        observed_bag = self.baseline_root / rel / "observed.bag"
         test_bag = self.test_results_root / rel / "result_test.bag"
         out_dir = self.test_results_root / rel
         common_bag = out_dir / "common.bag"
@@ -753,6 +764,8 @@ class ViewerAppPyQt(QMainWindow):
         extra_bags = get_bag_files_in_dir(test_bags_dir) if test_bags_dir.is_dir() else []
         play_bags = [str(b) for b in extra_bags]
         play_bags.append(str(baseline_bag))
+        if observed_bag.exists():
+            play_bags.append(str(observed_bag))
         if test_bag.exists():
             play_bags.append(str(test_bag))
         if common_bag.exists():
