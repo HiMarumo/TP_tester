@@ -3,6 +3,9 @@
     "use_sim_time": true,
     "map_name": "new_MM_map"
   },
+  "offline": {
+    "map_name": "new_MM_map"
+  },
   "record_topics": [
     "/WM/tracked_object_set_with_prediction",
     "/WM/along_object_set_with_prediction",

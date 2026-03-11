@@ -7,12 +7,12 @@ import copy
 import json
 import math
 import os
-import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 from common import (
+    check_offline_binary_supports_map_name,
     VALIDATION_BASELINE_NS,
     discover_bag_directories,
     get_bag_files_in_dir,
@@ -83,6 +83,27 @@ TP_EGO_FORWARD_OFFSET_M = 1.93
 TP_EGO_LENGTH_M = 4.7
 TP_EGO_WIDTH_M = 1.85
 TP_EGO_CLASSIFICATION_CAR = 4  # TrackedObject2 classification: 4=Car
+
+
+def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> None:
+    if total <= 0:
+        return
+    percent = int((done * 100) / total)
+    last_percent = state.get("last_percent", -1)
+    if percent == last_percent and done < total:
+        return
+    state["last_percent"] = percent
+    width = 30
+    fill = int((done * width) / total)
+    bar = "#" * fill + "-" * (width - fill)
+    print(
+        f"\r{prefix} [{bar}] {percent}% ({done}/{total})",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    if done >= total:
+        print(file=sys.stderr, flush=True)
 
 
 def _map_tp_internal_id_to_output_id(object_id: int) -> int:
@@ -482,6 +503,13 @@ def _build_observed_bag_from_input(
     group_ids_by_stamp = _collect_group_ids_by_stamp_from_result(result_bag, result_ns)
 
     observed_base_records: list[tuple] = []
+    observed_build_progress_state = {"last_percent": -1}
+    _print_progress_line(
+        f"[observed] {observed_bag.name} build",
+        0,
+        len(records),
+        observed_build_progress_state,
+    )
     for i, rec in enumerate(records):
         anchor_msg = rec["msg"]
         anchor_stamp_ns = rec["stamp_ns"]
@@ -667,6 +695,12 @@ def _build_observed_bag_from_input(
             observed_msg.objects.append(out_obj)
 
         observed_base_records.append((rec["t"], observed_msg))
+        _print_progress_line(
+            f"[observed] {observed_bag.name} build",
+            i + 1,
+            len(records),
+            observed_build_progress_state,
+        )
 
     observed_topics = {
         "base": f"{observed_ns}{WM_TOPIC_SUFFIXES[0]}",
@@ -677,8 +711,15 @@ def _build_observed_bag_from_input(
     }
 
     observed_bag.parent.mkdir(parents=True, exist_ok=True)
+    observed_write_progress_state = {"last_percent": -1}
+    _print_progress_line(
+        f"[observed] {observed_bag.name} write",
+        0,
+        len(observed_base_records),
+        observed_write_progress_state,
+    )
     with rosbag.Bag(str(observed_bag), "w") as out_bag:
-        for t, base_msg in observed_base_records:
+        for idx, (t, base_msg) in enumerate(observed_base_records, start=1):
             out_bag.write(observed_topics["base"], base_msg, t)
 
             header = getattr(base_msg, "header", None)
@@ -698,6 +739,12 @@ def _build_observed_bag_from_input(
                         if oid in keep_ids:
                             group_msg.objects.append(copy.deepcopy(obj))
                 out_bag.write(observed_topics[group], group_msg, t)
+            _print_progress_line(
+                f"[observed] {observed_bag.name} write",
+                idx,
+                len(observed_base_records),
+                observed_write_progress_state,
+            )
 
     return source_topic
 
@@ -708,7 +755,13 @@ def main() -> int:
     paths = settings["paths"]
     test_bags_root = root / paths["test_bags"]
     baseline_root = root / paths["baseline_results"]
-    rosparam = settings.get("rosparam", {})
+    offline_cfg = settings.get("offline", {})
+    map_name = str(
+        offline_cfg.get("map_name")
+        or settings.get("rosparam", {}).get("map_name")
+        or "new_MM_map"
+    )
+    offline_timeout_sec = float(offline_cfg.get("timeout_sec", 600))
     node_cfg = settings.get("node", {})
     pkg = node_cfg.get("trajectory_predictor_pkg", "nrc_wm_svcs")
     node_name = node_cfg.get("trajectory_predictor_node", "trajectory_predictor")
@@ -745,18 +798,7 @@ def main() -> int:
         print("No bag directories found under", test_bags_root, file=sys.stderr)
         return 1
 
-    # 2. use_sim_time / map_name はノード起動前に1回だけ設定（use_sim_time は ros::init() 前でないと効かない）
-    use_sim = str(rosparam.get("use_sim_time", True)).lower()
-    subprocess.run(
-        ["rosparam", "set", "/use_sim_time", use_sim],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["rosparam", "set", "/map_name", rosparam.get("map_name", "new_MM_map")],
-        check=True, capture_output=True,
-    )
-    r = subprocess.run(["rosparam", "get", "/use_sim_time"], capture_output=True, text=True, timeout=5)
-    print(f"[baseline] /use_sim_time = {r.stdout.strip() if r.returncode == 0 else 'get failed'} (offline executable will use this)")
+    print(f"[baseline] map_name = {map_name} (--map-name)")
 
     if not use_sim_offline:
         print(
@@ -764,6 +806,16 @@ def main() -> int:
             " trajectory_predictor_sim_offline を設定してください。",
             file=sys.stderr,
         )
+        return 1
+    supports_map_name, detail = check_offline_binary_supports_map_name(pkg, node_name)
+    if not supports_map_name:
+        print(
+            "[baseline] 実行バイナリが必須オプション（--map-name / --runtime-file）非対応です。"
+            " 新実装が反映されていないため、TP_SKIP_BUILD=0 で再ビルドしてください。",
+            file=sys.stderr,
+        )
+        if detail:
+            print(f"[baseline] detail: {detail}", file=sys.stderr)
         return 1
 
     for rel, dir_path in dirs:
@@ -799,6 +851,8 @@ def main() -> int:
             input_bags=selected_bags,
             output_bag=out_bag,
             output_ns=VALIDATION_BASELINE_NS,
+            map_name=map_name,
+            timeout_sec=offline_timeout_sec,
         )
         if run_log:
             (out_dir / "tp_run.log").write_text(run_log, encoding="utf-8")
@@ -815,6 +869,11 @@ def main() -> int:
         if rc != 0:
             (out_dir / "segfault").touch()
             (out_dir / "tp_returncode").write_text(str(rc), encoding="utf-8")
+            if rc == 124:
+                print(
+                    f"[baseline] {rel}: trajectory_predictor_sim_offline timeout ({offline_timeout_sec}s)",
+                    file=sys.stderr,
+                )
             print(
                 f"[baseline] {rel}: trajectory_predictor_sim_offline failed (returncode={rc})",
                 file=sys.stderr,

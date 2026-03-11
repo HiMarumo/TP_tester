@@ -10,6 +10,7 @@ from pathlib import Path
 
 from common import (
     VALIDATION_TEST_NS,
+    check_offline_binary_supports_map_name,
     discover_bag_directories,
     get_bag_files_in_dir,
     get_commit_info_for_run,
@@ -34,7 +35,12 @@ def main() -> int:
     paths = settings["paths"]
     test_bags_root = root / paths["test_bags"]
     test_results_root = root / paths["test_results"]
-    rosparam = settings.get("rosparam", {})
+    offline_cfg = settings.get("offline", {})
+    map_name = str(
+        offline_cfg.get("map_name")
+        or settings.get("rosparam", {}).get("map_name")
+        or "new_MM_map"
+    )
     node_cfg = settings.get("node", {})
     pkg = node_cfg.get("trajectory_predictor_pkg", "nrc_wm_svcs")
     node_name = node_cfg.get("trajectory_predictor_node", "trajectory_predictor")
@@ -69,17 +75,7 @@ def main() -> int:
         json.dump(commit_info, f, indent=2, ensure_ascii=False)
     print(f"[test] commit: {commit_info.get('commit', 'unknown')} ({commit_info.get('describe', '')})")
 
-    use_sim = str(rosparam.get("use_sim_time", True)).lower()
-    subprocess.run(
-        ["rosparam", "set", "/use_sim_time", use_sim],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["rosparam", "set", "/map_name", rosparam.get("map_name", "new_MM_map")],
-        check=True, capture_output=True,
-    )
-    r = subprocess.run(["rosparam", "get", "/use_sim_time"], capture_output=True, text=True, timeout=5)
-    print(f"[test] /use_sim_time = {r.stdout.strip() if r.returncode == 0 else 'get failed'} (offline executable will use this)")
+    print(f"[test] map_name = {map_name} (--map-name)")
 
     if not use_sim_offline:
         print(
@@ -87,6 +83,16 @@ def main() -> int:
             " trajectory_predictor_sim_offline を設定してください。",
             file=sys.stderr,
         )
+        return 1
+    supports_map_name, detail = check_offline_binary_supports_map_name(pkg, node_name)
+    if not supports_map_name:
+        print(
+            "[test] 実行バイナリが必須オプション（--map-name / --runtime-file）非対応です。"
+            " 新実装が反映されていないため、TP_SKIP_BUILD=0 で再ビルドしてください。",
+            file=sys.stderr,
+        )
+        if detail:
+            print(f"[test] detail: {detail}", file=sys.stderr)
         return 1
 
     for rel, dir_path in dirs:
@@ -120,6 +126,7 @@ def main() -> int:
             input_bags=selected_bags,
             output_bag=out_bag,
             output_ns=VALIDATION_TEST_NS,
+            map_name=map_name,
         )
         if run_log:
             (out_dir / "tp_run.log").write_text(run_log, encoding="utf-8")

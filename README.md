@@ -91,7 +91,7 @@ cd ~/TP_tester
 | 役割 | 説明 |
 |------|------|
 | **test_bags/** | 入力 bag。次のいずれかの構造で配置。同一ディレクトリ内の複数 bag は同時再生される。<br>・**2階層**: `<日付>/<時刻>/*.bag`（例: `2026-03-09/11-12-34/*.bag`）<br>・**1階層**: `<名前>/*.bag`（例: `C28-06_OR_20250101-120000/*.bag`。`C28-06` 部分は可変） |
-| **settings.json** | `paths.nrc_ws_devel`（nrc_ws の devel/setup.bash）、`rosparam`（use_sim_time, map_name 等）、`record_topics`、ノード名などを指定。 |
+| **settings.json** | `paths.nrc_ws_devel`（nrc_ws の devel/setup.bash）、`offline.map_name`（`trajectory_predictor_sim_offline` に `--map-name` で渡す）、`record_topics`、ノード名などを指定。 |
 | **baseline_results/** | ベースライン記録。`<日付>/<時刻>/result_baseline.bag` とルートに `commit_info.json`。 |
 | **test_results/** | テスト記録と比較結果。`<日付>/<時刻>/result_test.bag` と `comparison.json`、ルートに `commit_info.json`。 |
 
@@ -122,7 +122,7 @@ source /home/nissan/projects/nrc_ws/devel/setup.bash   # または NRC_WS_DEVEL 
 ./run_viewer.sh     # 検証結果ビューア
 ```
 
-ROS master（roscore）が必要です。各 `run_*.sh` は roscore が無い場合に自前で起動します。
+`run_baseline.sh` / `run_test.sh`（offline実行）は ROS master 不要です。`run_viewer.sh` は ROS master が必要です。
 
 ---
 

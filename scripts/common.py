@@ -9,6 +9,7 @@ VALIDATION_TEST_NS = "/validation/test"
 
 import json
 import os
+import selectors
 import queue
 import re
 import shlex
@@ -24,7 +25,7 @@ try:
 except Exception:
     HAS_ROSBAG = False
 
-# trajectory_predictor の標準出力に含まれる dt=30 などの値をパースする正規表現
+# trajectory_predictor ログ行から dt を拾う正規表現（旧経路/PTY補助用）
 DT_VALUE_RE = re.compile(r"dt\s*=\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 # trajectory_predictor_io.cpp の ROS_INFO に合わせる（182行目: "Ready. Waiting for data..."）
@@ -37,17 +38,136 @@ def run_trajectory_predictor_offline(
     input_bags: list[Path],
     output_bag: Path,
     output_ns: str,
+    map_name: str,
     timeout_sec: float | None = None,
 ) -> tuple[int, list[float], str]:
     """
     Run trajectory_predictor_sim_offline once for one scene.
     Returns (returncode, dt_values, combined_log_text).
+    dt_values are read from --runtime-file output (not parsed from stdout/stderr).
     """
     cmd = ["rosrun", pkg, node_name]
     for bag in input_bags:
         cmd.extend(["--input-bag", str(bag)])
-    cmd.extend(["--output-bag", str(output_bag), "--output-ns", output_ns])
+    runtime_file = output_bag.parent / f"{output_bag.stem}.runtime_ms.txt"
+    try:
+        if runtime_file.exists():
+            runtime_file.unlink()
+    except Exception:
+        pass
+    cmd.extend(
+        [
+            "--output-bag",
+            str(output_bag),
+            "--output-ns",
+            output_ns,
+            "--map-name",
+            map_name,
+            "--runtime-file",
+            str(runtime_file),
+        ]
+    )
 
+    log_parts: list[str] = []
+    returncode = 124
+    timed_out = False
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=os.environ,
+    )
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+
+    start_time = time.monotonic()
+    while True:
+        if timeout_sec is not None and (time.monotonic() - start_time) > timeout_sec:
+            timed_out = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            break
+
+        events = selector.select(timeout=0.2)
+        for key, _ in events:
+            try:
+                data = os.read(key.fileobj.fileno(), 4096)
+            except OSError:
+                data = b""
+            if not data:
+                try:
+                    selector.unregister(key.fileobj)
+                except Exception:
+                    pass
+                continue
+            text = data.decode("utf-8", errors="replace")
+            log_parts.append(text)
+            if text:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
+        if proc.poll() is not None:
+            # Drain remaining bytes after process exit.
+            while True:
+                try:
+                    data = os.read(proc.stdout.fileno(), 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                text = data.decode("utf-8", errors="replace")
+                log_parts.append(text)
+                if text:
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+            break
+
+    try:
+        selector.close()
+    except Exception:
+        pass
+
+    if timed_out:
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        returncode = 124
+    else:
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        returncode = int(proc.returncode if proc.returncode is not None else 1)
+
+    log_text = "".join(log_parts)
+    dt_values: list[float] = []
+    if runtime_file.exists():
+        try:
+            for line in runtime_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                dt_values.append(float(s))
+        except Exception:
+            dt_values = []
+    return (returncode, dt_values, log_text)
+
+
+def check_offline_binary_supports_map_name(
+    pkg: str,
+    node_name: str,
+    timeout_sec: float = 8.0,
+) -> tuple[bool, str]:
+    """
+    Validate that trajectory_predictor_sim_offline supports required offline args.
+    Returns (ok, detail_message).
+    """
+    cmd = ["rosrun", pkg, node_name, "--help"]
     try:
         proc = subprocess.run(
             cmd,
@@ -56,26 +176,25 @@ def run_trajectory_predictor_offline(
             timeout=timeout_sec,
             env=os.environ,
         )
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        returncode = int(proc.returncode)
-    except subprocess.TimeoutExpired as e:
-        stdout = e.stdout or ""
-        stderr = e.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", errors="replace")
-        returncode = 124
+    except subprocess.TimeoutExpired:
+        return (False, f"{' '.join(cmd)} timed out ({timeout_sec}s)")
+    except FileNotFoundError:
+        return (False, f"command not found: {cmd[0]}")
+    except Exception as e:
+        return (False, str(e))
 
-    log_text = stdout + ("\n" if stdout and stderr else "") + stderr
-    dt_values: list[float] = []
-    for m in DT_VALUE_RE.finditer(log_text):
-        try:
-            dt_values.append(float(m.group(1)))
-        except (TypeError, ValueError):
-            continue
-    return (returncode, dt_values, log_text)
+    out = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
+    required_args = ("--map-name", "--runtime-file")
+    missing = [opt for opt in required_args if opt not in out]
+    if not missing:
+        return (True, "")
+
+    if proc.returncode != 0:
+        return (
+            False,
+            f"{' '.join(cmd)} returned {proc.returncode} and does not advertise required args: {missing}",
+        )
+    return (False, f"offline binary help does not contain required args: {missing}")
 
 
 class PTYCaptureState:

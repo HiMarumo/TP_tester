@@ -26,15 +26,5 @@ if [[ -z "${TP_BASELINE_COMMIT:-}" ]] && [[ -n "$NRC_WS_DEVEL" ]] && command -v 
   done
 fi
 
-if ! rostopic list &>/dev/null; then
-  roscore &
-  ROSTERM_PID=$!
-  sleep 2
-fi
-
 export TP_TESTER_ROOT="$TP_ROOT"
 python3 scripts/run_baseline.py
-
-if [[ -n "${ROSTERM_PID:-}" ]]; then
-  kill $ROSTERM_PID 2>/dev/null || true
-fi
