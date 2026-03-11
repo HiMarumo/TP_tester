@@ -12,7 +12,6 @@ import time
 
 try:
     import rospy
-    from nrc_msgs.msg import TrackedObjectSet2WithTrajectory
 except ImportError as e:
     print(f"wait_publish_count: import error: {e}", file=sys.stderr)
     sys.exit(2)
@@ -38,7 +37,10 @@ def main() -> int:
         return 2
 
     rospy.init_node("wait_publish_count", anonymous=True)
-    rospy.Subscriber(args.topic, TrackedObjectSet2WithTrajectory, _on_msg, queue_size=100)
+    # Message type is intentionally generic because this utility is used for both:
+    # - /validation/*/WM/... (TrackedObjectSet2WithTrajectory)
+    # - /tp_sim/input_frame (TrajectoryPredictorSimInputFrame)
+    rospy.Subscriber(args.topic, rospy.AnyMsg, _on_msg, queue_size=100)
     start = time.time()
 
     def spin_thread():
@@ -76,4 +78,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

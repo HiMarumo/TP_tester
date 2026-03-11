@@ -29,7 +29,7 @@ from common import (
     start_trajectory_predictor_and_wait_ready,
     wait_for_node_ready,
 )
-from run_baseline import _build_observed_bag_from_input, _resolve_wait_publish_count_target
+from run_baseline import _build_observed_bag_from_input, _count_topic_messages_in_bag, TP_SIM_INPUT_FRAME_TOPIC
 
 
 VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
@@ -50,6 +50,7 @@ def main() -> int:
     settings = load_settings(root)
     paths = settings["paths"]
     test_bags_root = root / paths["test_bags"]
+    baseline_root = root / paths["baseline_results"]
     test_results_root = root / paths["test_results"]
     record_topics = settings["record_topics"]
     rosparam = settings.get("rosparam", {})
@@ -111,6 +112,23 @@ def main() -> int:
         out_dir = test_results_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)
         out_bag = out_dir / "result_test.bag"
+        baseline_input_bag = baseline_root / rel / "input.bag"
+
+        play_bags = bags
+        expected_output_count = None
+        if node_name == "trajectory_predictor_sim":
+            if not baseline_input_bag.exists():
+                print(f"[test] {rel}: input.bag が見つかりません: {baseline_input_bag}", file=sys.stderr)
+                return 1
+            expected_output_count = _count_topic_messages_in_bag(baseline_input_bag, TP_SIM_INPUT_FRAME_TOPIC)
+            if expected_output_count <= 0:
+                print(
+                    f"[test] {rel}: input.bag に {TP_SIM_INPUT_FRAME_TOPIC} がありません: {baseline_input_bag}",
+                    file=sys.stderr,
+                )
+                return 1
+            play_bags = [baseline_input_bag]
+            print(f"[test] {rel}: use baseline input.bag ({TP_SIM_INPUT_FRAME_TOPIC}={expected_output_count})")
 
         if tp_proc is None or tp_proc.poll() is not None:
             kill_rosnodes_matching(node_name)
@@ -155,29 +173,12 @@ def main() -> int:
 
         if capture_state is not None:
             capture_state.clear_dt()
-        expected_output_count = None
-        expected_source_topic = None
-        if node_name == "trajectory_predictor_sim":
-            try:
-                expected_source_topic, expected_output_count = _resolve_wait_publish_count_target(
-                    bags, observed_source_topic
-                )
-                print(
-                    f"[test] {rel}: wait_publish_count target={expected_output_count}"
-                    f" (input topic: {expected_source_topic})"
-                )
-            except Exception as e:
-                print(
-                    f"[test] {rel}: wait_publish_count の件数算出に失敗: {e}"
-                    " (silence待ちにフォールバック)",
-                    file=sys.stderr,
-                )
-        print(f"[test] {rel}: playing {len(bags)} bag(s), recording to {out_bag}")
+        print(f"[test] {rel}: playing {len(play_bags)} bag(s), recording to {out_bag}")
         record_cmd = ["rosbag", "record", "-O", str(out_bag)] + test_record_topics
         rec_proc = run_cmd(record_cmd)
         time.sleep(1.0)
         # タイマー位相を揃える: bag の先頭時刻で /clock を 2s 分 publish してから再生（10Hz×2s=20 ティックで位相を安定）
-        bag_start = get_bag_start_time(bags[0])
+        bag_start = get_bag_start_time(play_bags[0])
         if bag_start is not None:
             run_clock_preroll(bag_start, duration_sec=2.0)
         script_dir = root / "scripts"
@@ -202,7 +203,7 @@ def main() -> int:
                     preexec_fn=os.setsid if os.name != "nt" else None,
                 )
                 wait_count_started = True
-        play_cmd = ["rosbag", "play"] + [str(b) for b in bags] + ["--clock"]
+        play_cmd = ["rosbag", "play"] + [str(b) for b in play_bags] + ["--clock"]
         subprocess.run(play_cmd)
         # trajectory_predictor_sim は件数待ちを優先し、失敗時のみ silence 待ちへフォールバック
         if node_name == "trajectory_predictor_sim":
@@ -262,12 +263,12 @@ def main() -> int:
         observed_bag = out_dir / "observed_test.bag"
         try:
             used_topic = _build_observed_bag_from_input(
-                bags,
+                [baseline_input_bag] if node_name == "trajectory_predictor_sim" else bags,
                 observed_bag,
                 result_bag=out_bag,
                 observed_ns=VALIDATION_OBSERVED_TEST_NS,
                 result_ns=VALIDATION_TEST_NS,
-                preferred_source_topic=observed_source_topic,
+                preferred_source_topic=TP_SIM_INPUT_FRAME_TOPIC if node_name == "trajectory_predictor_sim" else observed_source_topic,
             )
             print(f"[test] {rel}: observed trajectories saved to {observed_bag} (source: {used_topic})")
         except Exception as e:
