@@ -72,7 +72,7 @@ DIFF_SUPPORTED_SOURCES = {
     "lane": {"along", "crossing", "opposite"},
     "object_ids": {"along", "opposite", "crossing", "other", "base"},
     "path": {"along", "opposite", "crossing", "other", "base"},
-    "vsl": {"along", "opposite", "crossing", "base"},
+    "vsl": {"along", "opposite", "crossing"},
 }
 SOURCE_ALIASES = {
     "oncoming": "opposite",
@@ -108,7 +108,8 @@ DISPLAY_MODE_LABELS = [
     "Compare obs-baseline crossing",
     "Compare obs-test crossing",
 ]
-VALIDATION_OBSERVED_NS = "/validation/observed"
+VALIDATION_OBSERVED_BASELINE_NS = "/validation/observed_baseline"
+VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
 
 
 class KeepSelectionColorDelegate(QStyledItemDelegate):
@@ -143,10 +144,12 @@ RECORD_TOPIC_TO_VIEWER_PARAM = {
 
 
 def _dt_status_display(status: str | None) -> str:
-    s = (status or "normal").strip().lower()
+    s = (status or "valid").strip().lower()
     if s == "normal":
         return "valid"
-    return s
+    if s in ("valid", "warning", "invalid"):
+        return s
+    return "valid"
 
 
 def _summary_state(comp: dict | None) -> str | None:
@@ -180,8 +183,8 @@ def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
     d = STATUS_UNCHANGED if path_ok else STATUS_CHANGED
     e = STATUS_UNCHANGED if traffic_ok else STATUS_CHANGED
     seg = "Yes" if comp.get("segfault_baseline") or comp.get("segfault_test") else "No"
-    sb = (comp.get("dt_status_baseline") or "normal").strip().lower()
-    st = (comp.get("dt_status_test") or "normal").strip().lower()
+    sb = _dt_status_display(comp.get("dt_status_baseline"))
+    st = _dt_status_display(comp.get("dt_status_test"))
     if sb == "invalid" or st == "invalid":
         dt_status_label = "Invalid"
     elif sb == "warning" or st == "warning":
@@ -674,7 +677,8 @@ class ViewerAppPyQt(QMainWindow):
                 viewer_args.append(f"_{param}:={VALIDATION_BASELINE_NS}{topic}")
                 viewer_args.append(f"_test_{param}:={VALIDATION_TEST_NS}{topic}")
                 if topic.startswith("/WM/"):
-                    viewer_args.append(f"_observed_{param}:={VALIDATION_OBSERVED_NS}{topic}")
+                    viewer_args.append(f"_observed_{param}:={VALIDATION_OBSERVED_BASELINE_NS}{topic}")
+                    viewer_args.append(f"_observed_test_{param}:={VALIDATION_OBSERVED_TEST_NS}{topic}")
         self.viewer_proc = subprocess.Popen(
             viewer_args,
             env=os.environ.copy(),
@@ -747,8 +751,9 @@ class ViewerAppPyQt(QMainWindow):
         self.current_rel = rel
         set_viewer_rosparams(self.settings)
         baseline_bag = self.baseline_root / rel / "result_baseline.bag"
-        observed_bag = self.baseline_root / rel / "observed.bag"
+        observed_baseline_bag = self.baseline_root / rel / "observed_baseline.bag"
         test_bag = self.test_results_root / rel / "result_test.bag"
+        observed_test_bag = self.test_results_root / rel / "observed_test.bag"
         out_dir = self.test_results_root / rel
         common_bag = out_dir / "common.bag"
         diff_baseline_bag = out_dir / "diff_baseline.bag"
@@ -764,10 +769,12 @@ class ViewerAppPyQt(QMainWindow):
         extra_bags = get_bag_files_in_dir(test_bags_dir) if test_bags_dir.is_dir() else []
         play_bags = [str(b) for b in extra_bags]
         play_bags.append(str(baseline_bag))
-        if observed_bag.exists():
-            play_bags.append(str(observed_bag))
+        if observed_baseline_bag.exists():
+            play_bags.append(str(observed_baseline_bag))
         if test_bag.exists():
             play_bags.append(str(test_bag))
+        if observed_test_bag.exists():
+            play_bags.append(str(observed_test_bag))
         if common_bag.exists():
             play_bags.append(str(common_bag))
         if diff_baseline_bag.exists():

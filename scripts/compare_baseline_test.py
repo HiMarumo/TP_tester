@@ -4,7 +4,7 @@ Compare baseline vs test result bags and write comparison.json per directory.
 All comparisons are timestamp-aligned: only messages with the same header.stamp (or bag time)
 are paired. Verifies:
   ① Lane IDs: 共通タイムスタンプ同士で曲線の集合が一致（曲線＝lane id の並び、格納順は不問）
-  ② VSL: 共通タイムスタンプ同士で object_id ごとの位置・向き一致
+  ② VSL: 共通タイムスタンプ同士で位置・向き集合が一致（object_id は比較に使わない）
   ③ Object IDs: 共通タイムスタンプでの path 付き object_id 集合が一致
   ④ Path / Traffic: 共通タイムスタンプ同士で軌跡・信号状態が一致
 """
@@ -64,7 +64,8 @@ TRAFFIC_TOPIC = "/viz/su/ym0_converted_traffic_light_state"
 
 LANE_SOURCES = ("along", "opposite", "crossing")
 OBJECT_PATH_SOURCES = ("along", "opposite", "crossing", "other", "base")
-VSL_SOURCES = ("along", "opposite", "crossing", "base")
+VSL_SOURCES = ("along", "opposite", "crossing")
+PATH_COMPARE_SOURCES = ("along", "opposite", "crossing", "other")
 
 LANE_TOPIC_TO_SOURCE = {
     "/viz/su/multi_lane_ids_set": "along",
@@ -74,6 +75,7 @@ LANE_TOPIC_TO_SOURCE = {
 WM_TOPIC_TO_SOURCE = {
     "/WM/tracked_object_set_with_prediction": "base",
     "/WM/along_object_set_with_prediction": "along",
+    # topic名は oncoming だが比較ソース名は opposite として扱う
     "/WM/oncoming_object_set_with_prediction": "opposite",
     "/WM/crossing_object_set_with_prediction": "crossing",
     "/WM/other_object_set_with_prediction": "other",
@@ -238,22 +240,9 @@ def _vsl_pose_counter(msg) -> Counter:
     return out
 
 
-def _trajectory_signature(obj) -> list:
-    """1 object の軌跡を時系列の並び（一連のつながり）として比較用に正規化。
-    - 軌跡 = (t,x,y) の並び（順序あり）。sorted(sig) で t 昇順に揃え、同一軌跡を一意に比較。
-    - trajectory_set 内の仮説の格納順は不問（全点を集めてから t でソート）。"""
-    sig = []
-    for ts in getattr(obj, "trajectory_set", []) or []:
-        for pt in getattr(ts, "trajectory", []) or []:
-            t = getattr(pt, "t", 0)
-            x = getattr(pt, "x", 0)
-            y = getattr(pt, "y", 0)
-            sig.append((round(t, 6), round(x, 6), round(y, 6)))
-    return sorted(sig)
-
-
 def _trajectory_path_signature(path_msg) -> tuple:
-    """Trajectory path signature as tuple[(t,x,y), ...] for exact diff extraction."""
+    """Trajectory path signature as tuple[(t,x,y), ...].
+    Path 内の点順序（時系列）は比較対象として保持する。"""
     sig = []
     for pt in getattr(path_msg, "trajectory", []) or []:
         t = getattr(pt, "t", 0)
@@ -264,7 +253,9 @@ def _trajectory_path_signature(path_msg) -> tuple:
 
 
 def _trajectory_counter(obj) -> Counter:
-    """Multiset of trajectory path signatures in one object."""
+    """Multiset of path signatures in one object.
+    - path 内の点順序は保持して比較
+    - trajectory_set の path 並び順は不問（Counter 比較）"""
     cnt = Counter()
     for path_msg in getattr(obj, "trajectory_set", []) or []:
         cnt[_trajectory_path_signature(path_msg)] += 1
@@ -295,15 +286,15 @@ def _objects_by_id(msg) -> dict:
     return out
 
 
-def _object_trajectories_by_id(msg) -> dict:
-    """object_id -> trajectory_signature list."""
+def _object_trajectory_counters_by_id(msg) -> dict:
+    """object_id -> Counter(path_signature)."""
     out = {}
     for obj in getattr(msg, "objects", []) or []:
         o = getattr(obj, "object", None)
         if o is None:
             continue
         oid = int(getattr(o, "object_id", -1))
-        out[oid] = _trajectory_signature(obj)
+        out[oid] = _trajectory_counter(obj)
     return out
 
 
@@ -505,19 +496,23 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
                     )
             vb = _vsl_pose_counter(m1)
             vt = _vsl_pose_counter(m2)
-            if vb != vt:
-                result["vsl_detail"] += f"{topic_b} VSL pose set differs (stamp={stamp}). "
-                vsl_ok = False
-                if source in VSL_SOURCES:
+            if source in VSL_SOURCES:
+                if vb != vt:
+                    result["vsl_detail"] += f"{topic_b} VSL pose set differs (stamp={stamp}). "
+                    vsl_ok = False
                     result["diff_by_source"]["vsl"][source] = True
                     result["diff_counts_by_source"]["vsl"][source] += 1
-            tb = _object_trajectories_by_id(m1)
-            tt = _object_trajectories_by_id(m2)
-            for oid in set(tb) | set(tt):
-                if tb.get(oid) != tt.get(oid):
-                    result["path_and_traffic_detail"] += f"{topic_b} object {oid} trajectory differs (stamp={stamp}). "
-                    path_ok = False
-                    if source in OBJECT_PATH_SOURCES:
+            if source in PATH_COMPARE_SOURCES:
+                tb = _object_trajectory_counters_by_id(m1)
+                tt = _object_trajectory_counters_by_id(m2)
+                for oid in set(tb) | set(tt):
+                    # object ごとに path 集合（順不同）を比較。
+                    # 各 path 内の点順序は signature に保持されるため順序一致必須。
+                    if tb.get(oid, Counter()) != tt.get(oid, Counter()):
+                        result["path_and_traffic_detail"] += (
+                            f"{topic_b} object {oid} path set differs (stamp={stamp}). "
+                        )
+                        path_ok = False
                         result["diff_by_source"]["path"][source] = True
                         result["diff_counts_by_source"]["path"][source] += 1
 
@@ -605,6 +600,71 @@ def _write_diff_bags(
 
 
 def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> None:
+    def _open_out_bag(path: Path):
+        # Keep chunks small to avoid occasional rosbag chunk header overflow on close.
+        return rosbag.Bag(str(path), "w", chunk_threshold=64 * 1024)
+
+    def _first_msg_from_by_stamp(by_stamp: dict) -> object | None:
+        if not by_stamp:
+            return None
+        try:
+            return next(iter(by_stamp.values()))[1]
+        except Exception:
+            return None
+
+    def _set_msg_stamp(msg, stamp_nsec: int) -> None:
+        header = getattr(msg, "header", None)
+        if header is None:
+            return
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return
+        sec = int(stamp_nsec // 10**9)
+        nsec = int(stamp_nsec % 10**9)
+        if HAS_CLOCK_MSG:
+            try:
+                header.stamp = rospy.Time(sec, nsec)
+                return
+            except Exception:
+                pass
+        # Fallback for environments where rospy is unavailable.
+        if hasattr(stamp, "secs"):
+            stamp.secs = sec
+        elif hasattr(stamp, "sec"):
+            stamp.sec = sec
+        if hasattr(stamp, "nsecs"):
+            stamp.nsecs = nsec
+        elif hasattr(stamp, "nsec"):
+            stamp.nsec = nsec
+        elif hasattr(stamp, "nanosec"):
+            stamp.nanosec = nsec
+
+    def _empty_msg_like(template_msg, stamp_nsec: int, kind: str):
+        if template_msg is None:
+            return None
+        try:
+            msg = copy.deepcopy(template_msg)
+        except Exception:
+            return None
+        _set_msg_stamp(msg, stamp_nsec)
+        if kind == "wm":
+            msg.objects = []
+        elif kind == "lane":
+            msg.arrays = []
+        elif kind == "traffic":
+            msg.trafficlightlist = []
+        return msg
+
+    def _fill_missing_templates(topic_to_template: dict[str, object | None]) -> dict[str, object | None]:
+        fallback = None
+        for t in topic_to_template.values():
+            if t is not None:
+                fallback = t
+                break
+        if fallback is None:
+            return topic_to_template
+        return {k: (v if v is not None else fallback) for k, v in topic_to_template.items()}
+
     def _bag_has_ns(bag_path: Path, ns: str) -> bool:
         try:
             with rosbag.Bag(str(bag_path), "r") as bag:
@@ -650,6 +710,8 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
     # 共通スタンプのみ compare 対象。diff/common bag には共通スタンプのデータのみ含める
     common_stamps = set(bl_wm_by.get(baseline_wm[0], {}).keys()) & set(te_wm_by.get(test_wm[0], {}).keys())
     common_stamps_sorted = sorted(common_stamps)
+    bl_ref_by = bl_wm_by.get(baseline_wm[0], {})
+    te_ref_by = te_wm_by.get(test_wm[0], {})
 
     def _write_clock_at_stamps(out_bag, stamps):
         if not HAS_CLOCK_MSG or not stamps:
@@ -659,6 +721,7 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
             msg = Clock(clock=t)
             out_bag.write("/clock", msg, t)
     for topic_b, topic_t in zip(baseline_wm, test_wm):
+        source = _wm_source_from_topic(topic_b) or _wm_source_from_topic(topic_t)
         bl_by = bl_wm_by[topic_b]
         te_by = te_wm_by[topic_t]
         common_stamps = set(bl_by.keys()) & set(te_by.keys())
@@ -692,6 +755,9 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
             for oid in common_ids:
                 if oid not in b_map or oid not in t_map:
                     continue
+                # object ごとに path 集合（Counter）として比較:
+                # - trajectory_set 内の path 順は不問
+                # - 各 path 内の点順（時系列）は _trajectory_path_signature で保持
                 b_counter = _trajectory_counter(b_map[oid])
                 t_counter = _trajectory_counter(t_map[oid])
                 if not b_counter and not t_counter:
@@ -701,7 +767,7 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
                 t_only_counter = t_counter - b_counter
 
                 if b_only_counter or t_only_counter:
-                    # path 差分あり: diff へは差分 path のみ、common へは一致 path のみ
+                    # path 差分あり: diff へは片側 path、common へは一致 path を保存
                     if b_only_counter:
                         wm_diff_b_traj_keep[topic_b][stamp][oid] = b_only_counter
                     if t_only_counter:
@@ -712,12 +778,14 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
                     # path 完全一致: common に object 丸ごと保持
                     wm_common_obj[topic_b][stamp].add(oid)
 
-            # VSL 差分は ID を無視して位置+向きのみで判定し、差分を diff bag へ反映する
-            b_vsl_counter = _vsl_pose_counter(m1)
-            t_vsl_counter = _vsl_pose_counter(m2)
-            wm_common_vsl_keep[topic_b][stamp] = b_vsl_counter & t_vsl_counter
-            wm_diff_b_vsl_keep[topic_b][stamp] = b_vsl_counter - t_vsl_counter
-            wm_diff_t_vsl_keep[topic_t][stamp] = t_vsl_counter - b_vsl_counter
+            # VSL は along/opposite/crossing のみ対象（base/other では扱わない）
+            if source in VSL_SOURCES:
+                # VSL 差分は ID を無視して位置+向きのみで判定し、差分を diff bag へ反映する
+                b_vsl_counter = _vsl_pose_counter(m1)
+                t_vsl_counter = _vsl_pose_counter(m2)
+                wm_common_vsl_keep[topic_b][stamp] = b_vsl_counter & t_vsl_counter
+                wm_diff_b_vsl_keep[topic_b][stamp] = b_vsl_counter - t_vsl_counter
+                wm_diff_t_vsl_keep[topic_t][stamp] = t_vsl_counter - b_vsl_counter
 
     # タイムスタンプごとに Lane の common / diff_baseline / diff_test を計算
     lane_common = {}    # topic_b -> {stamp: set of curves}
@@ -740,6 +808,13 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
             lane_common[topic_b][stamp] = bl_curves & te_curves
             lane_diff_b[topic_b][stamp] = bl_curves - te_curves
             lane_diff_t[topic_t][stamp] = te_curves - bl_curves
+
+    bl_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_wm_by.get(topic, {})) for topic in baseline_wm})
+    te_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_wm_by.get(topic, {})) for topic in test_wm})
+    bl_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_lane_by.get(topic, {})) for topic in baseline_lane})
+    te_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_lane_by.get(topic, {})) for topic in test_lane})
+    bl_traffic_template = _first_msg_from_by_stamp(bl_traffic_by)
+    te_traffic_template = _first_msg_from_by_stamp(te_traffic_by)
 
     def _filter_wm_msg(msg, keep_ids: set, keep_traj_by_id=None, keep_vsl_counter=None):
         try:
@@ -805,83 +880,137 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
     diff_test_traffic = f"{VALIDATION_DIFF_TEST_NS}{TRAFFIC_TOPIC}"
 
     # common.bag: 共通部分のみ → baseline 由来で 1 本だけ /validation/common へ
-    with rosbag.Bag(str(common_path), "w") as out_bag:
+    with _open_out_bag(common_path) as out_bag:
         _write_clock_at_stamps(out_bag, common_stamps_sorted)
         for stamp in common_stamps_sorted:
             if stamp in bl_traffic_by:
                 t, msg = bl_traffic_by[stamp]
+            else:
+                ref = bl_ref_by.get(stamp)
+                if ref is None:
+                    continue
+                t = ref[0]
+                msg = _empty_msg_like(bl_traffic_template, stamp, "traffic")
+            if msg is not None:
                 out_bag.write(common_traffic, msg, t)
         for topic_b, out_topic in zip(baseline_wm, common_wm):
-            for stamp in sorted(wm_common_obj.get(topic_b, {}).keys()):
-                t, msg = bl_wm_by[topic_b][stamp]
-                filtered = _filter_wm_msg(
-                    msg,
-                    wm_common_obj[topic_b][stamp],
-                    wm_common_traj_keep.get(topic_b, {}).get(stamp, {}),
-                    wm_common_vsl_keep.get(topic_b, {}).get(stamp, Counter()),
-                )
+            for stamp in common_stamps_sorted:
+                keep_ids = wm_common_obj.get(topic_b, {}).get(stamp, set())
+                keep_traj = wm_common_traj_keep.get(topic_b, {}).get(stamp, {})
+                keep_vsl = wm_common_vsl_keep.get(topic_b, {}).get(stamp, Counter())
+                if stamp in bl_wm_by.get(topic_b, {}):
+                    t, msg = bl_wm_by[topic_b][stamp]
+                    filtered = _filter_wm_msg(msg, keep_ids, keep_traj, keep_vsl)
+                else:
+                    ref = bl_ref_by.get(stamp)
+                    if ref is None:
+                        continue
+                    t = ref[0]
+                    filtered = _empty_msg_like(bl_wm_templates.get(topic_b), stamp, "wm")
                 if filtered is not None:
                     out_bag.write(out_topic, filtered, t)
         for topic_b, out_topic in zip(baseline_lane, common_lane):
-            for stamp in sorted(lane_common.get(topic_b, {}).keys()):
-                t, bl_msg = bl_lane_by[topic_b][stamp]
-                filtered = _filter_lane_msg(bl_msg, lane_common[topic_b][stamp])
+            for stamp in common_stamps_sorted:
+                keep_curves = lane_common.get(topic_b, {}).get(stamp, set())
+                if stamp in bl_lane_by.get(topic_b, {}):
+                    t, bl_msg = bl_lane_by[topic_b][stamp]
+                    filtered = _filter_lane_msg(bl_msg, keep_curves)
+                else:
+                    ref = bl_ref_by.get(stamp)
+                    if ref is None:
+                        continue
+                    t = ref[0]
+                    filtered = _empty_msg_like(bl_lane_templates.get(topic_b), stamp, "lane")
                 if filtered is not None:
                     out_bag.write(out_topic, filtered, t)
 
     # diff_baseline.bag → diff_baseline トピックへ（他 bag とずれないよう全 common スタンプでメッセージを書く。差分なしは空メッセージ）
-    with rosbag.Bag(str(diff_baseline_path), "w") as out_bag:
+    with _open_out_bag(diff_baseline_path) as out_bag:
         _write_clock_at_stamps(out_bag, common_stamps_sorted)
         for stamp in common_stamps_sorted:
             if stamp in bl_traffic_by:
                 t, msg = bl_traffic_by[stamp]
+            else:
+                ref = bl_ref_by.get(stamp)
+                if ref is None:
+                    continue
+                t = ref[0]
+                msg = _empty_msg_like(bl_traffic_template, stamp, "traffic")
+            if msg is not None:
                 out_bag.write(diff_baseline_traffic, msg, t)
         for topic, out_topic in zip(baseline_wm, diff_baseline_wm):
             for stamp in common_stamps_sorted:
-                if stamp not in bl_wm_by.get(topic, {}):
-                    continue
-                t, msg = bl_wm_by[topic][stamp]
                 keep_ids = wm_diff_b.get(topic, {}).get(stamp, set())
                 keep_traj = wm_diff_b_traj_keep.get(topic, {}).get(stamp, {})
                 keep_vsl = wm_diff_b_vsl_keep.get(topic, {}).get(stamp, Counter())
-                filtered = _filter_wm_msg(msg, keep_ids, keep_traj, keep_vsl)
+                if stamp in bl_wm_by.get(topic, {}):
+                    t, msg = bl_wm_by[topic][stamp]
+                    filtered = _filter_wm_msg(msg, keep_ids, keep_traj, keep_vsl)
+                else:
+                    ref = bl_ref_by.get(stamp)
+                    if ref is None:
+                        continue
+                    t = ref[0]
+                    filtered = _empty_msg_like(bl_wm_templates.get(topic), stamp, "wm")
                 if filtered is not None:
                     out_bag.write(out_topic, filtered, t)
         for topic_b, out_topic in zip(baseline_lane, diff_baseline_lane):
             for stamp in common_stamps_sorted:
-                if stamp not in bl_lane_by.get(topic_b, {}):
-                    continue
-                t, bl_msg = bl_lane_by[topic_b][stamp]
                 keep_curves = lane_diff_b.get(topic_b, {}).get(stamp, set())
-                filtered = _filter_lane_msg(bl_msg, keep_curves)
+                if stamp in bl_lane_by.get(topic_b, {}):
+                    t, bl_msg = bl_lane_by[topic_b][stamp]
+                    filtered = _filter_lane_msg(bl_msg, keep_curves)
+                else:
+                    ref = bl_ref_by.get(stamp)
+                    if ref is None:
+                        continue
+                    t = ref[0]
+                    filtered = _empty_msg_like(bl_lane_templates.get(topic_b), stamp, "lane")
                 if filtered is not None:
                     out_bag.write(out_topic, filtered, t)
 
     # diff_test.bag → diff_test トピックへ（他 bag とずれないよう全 common スタンプでメッセージを書く。差分なしは空メッセージ）
-    with rosbag.Bag(str(diff_test_path), "w") as out_bag:
+    with _open_out_bag(diff_test_path) as out_bag:
         _write_clock_at_stamps(out_bag, common_stamps_sorted)
         for stamp in common_stamps_sorted:
             if stamp in te_traffic_by:
                 t, msg = te_traffic_by[stamp]
+            else:
+                ref = te_ref_by.get(stamp)
+                if ref is None:
+                    continue
+                t = ref[0]
+                msg = _empty_msg_like(te_traffic_template, stamp, "traffic")
+            if msg is not None:
                 out_bag.write(diff_test_traffic, msg, t)
         for topic, out_topic in zip(test_wm, diff_test_wm):
             for stamp in common_stamps_sorted:
-                if stamp not in te_wm_by.get(topic, {}):
-                    continue
-                t, msg = te_wm_by[topic][stamp]
                 keep_ids = wm_diff_t.get(topic, {}).get(stamp, set())
                 keep_traj = wm_diff_t_traj_keep.get(topic, {}).get(stamp, {})
                 keep_vsl = wm_diff_t_vsl_keep.get(topic, {}).get(stamp, Counter())
-                filtered = _filter_wm_msg(msg, keep_ids, keep_traj, keep_vsl)
+                if stamp in te_wm_by.get(topic, {}):
+                    t, msg = te_wm_by[topic][stamp]
+                    filtered = _filter_wm_msg(msg, keep_ids, keep_traj, keep_vsl)
+                else:
+                    ref = te_ref_by.get(stamp)
+                    if ref is None:
+                        continue
+                    t = ref[0]
+                    filtered = _empty_msg_like(te_wm_templates.get(topic), stamp, "wm")
                 if filtered is not None:
                     out_bag.write(out_topic, filtered, t)
         for topic_t, out_topic in zip(test_lane, diff_test_lane):
             for stamp in common_stamps_sorted:
-                if stamp not in te_lane_by.get(topic_t, {}):
-                    continue
-                t, te_msg = te_lane_by[topic_t][stamp]
                 keep_curves = lane_diff_t.get(topic_t, {}).get(stamp, set())
-                filtered = _filter_lane_msg(te_msg, keep_curves)
+                if stamp in te_lane_by.get(topic_t, {}):
+                    t, te_msg = te_lane_by[topic_t][stamp]
+                    filtered = _filter_lane_msg(te_msg, keep_curves)
+                else:
+                    ref = te_ref_by.get(stamp)
+                    if ref is None:
+                        continue
+                    t = ref[0]
+                    filtered = _empty_msg_like(te_lane_templates.get(topic_t), stamp, "lane")
                 if filtered is not None:
                     out_bag.write(out_topic, filtered, t)
 
@@ -926,7 +1055,12 @@ def main() -> int:
         res["test_describe"] = test_commit.get("describe", "")
         res["segfault_baseline"] = (baseline_root / rel / "segfault").exists()
         res["segfault_test"] = (test_results_root / rel / "segfault").exists()
-        _read_dt = lambda p: p.read_text().strip() if p.exists() else "normal"
+        _normalize_dt = lambda s: (
+            "warning" if (s or "").strip().lower() == "warning" else
+            "invalid" if (s or "").strip().lower() == "invalid" else
+            "valid"
+        )
+        _read_dt = lambda p: _normalize_dt(p.read_text().strip()) if p.exists() else "valid"
         _read_dt_max = lambda p: p.read_text().strip() if p.exists() else "-"
         res["dt_status_baseline"] = _read_dt(baseline_root / rel / "dt_status")
         res["dt_status_test"] = _read_dt(test_results_root / rel / "dt_status")
@@ -973,9 +1107,8 @@ def main() -> int:
         suffix = f" ({', '.join(failed)})" if failed else ""
         seg_b = "Yes" if res.get("segfault_baseline") else "No"
         seg_t = "Yes" if res.get("segfault_test") else "No"
-        _dt_label = lambda s: {"normal": "normal", "warning": "warning", "invalid": "invalid"}.get(s, "normal")
-        rt_b = _dt_label(res.get("dt_status_baseline") or "normal")
-        rt_t = _dt_label(res.get("dt_status_test") or "normal")
+        rt_b = _normalize_dt(res.get("dt_status_baseline") or "valid")
+        rt_t = _normalize_dt(res.get("dt_status_test") or "valid")
         max_b = res.get("dt_max_baseline") or "-"
         max_t = res.get("dt_max_test") or "-"
         print(f"[compare] {rel}: {valid_str}  {status}{suffix}{cat_str}  segfault: baseline={seg_b} test={seg_t}  runtime: baseline={rt_b} ({max_b}) test={rt_t} ({max_t})")

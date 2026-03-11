@@ -29,6 +29,10 @@ from common import (
     start_trajectory_predictor_and_wait_ready,
     wait_for_node_ready,
 )
+from run_baseline import _build_observed_bag_from_input
+
+
+VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
 
 
 def run_cmd(cmd: list[str], env: dict | None = None) -> subprocess.Popen:
@@ -52,6 +56,7 @@ def main() -> int:
     node_cfg = settings.get("node", {})
     pkg = node_cfg.get("trajectory_predictor_pkg", "nrc_wm_svcs")
     node_name = node_cfg.get("trajectory_predictor_node", "trajectory_predictor")
+    observed_source_topic = settings.get("observed_source_topic")
 
     if os.environ.get("TP_SKIP_BUILD", "").strip().lower() in ("1", "true", "yes"):
         print("[test] TP_SKIP_BUILD=1: ビルドをスキップ")
@@ -175,6 +180,14 @@ def main() -> int:
                 rec_proc.terminate()
             rec_proc.wait(timeout=5)
 
+        for _ in range(30):
+            if out_bag.exists() and out_bag.stat().st_size > 0:
+                break
+            time.sleep(0.1)
+        if not out_bag.exists() or out_bag.stat().st_size <= 0:
+            print(f"[test] {rel}: result_test.bag が作成されていません: {out_bag}", file=sys.stderr)
+            return 1
+
         if capture_state is not None:
             values = capture_state.take_dt_values()
             max_dt = max(values) if values else None
@@ -183,8 +196,23 @@ def main() -> int:
             elif any(v >= 70 for v in values):
                 (out_dir / "dt_status").write_text("warning")
             else:
-                (out_dir / "dt_status").write_text("normal")
+                (out_dir / "dt_status").write_text("valid")
             (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
+
+        observed_bag = out_dir / "observed_test.bag"
+        try:
+            used_topic = _build_observed_bag_from_input(
+                bags,
+                observed_bag,
+                result_bag=out_bag,
+                observed_ns=VALIDATION_OBSERVED_TEST_NS,
+                result_ns=VALIDATION_TEST_NS,
+                preferred_source_topic=observed_source_topic,
+            )
+            print(f"[test] {rel}: observed trajectories saved to {observed_bag} (source: {used_topic})")
+        except Exception as e:
+            print(f"[test] {rel}: observed_test.bag 作成に失敗: {e}", file=sys.stderr)
+            return 1
 
         if tp_proc.poll() is not None:
             (out_dir / "segfault").touch()

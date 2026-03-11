@@ -58,7 +58,7 @@ WM_TOPIC_SUFFIXES = [
     "/WM/oncoming_object_set_with_prediction",
     "/WM/other_object_set_with_prediction",
 ]
-VALIDATION_OBSERVED_NS = "/validation/observed"
+VALIDATION_OBSERVED_BASELINE_NS = "/validation/observed_baseline"
 OBSERVED_HORIZON_SEC = 10.0
 OBSERVED_STEP_SEC = 0.5
 # 10Hz 前提で 0.5s サンプル時の揺らぎ許容（若干の stamp ずれを吸収）
@@ -117,19 +117,55 @@ def _speed_from_object(obj) -> float:
     return math.hypot(vx, vy)
 
 
-def _find_sample_index(stamps: list[int], start_idx: int, target_ns: int, tolerance_ns: int) -> int | None:
-    idx = bisect.bisect_left(stamps, target_ns, lo=start_idx)
-    candidates = []
-    if idx < len(stamps):
-        candidates.append(idx)
-    if idx - 1 >= start_idx:
-        candidates.append(idx - 1)
-    if not candidates:
+def _extract_object_state(obj) -> tuple[float, float, float, float]:
+    pose = getattr(obj, "pose", None)
+    pos = getattr(pose, "position", None) if pose is not None else None
+    ori = getattr(pose, "orientation", None) if pose is not None else None
+    x = float(getattr(pos, "x", 0.0) if pos is not None else 0.0)
+    y = float(getattr(pos, "y", 0.0) if pos is not None else 0.0)
+    yaw = _yaw_from_quat(ori)
+    speed = float(_speed_from_object(obj))
+    return x, y, yaw, speed
+
+
+def _interpolate_state(
+    prev_state: tuple[float, float, float, float],
+    next_state: tuple[float, float, float, float],
+    ratio: float,
+) -> tuple[float, float, float, float]:
+    x0, y0, yaw0, v0 = prev_state
+    x1, y1, yaw1, v1 = next_state
+    dyaw = (yaw1 - yaw0 + math.pi) % (2.0 * math.pi) - math.pi
+    return (
+        x0 + (x1 - x0) * ratio,
+        y0 + (y1 - y0) * ratio,
+        yaw0 + dyaw * ratio,
+        v0 + (v1 - v0) * ratio,
+    )
+
+
+def _find_sample_index_for_object(
+    records: list[dict],
+    stamps: list[int],
+    start_idx: int,
+    target_ns: int,
+    tolerance_ns: int,
+    object_id: int,
+) -> int | None:
+    if start_idx >= len(stamps):
         return None
-    best = min(candidates, key=lambda i: abs(stamps[i] - target_ns))
-    if abs(stamps[best] - target_ns) > tolerance_ns:
-        return None
-    return best
+    lo = bisect.bisect_left(stamps, target_ns - tolerance_ns, lo=start_idx)
+    hi = bisect.bisect_right(stamps, target_ns + tolerance_ns, lo=lo)
+    best_idx = None
+    best_delta = None
+    for idx in range(lo, hi):
+        if object_id not in records[idx]["obj_by_id"]:
+            continue
+        delta = abs(stamps[idx] - target_ns)
+        if best_idx is None or delta < best_delta:
+            best_idx = idx
+            best_delta = delta
+    return best_idx
 
 
 def _resolve_observed_source_topic(input_bags: list[Path], preferred_topic: str | None = None) -> str:
@@ -184,15 +220,68 @@ def _collect_observed_source_records(input_bags: list[Path], source_topic: str) 
     return records
 
 
+def _extract_object_id_from_traj_obj(obj) -> int:
+    base_obj = getattr(obj, "object", obj)
+    try:
+        return int(getattr(base_obj, "object_id", -1))
+    except Exception:
+        return -1
+
+
+def _resolve_existing_topic(topics_info: dict, candidates: list[str]) -> str | None:
+    for topic in candidates:
+        topic_info = topics_info.get(topic)
+        if topic_info is not None and int(getattr(topic_info, "message_count", 0) or 0) > 0:
+            return topic
+    return None
+
+
+def _collect_group_ids_by_stamp_from_result(
+    result_bag: Path, result_ns: str
+) -> dict[str, dict[int, set[int]]]:
+    group_suffix = {
+        "along": WM_TOPIC_SUFFIXES[1],
+        "crossing": WM_TOPIC_SUFFIXES[2],
+        "oncoming": WM_TOPIC_SUFFIXES[3],
+        "other": WM_TOPIC_SUFFIXES[4],
+    }
+    group_ids: dict[str, dict[int, set[int]]] = {k: defaultdict(set) for k in group_suffix}
+    with rosbag.Bag(str(result_bag), "r") as bag:
+        info = bag.get_type_and_topic_info()
+        topics_info = getattr(info, "topics", {}) or {}
+        resolved_topics: dict[str, str] = {}
+        for group, suffix in group_suffix.items():
+            topic = _resolve_existing_topic(topics_info, [f"{result_ns}{suffix}", suffix])
+            if topic:
+                resolved_topics[group] = topic
+
+        for group, topic in resolved_topics.items():
+            for _, msg, t in bag.read_messages(topics=[topic]):
+                stamp_ns = _msg_stamp_nsec(msg, t)
+                id_set = group_ids[group][stamp_ns]
+                for obj in getattr(msg, "objects", []) or []:
+                    oid = _extract_object_id_from_traj_obj(obj)
+                    if oid >= 0:
+                        id_set.add(oid)
+    return group_ids
+
+
 def _build_observed_bag_from_input(
-    input_bags: list[Path], observed_bag: Path, preferred_source_topic: str | None = None
+    input_bags: list[Path],
+    observed_bag: Path,
+    result_bag: Path,
+    observed_ns: str,
+    result_ns: str,
+    preferred_source_topic: str | None = None,
 ) -> str:
     if not HAS_ROSBAG:
         raise RuntimeError("python rosbag is not available")
     if not HAS_NRC_MSGS:
         raise RuntimeError("nrc_msgs python messages are not available")
     if not input_bags:
-        raise RuntimeError("no input bags to build observed.bag")
+        raise RuntimeError("no input bags to build observed bag")
+    if not result_bag.exists():
+        raise RuntimeError(f"result bag not found: {result_bag}")
 
     source_topic = _resolve_observed_source_topic(input_bags, preferred_source_topic)
     records = _collect_observed_source_records(input_bags, source_topic)
@@ -203,6 +292,7 @@ def _build_observed_bag_from_input(
     horizon_steps = int(round(OBSERVED_HORIZON_SEC / OBSERVED_STEP_SEC))
     tolerance_ns = int(round(OBSERVED_SAMPLE_TOLERANCE_SEC * 1.0e9))
     stamps = [r["stamp_ns"] for r in records]
+    group_ids_by_stamp = _collect_group_ids_by_stamp_from_result(result_bag, result_ns)
 
     observed_base_records: list[tuple] = []
     for i, rec in enumerate(records):
@@ -231,26 +321,61 @@ def _build_observed_bag_from_input(
                 traj_set.prediction_mode = 0
             traj_set.trajectory = []
 
-            for step_i in range(horizon_steps + 1):
-                target_ns = anchor_stamp_ns + step_i * step_ns
-                sample_idx = _find_sample_index(stamps, i, target_ns, tolerance_ns)
-                if sample_idx is None:
+            anchor_state = _extract_object_state(anchor_obj)
+            sampled_states_by_step: dict[int, tuple[float, float, float, float]] = {0: anchor_state}
+            last_known_step = 0
+            last_known_state = anchor_state
+            search_start_idx = i
+
+            step_i = 1
+            while step_i <= horizon_steps:
+                found_step = None
+                found_idx = None
+                found_state = None
+                # 欠損時は +1.0s ではなく、起点から horizon(10s) 末尾まで再接続を探索する。
+                # 実際の探索は records 末尾で自然に頭打ちになる。
+                search_end_step = horizon_steps
+                for cand_step in range(step_i, search_end_step + 1):
+                    target_ns = anchor_stamp_ns + cand_step * step_ns
+                    sample_idx = _find_sample_index_for_object(
+                        records,
+                        stamps,
+                        search_start_idx,
+                        target_ns,
+                        tolerance_ns,
+                        anchor_oid,
+                    )
+                    if sample_idx is None:
+                        continue
+                    sample_obj = records[sample_idx]["obj_by_id"].get(anchor_oid)
+                    if sample_obj is None:
+                        continue
+                    found_step = cand_step
+                    found_idx = sample_idx
+                    found_state = _extract_object_state(sample_obj)
                     break
 
-                sample_obj = records[sample_idx]["obj_by_id"].get(anchor_oid)
-                if sample_obj is None:
+                if found_step is None or found_state is None:
+                    # 残り horizon 区間内で再接続不能なら、この object の observed trajectory はここで終端。
                     break
 
-                pose = getattr(sample_obj, "pose", None)
-                pos = getattr(pose, "position", None) if pose is not None else None
-                ori = getattr(pose, "orientation", None) if pose is not None else None
-                x = float(getattr(pos, "x", 0.0) if pos is not None else 0.0)
-                y = float(getattr(pos, "y", 0.0) if pos is not None else 0.0)
-                yaw = _yaw_from_quat(ori)
+                if found_step > last_known_step + 1:
+                    denom = float(found_step - last_known_step)
+                    for fill_step in range(last_known_step + 1, found_step):
+                        ratio = float(fill_step - last_known_step) / denom
+                        sampled_states_by_step[fill_step] = _interpolate_state(last_known_state, found_state, ratio)
 
+                sampled_states_by_step[found_step] = found_state
+                last_known_step = found_step
+                last_known_state = found_state
+                search_start_idx = max(search_start_idx, found_idx)
+                step_i = found_step + 1
+
+            for sampled_step in sorted(sampled_states_by_step.keys()):
+                x, y, yaw, speed = sampled_states_by_step[sampled_step]
                 pt = TrajectoryState()
                 if hasattr(pt, "t"):
-                    pt.t = float(step_i * OBSERVED_STEP_SEC)
+                    pt.t = float(sampled_step * OBSERVED_STEP_SEC)
                 if hasattr(pt, "x"):
                     pt.x = x
                 if hasattr(pt, "y"):
@@ -258,7 +383,7 @@ def _build_observed_bag_from_input(
                 if hasattr(pt, "yaw"):
                     pt.yaw = yaw
                 if hasattr(pt, "velocity"):
-                    pt.velocity = float(_speed_from_object(sample_obj))
+                    pt.velocity = speed
                 if hasattr(pt, "covariance"):
                     pt.covariance = [0.0] * 16
                 traj_set.trajectory.append(pt)
@@ -270,11 +395,11 @@ def _build_observed_bag_from_input(
         observed_base_records.append((rec["t"], observed_msg))
 
     observed_topics = {
-        "base": f"{VALIDATION_OBSERVED_NS}{WM_TOPIC_SUFFIXES[0]}",
-        "along": f"{VALIDATION_OBSERVED_NS}{WM_TOPIC_SUFFIXES[1]}",
-        "crossing": f"{VALIDATION_OBSERVED_NS}{WM_TOPIC_SUFFIXES[2]}",
-        "oncoming": f"{VALIDATION_OBSERVED_NS}{WM_TOPIC_SUFFIXES[3]}",
-        "other": f"{VALIDATION_OBSERVED_NS}{WM_TOPIC_SUFFIXES[4]}",
+        "base": f"{observed_ns}{WM_TOPIC_SUFFIXES[0]}",
+        "along": f"{observed_ns}{WM_TOPIC_SUFFIXES[1]}",
+        "crossing": f"{observed_ns}{WM_TOPIC_SUFFIXES[2]}",
+        "oncoming": f"{observed_ns}{WM_TOPIC_SUFFIXES[3]}",
+        "other": f"{observed_ns}{WM_TOPIC_SUFFIXES[4]}",
     }
 
     observed_bag.parent.mkdir(parents=True, exist_ok=True)
@@ -282,18 +407,23 @@ def _build_observed_bag_from_input(
         for t, base_msg in observed_base_records:
             out_bag.write(observed_topics["base"], base_msg, t)
 
-            # 観測はカテゴリ分類を持たないため、群別トピックは同stampの空メッセージを配置して同期だけ揃える
-            empty_msg = TrackedObjectSet2WithTrajectory()
-            empty_msg.header = copy.deepcopy(base_msg.header)
-            if hasattr(empty_msg, "status") and hasattr(base_msg, "status"):
-                empty_msg.status = base_msg.status
-            if hasattr(empty_msg, "status_message") and hasattr(base_msg, "status_message"):
-                empty_msg.status_message = base_msg.status_message
-            empty_msg.objects = []
-            out_bag.write(observed_topics["along"], empty_msg, t)
-            out_bag.write(observed_topics["crossing"], empty_msg, t)
-            out_bag.write(observed_topics["oncoming"], empty_msg, t)
-            out_bag.write(observed_topics["other"], empty_msg, t)
+            header = getattr(base_msg, "header", None)
+            stamp_ns = _to_nsec(getattr(header, "stamp", None))
+            for group in ("along", "crossing", "oncoming", "other"):
+                group_msg = TrackedObjectSet2WithTrajectory()
+                group_msg.header = copy.deepcopy(base_msg.header)
+                if hasattr(group_msg, "status") and hasattr(base_msg, "status"):
+                    group_msg.status = base_msg.status
+                if hasattr(group_msg, "status_message") and hasattr(base_msg, "status_message"):
+                    group_msg.status_message = base_msg.status_message
+                keep_ids = group_ids_by_stamp.get(group, {}).get(stamp_ns, set())
+                group_msg.objects = []
+                if keep_ids:
+                    for obj in getattr(base_msg, "objects", []) or []:
+                        oid = _extract_object_id_from_traj_obj(obj)
+                        if oid in keep_ids:
+                            group_msg.objects.append(copy.deepcopy(obj))
+                out_bag.write(observed_topics[group], group_msg, t)
 
     return source_topic
 
@@ -453,17 +583,22 @@ def main() -> int:
             elif any(v >= 70 for v in values):
                 (out_dir / "dt_status").write_text("warning")
             else:
-                (out_dir / "dt_status").write_text("normal")
+                (out_dir / "dt_status").write_text("valid")
             (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
 
-        observed_bag = out_dir / "observed.bag"
+        observed_bag = out_dir / "observed_baseline.bag"
         try:
             used_topic = _build_observed_bag_from_input(
-                bags, observed_bag, preferred_source_topic=observed_source_topic
+                bags,
+                observed_bag,
+                result_bag=out_bag,
+                observed_ns=VALIDATION_OBSERVED_BASELINE_NS,
+                result_ns=VALIDATION_BASELINE_NS,
+                preferred_source_topic=observed_source_topic,
             )
             print(f"[baseline] {rel}: observed trajectories saved to {observed_bag} (source: {used_topic})")
         except Exception as e:
-            print(f"[baseline] {rel}: observed.bag 作成に失敗: {e}", file=sys.stderr)
+            print(f"[baseline] {rel}: observed_baseline.bag 作成に失敗: {e}", file=sys.stderr)
             return 1
 
         # 不正終了していたら該当 dir に segfault タグを付け（次のループで再起動する）
