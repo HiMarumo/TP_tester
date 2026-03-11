@@ -80,6 +80,21 @@ def run_cmd(cmd: list[str], env: dict | None = None, timeout: float | None = Non
     )
 
 
+def _collect_tracked_object_set2_topic_counts(input_bags: list[Path]) -> dict[str, int]:
+    topic_counts: dict[str, int] = defaultdict(int)
+    for bag_path in input_bags:
+        if not bag_path.exists():
+            continue
+        with rosbag.Bag(str(bag_path), "r") as bag:
+            info = bag.get_type_and_topic_info()
+            topics_info = getattr(info, "topics", {}) or {}
+            for topic, tinf in topics_info.items():
+                msg_type = getattr(tinf, "msg_type", "")
+                if msg_type == "nrc_msgs/TrackedObjectSet2":
+                    topic_counts[topic] += int(getattr(tinf, "message_count", 0) or 0)
+    return dict(topic_counts)
+
+
 def _to_nsec(ts) -> int:
     if ts is None:
         return 0
@@ -168,18 +183,11 @@ def _find_sample_index_for_object(
     return best_idx
 
 
-def _resolve_observed_source_topic(input_bags: list[Path], preferred_topic: str | None = None) -> str:
-    topic_counts: dict[str, int] = defaultdict(int)
-    for bag_path in input_bags:
-        if not bag_path.exists():
-            continue
-        with rosbag.Bag(str(bag_path), "r") as bag:
-            info = bag.get_type_and_topic_info()
-            topics_info = getattr(info, "topics", {}) or {}
-            for topic, tinf in topics_info.items():
-                msg_type = getattr(tinf, "msg_type", "")
-                if msg_type == "nrc_msgs/TrackedObjectSet2":
-                    topic_counts[topic] += int(getattr(tinf, "message_count", 0) or 0)
+def _resolve_observed_source_topic(
+    input_bags: list[Path], preferred_topic: str | None = None, topic_counts: dict[str, int] | None = None
+) -> str:
+    if topic_counts is None:
+        topic_counts = _collect_tracked_object_set2_topic_counts(input_bags)
 
     if preferred_topic:
         if topic_counts.get(preferred_topic, 0) > 0:
@@ -192,6 +200,19 @@ def _resolve_observed_source_topic(input_bags: list[Path], preferred_topic: str 
     if topic_counts:
         return max(topic_counts.items(), key=lambda kv: kv[1])[0]
     raise RuntimeError("no nrc_msgs/TrackedObjectSet2 topic found in input bags")
+
+
+def _resolve_wait_publish_count_target(
+    input_bags: list[Path], preferred_topic: str | None = None
+) -> tuple[str, int]:
+    if not HAS_ROSBAG:
+        raise RuntimeError("python rosbag is not available")
+    topic_counts = _collect_tracked_object_set2_topic_counts(input_bags)
+    source_topic = _resolve_observed_source_topic(input_bags, preferred_topic, topic_counts=topic_counts)
+    expected_count = int(topic_counts.get(source_topic, 0) or 0)
+    if expected_count <= 0:
+        raise RuntimeError(f"expected_count is zero for source topic: {source_topic}")
+    return source_topic, expected_count
 
 
 def _collect_observed_source_records(input_bags: list[Path], source_topic: str) -> list[dict]:
@@ -542,6 +563,23 @@ def main() -> int:
 
         if capture_state is not None:
             capture_state.clear_dt()
+        expected_output_count = None
+        expected_source_topic = None
+        if node_name == "trajectory_predictor_sim":
+            try:
+                expected_source_topic, expected_output_count = _resolve_wait_publish_count_target(
+                    bags, observed_source_topic
+                )
+                print(
+                    f"[baseline] {rel}: wait_publish_count target={expected_output_count}"
+                    f" (input topic: {expected_source_topic})"
+                )
+            except Exception as e:
+                print(
+                    f"[baseline] {rel}: wait_publish_count の件数算出に失敗: {e}"
+                    " (silence待ちにフォールバック)",
+                    file=sys.stderr,
+                )
         print(f"[baseline] {rel}: playing {len(bags)} bag(s), recording to {out_bag}")
         record_cmd = ["rosbag", "record", "-O", str(out_bag)] + baseline_record_topics
         rec_proc = run_cmd(record_cmd)
@@ -550,14 +588,57 @@ def main() -> int:
         bag_start = get_bag_start_time(bags[0])
         if bag_start is not None:
             run_clock_preroll(bag_start, duration_sec=2.0)
+        script_dir = root / "scripts"
+        wait_count_proc = None
+        wait_count_started = False
+        if node_name == "trajectory_predictor_sim":
+            wait_count_script = script_dir / "wait_publish_count.py"
+            if expected_output_count is not None and expected_output_count > 0 and wait_count_script.exists():
+                wait_cmd = [
+                    sys.executable,
+                    str(wait_count_script),
+                    baseline_record_topics[0],
+                    str(expected_output_count),
+                    "--timeout-sec",
+                    "120",
+                    "--settle-sec",
+                    "0.3",
+                ]
+                wait_count_proc = subprocess.Popen(
+                    wait_cmd,
+                    env=os.environ,
+                    preexec_fn=os.setsid if os.name != "nt" else None,
+                )
+                wait_count_started = True
         play_cmd = ["rosbag", "play"] + [str(b) for b in bags] + ["--clock"]
         subprocess.run(play_cmd)
-        # trajectory_predictor_sim は逐次実行のため、1秒間 publish がなければ記録終了
+        # trajectory_predictor_sim は件数待ちを優先し、失敗時のみ silence 待ちへフォールバック
         if node_name == "trajectory_predictor_sim":
-            script_dir = root / "scripts"
-            wait_script = script_dir / "wait_publish_silence.py"
-            wait_cmd = [sys.executable, str(wait_script), baseline_record_topics[0], "--silence-sec", "1"]
-            subprocess.run(wait_cmd)
+            waited = False
+            if wait_count_started and wait_count_proc is not None:
+                try:
+                    rc = wait_count_proc.wait(timeout=130.0)
+                except subprocess.TimeoutExpired:
+                    rc = -1
+                    try:
+                        os.killpg(os.getpgid(wait_count_proc.pid), signal.SIGTERM)
+                    except (ProcessLookupError, AttributeError, OSError):
+                        wait_count_proc.terminate()
+                    try:
+                        wait_count_proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        pass
+                waited = (rc == 0)
+                if not waited:
+                    print(
+                        f"[baseline] {rel}: wait_publish_count failed (rc={rc})"
+                        " -> silence待ちにフォールバック",
+                        file=sys.stderr,
+                    )
+            if not waited:
+                wait_script = script_dir / "wait_publish_silence.py"
+                wait_cmd = [sys.executable, str(wait_script), baseline_record_topics[0], "--silence-sec", "1"]
+                subprocess.run(wait_cmd)
         else:
             time.sleep(0.5)
         if rec_proc.poll() is None:
