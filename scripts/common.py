@@ -18,11 +18,64 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    import rosbag
+    HAS_ROSBAG = True
+except Exception:
+    HAS_ROSBAG = False
+
 # trajectory_predictor の標準出力に含まれる dt=30 などの値をパースする正規表現
 DT_VALUE_RE = re.compile(r"dt\s*=\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 
 # trajectory_predictor_io.cpp の ROS_INFO に合わせる（182行目: "Ready. Waiting for data..."）
 NODE_READY_MARKERS = ("Ready. Waiting for data",)
+
+
+def run_trajectory_predictor_offline(
+    pkg: str,
+    node_name: str,
+    input_bags: list[Path],
+    output_bag: Path,
+    output_ns: str,
+    timeout_sec: float | None = None,
+) -> tuple[int, list[float], str]:
+    """
+    Run trajectory_predictor_sim_offline once for one scene.
+    Returns (returncode, dt_values, combined_log_text).
+    """
+    cmd = ["rosrun", pkg, node_name]
+    for bag in input_bags:
+        cmd.extend(["--input-bag", str(bag)])
+    cmd.extend(["--output-bag", str(output_bag), "--output-ns", output_ns])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            env=os.environ,
+        )
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        returncode = int(proc.returncode)
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        returncode = 124
+
+    log_text = stdout + ("\n" if stdout and stderr else "") + stderr
+    dt_values: list[float] = []
+    for m in DT_VALUE_RE.finditer(log_text):
+        try:
+            dt_values.append(float(m.group(1)))
+        except (TypeError, ValueError):
+            continue
+    return (returncode, dt_values, log_text)
 
 
 class PTYCaptureState:
@@ -258,6 +311,44 @@ def discover_bag_directories(test_bags_root: Path) -> list[tuple[str, Path]]:
 def get_bag_files_in_dir(dir_path: Path) -> list[Path]:
     """Return sorted list of .bag files in the directory."""
     return sorted(dir_path.glob("*.bag"))
+
+
+def select_bag_files_by_topics(
+    bag_files: list[Path],
+    required_topics: list[str],
+) -> tuple[list[Path], set[str]]:
+    """
+    Keep only bag files that contain at least one required topic.
+    Returns (selected_bags, matched_topics).
+    If python rosbag is unavailable, returns original bag_files.
+    """
+    if not bag_files or not required_topics:
+        return (bag_files, set())
+    if not HAS_ROSBAG:
+        return (bag_files, set())
+
+    required = set(required_topics)
+    selected: list[Path] = []
+    matched_topics: set[str] = set()
+
+    for bag_path in bag_files:
+        if not bag_path.exists():
+            continue
+        try:
+            with rosbag.Bag(str(bag_path), "r") as bag:
+                info = bag.get_type_and_topic_info()
+                topics = set((info.topics or {}).keys())
+        except Exception:
+            continue
+
+        hit = topics & required
+        if hit:
+            selected.append(bag_path)
+            matched_topics |= hit
+
+    if not selected:
+        return (bag_files, set())
+    return (selected, matched_topics)
 
 
 def get_git_commit_info(repo_path: Path) -> dict:

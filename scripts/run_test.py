@@ -1,48 +1,31 @@
 #!/usr/bin/env python3
-"""
-Test run: trajectory_predictor を1回起動し、全 test_bags ディレクトリを順次再生・記録。
-segfault 等で不正終了した場合は該当 dir に segfault タグを付け、次の dir の前に再起動する。
-最後に compare_baseline_test.py で比較。
-"""
+"""Test run: sceneごとに trajectory_predictor_sim_offline を直接実行し、最後に比較する。"""
 from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 from common import (
     VALIDATION_TEST_NS,
     discover_bag_directories,
     get_bag_files_in_dir,
-    get_bag_start_time,
     get_commit_info_for_run,
     get_tester_root,
-    kill_rosnodes_matching,
     load_settings,
     run_catkin_build,
-    run_clock_preroll,
-    start_clock_publisher,
-    start_trajectory_predictor_and_wait_ready,
-    wait_for_node_ready,
+    run_trajectory_predictor_offline,
+    select_bag_files_by_topics,
 )
-from run_baseline import _build_observed_bag_from_input, _count_topic_messages_in_bag, TP_SIM_INPUT_FRAME_TOPIC
+from run_baseline import (
+    _build_observed_bag_from_input,
+    TP_SIM_OFFLINE_INPUT_TOPICS,
+)
 
 
 VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
-
-
-def run_cmd(cmd: list[str], env: dict | None = None) -> subprocess.Popen:
-    return subprocess.Popen(
-        cmd,
-        env=env or os.environ,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid if os.name != "nt" else None,
-    )
 
 
 def main() -> int:
@@ -50,14 +33,13 @@ def main() -> int:
     settings = load_settings(root)
     paths = settings["paths"]
     test_bags_root = root / paths["test_bags"]
-    baseline_root = root / paths["baseline_results"]
     test_results_root = root / paths["test_results"]
-    record_topics = settings["record_topics"]
     rosparam = settings.get("rosparam", {})
     node_cfg = settings.get("node", {})
     pkg = node_cfg.get("trajectory_predictor_pkg", "nrc_wm_svcs")
     node_name = node_cfg.get("trajectory_predictor_node", "trajectory_predictor")
     observed_source_topic = settings.get("observed_source_topic")
+    use_sim_offline = (node_name == "trajectory_predictor_sim_offline")
 
     if os.environ.get("TP_SKIP_BUILD", "").strip().lower() in ("1", "true", "yes"):
         print("[test] TP_SKIP_BUILD=1: ビルドをスキップ")
@@ -97,191 +79,87 @@ def main() -> int:
         check=True, capture_output=True,
     )
     r = subprocess.run(["rosparam", "get", "/use_sim_time"], capture_output=True, text=True, timeout=5)
-    print(f"[test] /use_sim_time = {r.stdout.strip() if r.returncode == 0 else 'get failed'} (node will use this when started)")
+    print(f"[test] /use_sim_time = {r.stdout.strip() if r.returncode == 0 else 'get failed'} (offline executable will use this)")
 
-    remap_args = [f"{t}:={VALIDATION_TEST_NS}{t}" for t in record_topics]
-    test_record_topics = [f"{VALIDATION_TEST_NS}{t}" for t in record_topics]
-    tp_cmd = ["rosrun", pkg, node_name] + remap_args
-    tp_proc = None
-    capture_state = None
+    if not use_sim_offline:
+        print(
+            f"[test] node.trajectory_predictor_node={node_name} は未対応です。"
+            " trajectory_predictor_sim_offline を設定してください。",
+            file=sys.stderr,
+        )
+        return 1
 
     for rel, dir_path in dirs:
         bags = get_bag_files_in_dir(dir_path)
         if not bags:
             continue
+        selected_bags, matched_topics = select_bag_files_by_topics(
+            bags, TP_SIM_OFFLINE_INPUT_TOPICS
+        )
+        if "/target_tracker/tracked_object_set2" not in matched_topics:
+            print(
+                f"[test] {rel}: /target_tracker/tracked_object_set2 を含む bag が見つかりません",
+                file=sys.stderr,
+            )
+            return 1
+        if len(selected_bags) != len(bags):
+            print(
+                f"[test] {rel}: using {len(selected_bags)}/{len(bags)} bag(s)"
+                f" (matched topics={sorted(matched_topics)})"
+            )
         out_dir = test_results_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)
         out_bag = out_dir / "result_test.bag"
-        baseline_input_bag = baseline_root / rel / "input.bag"
 
-        play_bags = bags
-        expected_output_count = None
-        if node_name == "trajectory_predictor_sim":
-            if not baseline_input_bag.exists():
-                print(f"[test] {rel}: input.bag が見つかりません: {baseline_input_bag}", file=sys.stderr)
-                return 1
-            expected_output_count = _count_topic_messages_in_bag(baseline_input_bag, TP_SIM_INPUT_FRAME_TOPIC)
-            if expected_output_count <= 0:
-                print(
-                    f"[test] {rel}: input.bag に {TP_SIM_INPUT_FRAME_TOPIC} がありません: {baseline_input_bag}",
-                    file=sys.stderr,
-                )
-                return 1
-            play_bags = [baseline_input_bag]
-            print(f"[test] {rel}: use baseline input.bag ({TP_SIM_INPUT_FRAME_TOPIC}={expected_output_count})")
+        if out_bag.exists():
+            out_bag.unlink()
+        print(f"[test] {rel}: offline processing {len(selected_bags)} bag(s) -> {out_bag}")
+        rc, dt_values, run_log = run_trajectory_predictor_offline(
+            pkg=pkg,
+            node_name=node_name,
+            input_bags=selected_bags,
+            output_bag=out_bag,
+            output_ns=VALIDATION_TEST_NS,
+        )
+        if run_log:
+            (out_dir / "tp_run.log").write_text(run_log, encoding="utf-8")
 
-        if tp_proc is None or tp_proc.poll() is not None:
-            kill_rosnodes_matching(node_name)
-            time.sleep(0.5)
-            clock_proc = None
-            if os.environ.get("TP_PUBLISH_CLOCK", "").strip().lower() in ("1", "true", "yes"):
-                clock_proc = start_clock_publisher()
-                if clock_proc is not None:
-                    time.sleep(1.0)
-            tp_proc, ready_ok, cap = start_trajectory_predictor_and_wait_ready(tp_cmd, timeout=30.0)
-            if cap is not None:
-                capture_state = cap
-            if tp_proc is None:
-                tp_proc = subprocess.Popen(
-                    tp_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                    env=os.environ,
-                    preexec_fn=os.setsid if os.name != "nt" else None,
-                )
-                ready_ok = wait_for_node_ready(tp_proc, timeout=30.0)
-            if not ready_ok:
-                if clock_proc is not None and clock_proc.poll() is None:
-                    clock_proc.terminate()
-                    clock_proc.wait(timeout=2)
-                if tp_proc.poll() is None:
-                    try:
-                        os.killpg(os.getpgid(tp_proc.pid), signal.SIGTERM)
-                    except (ProcessLookupError, AttributeError, OSError):
-                        tp_proc.terminate()
-                    tp_proc.wait(timeout=5)
-                print(f"[test] trajectory_predictor が 'Ready. Waiting for data' を出さずタイムアウト。", file=sys.stderr)
-                return 1
-            if clock_proc is not None and clock_proc.poll() is None:
-                clock_proc.terminate()
-                clock_proc.wait(timeout=2)
-            print(f"[test] trajectory_predictor ready (start/restart).")
-            if capture_state is not None:
-                capture_state.forward_to_terminal = False
-
-        if capture_state is not None:
-            capture_state.clear_dt()
-        print(f"[test] {rel}: playing {len(play_bags)} bag(s), recording to {out_bag}")
-        record_cmd = ["rosbag", "record", "-O", str(out_bag)] + test_record_topics
-        rec_proc = run_cmd(record_cmd)
-        time.sleep(1.0)
-        # タイマー位相を揃える: bag の先頭時刻で /clock を 2s 分 publish してから再生（10Hz×2s=20 ティックで位相を安定）
-        bag_start = get_bag_start_time(play_bags[0])
-        if bag_start is not None:
-            run_clock_preroll(bag_start, duration_sec=2.0)
-        script_dir = root / "scripts"
-        wait_count_proc = None
-        wait_count_started = False
-        if node_name == "trajectory_predictor_sim":
-            wait_count_script = script_dir / "wait_publish_count.py"
-            if expected_output_count is not None and expected_output_count > 0 and wait_count_script.exists():
-                wait_cmd = [
-                    sys.executable,
-                    str(wait_count_script),
-                    test_record_topics[0],
-                    str(expected_output_count),
-                    "--timeout-sec",
-                    "120",
-                    "--settle-sec",
-                    "0.3",
-                ]
-                wait_count_proc = subprocess.Popen(
-                    wait_cmd,
-                    env=os.environ,
-                    preexec_fn=os.setsid if os.name != "nt" else None,
-                )
-                wait_count_started = True
-        play_cmd = ["rosbag", "play"] + [str(b) for b in play_bags] + ["--clock"]
-        subprocess.run(play_cmd)
-        # trajectory_predictor_sim は件数待ちを優先し、失敗時のみ silence 待ちへフォールバック
-        if node_name == "trajectory_predictor_sim":
-            waited = False
-            if wait_count_started and wait_count_proc is not None:
-                try:
-                    rc = wait_count_proc.wait(timeout=130.0)
-                except subprocess.TimeoutExpired:
-                    rc = -1
-                    try:
-                        os.killpg(os.getpgid(wait_count_proc.pid), signal.SIGTERM)
-                    except (ProcessLookupError, AttributeError, OSError):
-                        wait_count_proc.terminate()
-                    try:
-                        wait_count_proc.wait(timeout=2.0)
-                    except subprocess.TimeoutExpired:
-                        pass
-                waited = (rc == 0)
-                if not waited:
-                    print(
-                        f"[test] {rel}: wait_publish_count failed (rc={rc})"
-                        " -> silence待ちにフォールバック",
-                        file=sys.stderr,
-                    )
-            if not waited:
-                wait_script = script_dir / "wait_publish_silence.py"
-                wait_cmd = [sys.executable, str(wait_script), test_record_topics[0], "--silence-sec", "1"]
-                subprocess.run(wait_cmd)
+        max_dt = max(dt_values) if dt_values else None
+        if any(v >= 100 for v in dt_values):
+            (out_dir / "dt_status").write_text("invalid")
+        elif any(v >= 70 for v in dt_values):
+            (out_dir / "dt_status").write_text("warning")
         else:
-            time.sleep(0.5)
-        if rec_proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(rec_proc.pid), signal.SIGINT)
-            except (ProcessLookupError, AttributeError):
-                rec_proc.terminate()
-            rec_proc.wait(timeout=5)
+            (out_dir / "dt_status").write_text("valid")
+        (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
 
-        for _ in range(30):
-            if out_bag.exists() and out_bag.stat().st_size > 0:
-                break
-            time.sleep(0.1)
+        if rc != 0:
+            (out_dir / "segfault").touch()
+            (out_dir / "tp_returncode").write_text(str(rc), encoding="utf-8")
+            print(
+                f"[test] {rel}: trajectory_predictor_sim_offline failed (returncode={rc})",
+                file=sys.stderr,
+            )
+            continue
+
         if not out_bag.exists() or out_bag.stat().st_size <= 0:
             print(f"[test] {rel}: result_test.bag が作成されていません: {out_bag}", file=sys.stderr)
             return 1
 
-        if capture_state is not None:
-            values = capture_state.take_dt_values()
-            max_dt = max(values) if values else None
-            if any(v >= 100 for v in values):
-                (out_dir / "dt_status").write_text("invalid")
-            elif any(v >= 70 for v in values):
-                (out_dir / "dt_status").write_text("warning")
-            else:
-                (out_dir / "dt_status").write_text("valid")
-            (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
-
         observed_bag = out_dir / "observed_test.bag"
         try:
             used_topic = _build_observed_bag_from_input(
-                [baseline_input_bag] if node_name == "trajectory_predictor_sim" else bags,
+                selected_bags,
                 observed_bag,
                 result_bag=out_bag,
                 observed_ns=VALIDATION_OBSERVED_TEST_NS,
                 result_ns=VALIDATION_TEST_NS,
-                preferred_source_topic=TP_SIM_INPUT_FRAME_TOPIC if node_name == "trajectory_predictor_sim" else observed_source_topic,
+                preferred_source_topic=observed_source_topic,
             )
             print(f"[test] {rel}: observed trajectories saved to {observed_bag} (source: {used_topic})")
         except Exception as e:
             print(f"[test] {rel}: observed_test.bag 作成に失敗: {e}", file=sys.stderr)
             return 1
-
-        if tp_proc.poll() is not None:
-            (out_dir / "segfault").touch()
-            print(f"[test] {rel}: trajectory_predictor が不正終了 (returncode={tp_proc.returncode})。segfault タグを付け、次回再生前に再起動します。", file=sys.stderr)
-
-    if tp_proc is not None and tp_proc.poll() is None:
-        tp_proc.terminate()
-        tp_proc.wait(timeout=5)
 
     script_dir = root / "scripts"
     compare_script = script_dir / "compare_baseline_test.py"

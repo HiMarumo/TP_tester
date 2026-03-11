@@ -23,7 +23,7 @@
   "node": {
     "trajectory_predictor_repo": "nrc_wm",
     "trajectory_predictor_pkg": "nrc_wm_svcs",
-    "trajectory_predictor_node": "trajectory_predictor_sim",
+    "trajectory_predictor_node": "trajectory_predictor_sim_offline",
     "viewer_pkg": "nrc_svcs",
     "viewer_node": "TrajectoryPredictorViewer",
     "viewer_validation_node": "TrajectoryPredictorViewer_validation"
