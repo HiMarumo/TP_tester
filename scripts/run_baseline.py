@@ -70,6 +70,11 @@ OBSERVED_SOURCE_TOPIC_CANDIDATES = [
     "/sensor_fusion/tracked_object_set2",
     "/local_model/tracked_object_set2",
 ]
+TP_EGO_INTERNAL_ID_DEFAULT = 500000
+TP_EGO_FORWARD_OFFSET_M = 1.93
+TP_EGO_LENGTH_M = 4.7
+TP_EGO_WIDTH_M = 1.85
+TP_EGO_CLASSIFICATION_CAR = 1
 
 
 def run_cmd(cmd: list[str], env: dict | None = None, timeout: float | None = None) -> subprocess.Popen:
@@ -80,6 +85,53 @@ def run_cmd(cmd: list[str], env: dict | None = None, timeout: float | None = Non
         stderr=subprocess.PIPE,
         preexec_fn=os.setsid if os.name != "nt" else None,
     )
+
+
+def _map_tp_internal_id_to_output_id(object_id: int) -> int:
+    if object_id == 500000:
+        return 0
+    if object_id == 500001:
+        return 1
+    return object_id
+
+
+def _extract_logical_pose_internal_ego_id(logical_pose) -> int:
+    if logical_pose is None:
+        return TP_EGO_INTERNAL_ID_DEFAULT
+    for attr in ("id", "object_id", "ego_id"):
+        if hasattr(logical_pose, attr):
+            try:
+                return int(getattr(logical_pose, attr))
+            except (TypeError, ValueError):
+                continue
+    return TP_EGO_INTERNAL_ID_DEFAULT
+
+
+def _extract_ego_state_from_source_msg(msg) -> tuple[tuple[float, float, float, float] | None, int]:
+    if msg is None:
+        return None, TP_EGO_INTERNAL_ID_DEFAULT
+    if not bool(getattr(msg, "has_logical_pose", False)):
+        return None, TP_EGO_INTERNAL_ID_DEFAULT
+
+    logical_pose = getattr(msg, "logical_pose", None)
+    if logical_pose is None:
+        return None, TP_EGO_INTERNAL_ID_DEFAULT
+
+    yaw = float(getattr(logical_pose, "map_yaw", 0.0) or 0.0)
+    x = float(getattr(logical_pose, "map_position_x", 0.0) or 0.0) + TP_EGO_FORWARD_OFFSET_M * math.cos(yaw)
+    y = float(getattr(logical_pose, "map_position_y", 0.0) or 0.0) + TP_EGO_FORWARD_OFFSET_M * math.sin(yaw)
+
+    speed = 0.0
+    if bool(getattr(msg, "has_controller_state", False)):
+        controller_state = getattr(msg, "controller_state", None)
+        speed = float(getattr(controller_state, "velocity", 0.0) or 0.0)
+    elif bool(getattr(msg, "has_odometry_input", False)):
+        odometry_input = getattr(msg, "odometry_input", None)
+        speed = float(getattr(odometry_input, "velocity_rear_axis", 0.0) or 0.0)
+    speed = abs(speed)
+
+    internal_id = _extract_logical_pose_internal_ego_id(logical_pose)
+    return (x, y, yaw, speed), internal_id
 
 
 def _collect_tracked_object_set2_topic_counts(input_bags: list[Path]) -> dict[str, int]:
@@ -194,6 +246,55 @@ def _find_sample_index_for_object(
             best_idx = idx
             best_delta = delta
     return best_idx
+
+
+def _find_sample_index_for_ego_state(
+    records: list[dict],
+    stamps: list[int],
+    start_idx: int,
+    target_ns: int,
+    tolerance_ns: int,
+) -> int | None:
+    if start_idx >= len(stamps):
+        return None
+    lo = bisect.bisect_left(stamps, target_ns - tolerance_ns, lo=start_idx)
+    hi = bisect.bisect_right(stamps, target_ns + tolerance_ns, lo=lo)
+    best_idx = None
+    best_delta = None
+    for idx in range(lo, hi):
+        if records[idx].get("ego_state") is None:
+            continue
+        delta = abs(stamps[idx] - target_ns)
+        if best_idx is None or delta < best_delta:
+            best_idx = idx
+            best_delta = delta
+    return best_idx
+
+
+def _set_quat_from_yaw(quat, yaw: float) -> None:
+    half = 0.5 * yaw
+    quat.x = 0.0
+    quat.y = 0.0
+    quat.z = math.sin(half)
+    quat.w = math.cos(half)
+
+
+def _apply_state_to_traj_obj_object(out_obj, state: tuple[float, float, float, float], internal_id: int) -> None:
+    x, y, yaw, speed = state
+    out_obj.object_id = int(_map_tp_internal_id_to_output_id(internal_id))
+    out_obj.pose.position.x = x
+    out_obj.pose.position.y = y
+    out_obj.pose.position.z = 0.0
+    _set_quat_from_yaw(out_obj.pose.orientation, yaw)
+    out_obj.velocity.linear.x = speed * math.cos(yaw)
+    out_obj.velocity.linear.y = speed * math.sin(yaw)
+    out_obj.velocity.angular.z = 0.0
+    out_obj.acceleration.x = 0.0
+    out_obj.acceleration.y = 0.0
+    out_obj.dimensions.x = TP_EGO_LENGTH_M
+    out_obj.dimensions.y = TP_EGO_WIDTH_M
+    out_obj.dimensions.z = 1.0
+    out_obj.classification = TP_EGO_CLASSIFICATION_CAR
 
 
 def _resolve_observed_source_topic(
@@ -388,6 +489,7 @@ def _collect_observed_source_records(input_bags: list[Path], source_topic: str) 
                 if tracked is None:
                     continue
                 stamp_ns = _msg_stamp_nsec(tracked, t)
+                ego_state, ego_internal_id = _extract_ego_state_from_source_msg(msg)
                 obj_by_id = {}
                 for obj in getattr(tracked, "objects", []) or []:
                     oid = int(getattr(obj, "object_id", -1))
@@ -400,6 +502,8 @@ def _collect_observed_source_records(input_bags: list[Path], source_topic: str) 
                         "msg": tracked,
                         "t": t,
                         "obj_by_id": obj_by_id,
+                        "ego_state": ego_state,
+                        "ego_internal_id": ego_internal_id,
                     }
                 )
     records.sort(key=lambda r: (r["stamp_ns"], r["bag_t_ns"]))
@@ -492,11 +596,13 @@ def _build_observed_bag_from_input(
         if hasattr(observed_msg, "status_message") and hasattr(anchor_msg, "status_message"):
             observed_msg.status_message = anchor_msg.status_message
         observed_msg.objects = []
+        existing_output_ids: set[int] = set()
 
         for anchor_obj in getattr(anchor_msg, "objects", []) or []:
             anchor_oid = int(getattr(anchor_obj, "object_id", -1))
             if anchor_oid < 0:
                 continue
+            existing_output_ids.add(_map_tp_internal_id_to_output_id(anchor_oid))
 
             out_obj = TrackedObject2WithTrajectory()
             out_obj.object = copy.deepcopy(anchor_obj)
@@ -543,6 +649,86 @@ def _build_observed_bag_from_input(
 
                 if found_step is None or found_state is None:
                     # 残り horizon 区間内で再接続不能なら、この object の observed trajectory はここで終端。
+                    break
+
+                if found_step > last_known_step + 1:
+                    denom = float(found_step - last_known_step)
+                    for fill_step in range(last_known_step + 1, found_step):
+                        ratio = float(fill_step - last_known_step) / denom
+                        sampled_states_by_step[fill_step] = _interpolate_state(last_known_state, found_state, ratio)
+
+                sampled_states_by_step[found_step] = found_state
+                last_known_step = found_step
+                last_known_state = found_state
+                search_start_idx = max(search_start_idx, found_idx)
+                step_i = found_step + 1
+
+            for sampled_step in sorted(sampled_states_by_step.keys()):
+                x, y, yaw, speed = sampled_states_by_step[sampled_step]
+                pt = TrajectoryState()
+                if hasattr(pt, "t"):
+                    pt.t = float(sampled_step * OBSERVED_STEP_SEC)
+                if hasattr(pt, "x"):
+                    pt.x = x
+                if hasattr(pt, "y"):
+                    pt.y = y
+                if hasattr(pt, "yaw"):
+                    pt.yaw = yaw
+                if hasattr(pt, "velocity"):
+                    pt.velocity = speed
+                if hasattr(pt, "covariance"):
+                    pt.covariance = [0.0] * 16
+                traj_set.trajectory.append(pt)
+
+            if traj_set.trajectory:
+                out_obj.trajectory_set = [traj_set]
+            observed_msg.objects.append(out_obj)
+
+        ego_anchor_state = rec.get("ego_state")
+        ego_internal_id = int(rec.get("ego_internal_id", TP_EGO_INTERNAL_ID_DEFAULT))
+        ego_output_id = _map_tp_internal_id_to_output_id(ego_internal_id)
+        if ego_anchor_state is not None and ego_output_id not in existing_output_ids:
+
+            out_obj = TrackedObject2WithTrajectory()
+            out_obj.trajectory_set = []
+            _apply_state_to_traj_obj_object(out_obj.object, ego_anchor_state, ego_internal_id)
+
+            traj_set = TrajectoryStateSet()
+            if hasattr(traj_set, "prediction_mode"):
+                traj_set.prediction_mode = 0
+            traj_set.trajectory = []
+
+            sampled_states_by_step: dict[int, tuple[float, float, float, float]] = {0: ego_anchor_state}
+            last_known_step = 0
+            last_known_state = ego_anchor_state
+            search_start_idx = i
+
+            step_i = 1
+            while step_i <= horizon_steps:
+                found_step = None
+                found_idx = None
+                found_state = None
+                search_end_step = horizon_steps
+                for cand_step in range(step_i, search_end_step + 1):
+                    target_ns = anchor_stamp_ns + cand_step * step_ns
+                    sample_idx = _find_sample_index_for_ego_state(
+                        records,
+                        stamps,
+                        search_start_idx,
+                        target_ns,
+                        tolerance_ns,
+                    )
+                    if sample_idx is None:
+                        continue
+                    sample_state = records[sample_idx].get("ego_state")
+                    if sample_state is None:
+                        continue
+                    found_step = cand_step
+                    found_idx = sample_idx
+                    found_state = sample_state
+                    break
+
+                if found_step is None or found_state is None:
                     break
 
                 if found_step > last_known_step + 1:
