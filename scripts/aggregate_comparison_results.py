@@ -7,7 +7,8 @@ from pathlib import Path
 
 from common import discover_bag_directories, get_tester_root, load_settings
 
-VALIDATION_THRESHOLDS = ("strict", "loose")
+VALIDATION_HORIZONS = ("half-time-relaxed", "time-relaxed")
+VALIDATION_THRESHOLDS = ("approximate", "strict")
 
 
 def _default_threshold_summary(detail: str) -> dict:
@@ -20,7 +21,10 @@ def _default_threshold_summary(detail: str) -> dict:
 
 
 def _default_side_summary(detail: str) -> dict:
-    return {threshold: _default_threshold_summary(detail) for threshold in VALIDATION_THRESHOLDS}
+    return {
+        horizon: {threshold: _default_threshold_summary(detail) for threshold in VALIDATION_THRESHOLDS}
+        for horizon in VALIDATION_HORIZONS
+    }
 
 
 def _load_json_dict(path: Path) -> dict | None:
@@ -64,11 +68,33 @@ def _load_side_summary(path: Path, side: str) -> dict:
     raw = _load_json_dict(path)
     if raw is None:
         return _default_side_summary(f"{side}_summary_missing")
-    out = {}
-    for threshold in VALIDATION_THRESHOLDS:
-        out[threshold] = _normalize_threshold_summary(
-            raw.get(threshold, {}),
-            detail_fallback=f"{side}_{threshold}_summary_missing",
+
+    out = _default_side_summary(f"{side}_summary_missing")
+    has_horizon_keys = any((h in raw) or (h.replace("-", "_") in raw) for h in VALIDATION_HORIZONS)
+    if has_horizon_keys:
+        for horizon in VALIDATION_HORIZONS:
+            hnode = raw.get(horizon, raw.get(horizon.replace("-", "_"), {}))
+            if not isinstance(hnode, dict):
+                hnode = {}
+            for threshold in VALIDATION_THRESHOLDS:
+                node = hnode.get(threshold, {})
+                if threshold == "strict" and (not isinstance(node, dict) or not node):
+                    # Backward compatibility: old "time-relaxed as threshold".
+                    if horizon == "time-relaxed":
+                        node = hnode.get("time-relaxed", {}) or hnode.get("loose", {})
+                out[horizon][threshold] = _normalize_threshold_summary(
+                    node,
+                    detail_fallback=f"{side}_{horizon}_{threshold}_summary_missing",
+                )
+    else:
+        # Backward compatibility: old summary schema had only threshold keys.
+        out["half-time-relaxed"]["strict"] = _normalize_threshold_summary(
+            raw.get("half-time-relaxed", {}) or raw.get("half_time_relaxed", {}),
+            detail_fallback=f"{side}_half-time-relaxed_strict_summary_missing",
+        )
+        out["time-relaxed"]["strict"] = _normalize_threshold_summary(
+            raw.get("time-relaxed", {}) or raw.get("loose", {}),
+            detail_fallback=f"{side}_time-relaxed_strict_summary_missing",
         )
     return out
 

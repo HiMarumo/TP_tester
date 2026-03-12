@@ -48,9 +48,10 @@ from PyQt5.QtGui import QColor, QBrush, QPalette
 
 
 # Column headers for comparison table (row 0 = what each column means)
-TABLE_HEADERS = ["", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
-COL_STATUS_MARK = 0
-COL_DIRECTORY = 1
+TABLE_HEADERS = ["", "", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
+COL_HALF_DELTA = 0
+COL_STATUS_MARK = 1
+COL_DIRECTORY = 2
 STATUS_CHANGED = "Changed"
 STATUS_UNCHANGED = "Unchanged"
 COLOR_GREEN = QColor(0, 140, 0)
@@ -89,7 +90,21 @@ LANE_SOURCE_PATTERNS = (
     ("crossing", "crossing_lane_ids_set"),
     ("opposite", "opposite_lane_ids_set"),
 )
-DISPLAY_MODE_LABELS = [
+VALIDATION_OBSERVED_BASELINE_NS = "/validation/observed_baseline"
+VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
+VALIDATION_DISPLAY_HORIZONS = ("half-time-relaxed", "time-relaxed")
+VALIDATION_SUMMARY_HORIZONS = ("half-time-relaxed", "time-relaxed")
+VALIDATION_THRESHOLDS = ("approximate", "strict")
+VALIDATION_SUMMARY_ROWS = (
+    ("half-time-relaxed", "approximate"),
+    ("half-time-relaxed", "strict"),
+    ("time-relaxed", "approximate"),
+    ("time-relaxed", "strict"),
+)
+VALIDATION_GROUPS = ("along", "opposite", "crossing", "other")
+VALIDATION_SIDES = ("baseline", "test")
+VALIDATION_STATUSES = ("optimal", "ignore", "fail", "observed_ok", "observed_ng")
+_DISPLAY_MODE_BASE_LABELS = [
     "Baseline",
     "Test",
     "Diff overlay",
@@ -101,29 +116,33 @@ DISPLAY_MODE_LABELS = [
     "Diff crossing path",
     "Diff other path",
     "Observed",
-    "Baseline strict validation along",
-    "Baseline strict validation opposite",
-    "Baseline strict validation crossing",
-    "Baseline strict validation other",
-    "Baseline loose validation along",
-    "Baseline loose validation opposite",
-    "Baseline loose validation crossing",
-    "Baseline loose validation other",
-    "Test strict validation along",
-    "Test strict validation opposite",
-    "Test strict validation crossing",
-    "Test strict validation other",
-    "Test loose validation along",
-    "Test loose validation opposite",
-    "Test loose validation crossing",
-    "Test loose validation other",
 ]
-VALIDATION_OBSERVED_BASELINE_NS = "/validation/observed_baseline"
-VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
-VALIDATION_THRESHOLDS = ("strict", "loose")
-VALIDATION_GROUPS = ("along", "opposite", "crossing", "other")
-VALIDATION_SIDES = ("baseline", "test")
-VALIDATION_STATUSES = ("optimal", "ignore", "fail", "observed_ok", "observed_ng")
+DISPLAY_MODE_LABELS = list(_DISPLAY_MODE_BASE_LABELS)
+DISPLAY_MODE_VALUES = list(range(len(_DISPLAY_MODE_BASE_LABELS)))
+_validation_groups_per_horizon = len(VALIDATION_THRESHOLDS) * len(VALIDATION_GROUPS)
+_validation_modes_per_side = len(VALIDATION_DISPLAY_HORIZONS) * _validation_groups_per_horizon
+for horizon_index, _horizon in enumerate(VALIDATION_DISPLAY_HORIZONS):
+    for threshold_index, _threshold in enumerate(VALIDATION_THRESHOLDS):
+        for group_index, _group in enumerate(VALIDATION_GROUPS):
+            for _side_label, side_index in (("Baseline", 0), ("Test", 1)):
+                if _threshold == "approximate":
+                    threshold_label = "approximate"
+                else:
+                    threshold_label = "strict"
+                if _horizon == "half-time-relaxed":
+                    label = f"{_side_label} half-time-relaxed {threshold_label} validation {_group}"
+                else:
+                    label = f"{_side_label} time-relaxed {threshold_label} validation {_group}"
+                DISPLAY_MODE_LABELS.append(label)
+                mode_value = (
+                    11
+                    + side_index * _validation_modes_per_side
+                    + horizon_index * _validation_groups_per_horizon
+                    + threshold_index * len(VALIDATION_GROUPS)
+                    + group_index
+                )
+                DISPLAY_MODE_VALUES.append(mode_value)
+
 VALIDATION_SUMMARY_METRIC_WIDTH = 220
 VALIDATION_SUMMARY_VALUE_COL_RATIO = (1, 1)  # Baseline : Test
 
@@ -178,10 +197,76 @@ def _summary_state(comp: dict | None) -> str | None:
     return STATUS_CHANGED
 
 
+def _ok_total(node: dict | None) -> tuple[int, int]:
+    if not isinstance(node, dict):
+        return 0, 0
+    try:
+        ok = int(node.get("ok", 0) or 0)
+    except Exception:
+        ok = 0
+    try:
+        total = int(node.get("total", 0) or 0)
+    except Exception:
+        total = 0
+    return max(0, ok), max(0, total)
+
+
+def _validation_metric_node(side_validation: dict | None, horizon: str, threshold: str):
+    if not isinstance(side_validation, dict):
+        return None
+    hnode = side_validation.get(horizon)
+    if not isinstance(hnode, dict):
+        alt_horizon = horizon.replace("-", "_")
+        hnode = side_validation.get(alt_horizon)
+    if not isinstance(hnode, dict):
+        alt_horizon = horizon.replace("_", "-")
+        hnode = side_validation.get(alt_horizon)
+    if isinstance(hnode, dict):
+        node = hnode.get(threshold)
+        if isinstance(node, dict):
+            return node
+        if horizon == "time-relaxed":
+            node = hnode.get("time-relaxed") or hnode.get("loose")
+            if isinstance(node, dict):
+                return node
+    # Backward compatibility: old schema had threshold keys at side root.
+    node = side_validation.get(threshold)
+    if isinstance(node, dict):
+        return node
+    if horizon == "time-relaxed":
+        node = side_validation.get("time-relaxed") or side_validation.get("loose")
+        if isinstance(node, dict):
+            return node
+    return None
+
+
+def _half_time_relaxed_rate(side_validation: dict | None) -> float | None:
+    node = _validation_metric_node(side_validation, "half-time-relaxed", "approximate")
+    ok, total = _ok_total(node)
+    if total <= 0:
+        return None
+    return 100.0 * float(ok) / float(total)
+
+
+def _half_delta_mark(comp: dict | None) -> str:
+    if not isinstance(comp, dict):
+        return "-"
+    validation = comp.get("validation", {})
+    if not isinstance(validation, dict):
+        return "-"
+    baseline_rate = _half_time_relaxed_rate(validation.get("baseline"))
+    test_rate = _half_time_relaxed_rate(validation.get("test"))
+    if baseline_rate is None or test_rate is None:
+        return "-"
+    if abs(test_rate - baseline_rate) <= 1e-9:
+        return "-"
+    return "↑" if test_rate > baseline_rate else "↓"
+
+
 def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
-    """Return [status_mark, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status] for table row."""
+    """Return [half_delta, status_mark, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
     if not comp:
-        return ["-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
+        return ["-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
     valid = comp.get("valid_frames")
     total = comp.get("total_frames")
     # 全体 = 和集合。古い JSON 用に total が無い場合は record_frames から算出
@@ -217,7 +302,8 @@ def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
         dt_status = dt_status_label
     else:
         dt_status = f"{dt_status_label} ({max_val})"
-    return ["■", rel, valid_str, a, b, c, d, e, seg, dt_status]
+    half_delta = _half_delta_mark(comp)
+    return [half_delta, "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
 
 
 def _validation_rate_stats(node: dict | None) -> tuple[str, float | None]:
@@ -239,9 +325,11 @@ def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QCo
     baseline = validation.get("baseline", {}) if isinstance(validation, dict) else {}
     test = validation.get("test", {}) if isinstance(validation, dict) else {}
     rows: list[tuple[str, str, str, QColor | None, QColor | None]] = []
-    for threshold in ("strict", "loose"):
-        b_text, b_rate = _validation_rate_stats(baseline.get(threshold))
-        t_text, t_rate = _validation_rate_stats(test.get(threshold))
+    for horizon, threshold in VALIDATION_SUMMARY_ROWS:
+        b_node = _validation_metric_node(baseline, horizon, threshold)
+        t_node = _validation_metric_node(test, horizon, threshold)
+        b_text, b_rate = _validation_rate_stats(b_node)
+        t_text, t_rate = _validation_rate_stats(t_node)
         b_color = None
         t_color = None
         if b_rate is not None and t_rate is not None and abs(b_rate - t_rate) > 1e-9:
@@ -251,7 +339,15 @@ def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QCo
             else:
                 b_color = COLOR_RED
                 t_color = COLOR_GREEN
-        rows.append((f"{threshold} success rate", b_text, t_text, b_color, t_color))
+        if threshold == "approximate":
+            th_label = "approximate"
+        else:
+            th_label = "strict"
+        if horizon == "half-time-relaxed":
+            label = f"half-time-relaxed {th_label} success rate"
+        else:
+            label = f"time-relaxed {th_label} success rate"
+        rows.append((label, b_text, t_text, b_color, t_color))
     return rows
 
 
@@ -506,7 +602,7 @@ class ViewerAppPyQt(QMainWindow):
         viewer_host_layout = QVBoxLayout(self.viewer_host)
         viewer_host_layout.addWidget(QLabel("Validation summary"))
         self.validation_table = QTableWidget()
-        self.validation_table.setRowCount(2)
+        self.validation_table.setRowCount(len(VALIDATION_SUMMARY_ROWS))
         self.validation_table.setColumnCount(3)
         self.validation_table.setHorizontalHeaderLabels(["Metric", "Baseline", "Test"])
         self.validation_table.setVerticalHeaderLabels(["", ""])
@@ -515,7 +611,7 @@ class ViewerAppPyQt(QMainWindow):
         # Metric は固定幅、Baseline/Test は残り幅を固定比率で配分する。
         self.validation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.validation_table.verticalHeader().setVisible(False)
-        self.validation_table.setMaximumHeight(130)
+        self.validation_table.setMaximumHeight(190)
         viewer_host_layout.addWidget(self.validation_table)
         viewer_host_layout.addWidget(QLabel("Diff matrix"))
         self.diff_table = QTableWidget()
@@ -676,7 +772,13 @@ class ViewerAppPyQt(QMainWindow):
             cells = _row_from_comp(rel, comp)
             for j, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if j == COL_STATUS_MARK:
+                if j == COL_HALF_DELTA:
+                    item.setTextAlignment(Qt.AlignCenter)
+                    if text == "↑":
+                        item.setForeground(COLOR_GREEN)
+                    elif text == "↓":
+                        item.setForeground(COLOR_RED)
+                elif j == COL_STATUS_MARK:
                     item.setTextAlignment(Qt.AlignCenter)
                     marker_state = _summary_state(comp)
                     if marker_state in STATUS_COLOR:
@@ -685,6 +787,7 @@ class ViewerAppPyQt(QMainWindow):
                     self._set_status_color(item)
                 self.table.setItem(i, j, item)
         self.table.resizeColumnsToContents()
+        self.table.setColumnWidth(COL_HALF_DELTA, 28)
         self.table.setColumnWidth(COL_STATUS_MARK, 24)
 
     def _on_select(self):
@@ -790,8 +893,10 @@ class ViewerAppPyQt(QMainWindow):
         try:
             if mode is None:
                 mode = self.mode_combo.currentIndex()
+            mode_index = int(mode)
+            mode_value = DISPLAY_MODE_VALUES[mode_index] if 0 <= mode_index < len(DISPLAY_MODE_VALUES) else 0
             subprocess.run(
-                ["rostopic", "pub", "-1", "/validation/display_mode", "std_msgs/Int32", str(mode)],
+                ["rostopic", "pub", "-1", "/validation/display_mode", "std_msgs/Int32", str(mode_value)],
                 env=os.environ.copy(), capture_output=True, timeout=2
             )
         except Exception:
@@ -919,14 +1024,15 @@ class ViewerAppPyQt(QMainWindow):
             play_bags.append(str(diff_baseline_bag))
         if diff_test_bag.exists():
             play_bags.append(str(diff_test_bag))
-        for threshold in VALIDATION_THRESHOLDS:
-            for group in VALIDATION_GROUPS:
-                for side in VALIDATION_SIDES:
-                    for status in VALIDATION_STATUSES:
-                        validation_root = self.baseline_root if side == "baseline" else self.test_results_root
-                        validation_bag = validation_root / rel / f"{threshold}_{group}_{side}_{status}.bag"
-                        if validation_bag.exists():
-                            play_bags.append(str(validation_bag))
+        for horizon in VALIDATION_DISPLAY_HORIZONS:
+            for threshold in VALIDATION_THRESHOLDS:
+                for group in VALIDATION_GROUPS:
+                    for side in VALIDATION_SIDES:
+                        for status in VALIDATION_STATUSES:
+                            validation_root = self.baseline_root if side == "baseline" else self.test_results_root
+                            validation_bag = validation_root / rel / f"{horizon}_{threshold}_{group}_{side}_{status}.bag"
+                            if validation_bag.exists():
+                                play_bags.append(str(validation_bag))
         self._playing_rel = rel
         self._publish_display_mode(self.mode_combo.currentIndex())
         self._start_rosbag_play(play_bags)

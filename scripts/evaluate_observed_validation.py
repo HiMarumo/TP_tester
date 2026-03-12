@@ -36,15 +36,100 @@ GROUP_TO_WM_SUFFIX = {
 }
 
 VALIDATION_GROUPS = ("along", "opposite", "crossing", "other")
-VALIDATION_THRESHOLDS = {
-    "strict": {"longitudinal": 2.0, "lateral": 0.5},
-    "loose": {"longitudinal": 5.0, "lateral": 1.0},
+VALIDATION_THRESHOLDS = ("approximate", "strict")
+VALIDATION_HORIZONS = ("half-time-relaxed", "time-relaxed")
+VALIDATION_HORIZON_WINDOWS = {
+    "half-time-relaxed": {"max_t": 5.0, "other_max_t": 1.5},
+    "time-relaxed": {"max_t": 10.0, "other_max_t": 3.0},
 }
+CLASSIFICATION_UNCLASSIFIED = 0
+CLASSIFICATION_PEDESTRIAN = 1
+CLASSIFICATION_CYCLIST = 2
+CLASSIFICATION_MOTORCYCLIST = 3
+CLASSIFICATION_CAR = 4
+CLASSIFICATION_TRUCK = 5
+CLASSIFICATION_BUS = 6
+
+CLASS_GROUP_VEHICLE = "vehicle"
+CLASS_GROUP_BIKE = "bike"
+CLASS_GROUP_PEDESTRIAN = "pedestrian"
+
+CLASS_GROUP_BY_CLASSIFICATION = {
+    CLASSIFICATION_CAR: CLASS_GROUP_VEHICLE,
+    CLASSIFICATION_TRUCK: CLASS_GROUP_VEHICLE,
+    CLASSIFICATION_BUS: CLASS_GROUP_VEHICLE,
+    CLASSIFICATION_CYCLIST: CLASS_GROUP_BIKE,
+    CLASSIFICATION_MOTORCYCLIST: CLASS_GROUP_BIKE,
+    CLASSIFICATION_PEDESTRIAN: CLASS_GROUP_PEDESTRIAN,
+}
+
+CLASS_GROUP_TOLERANCES = {
+    CLASS_GROUP_VEHICLE: {
+        "strict": {
+            "longitudinal": 2.0,
+            "lateral_near": 0.5,
+            "lateral_far": 1.2,
+        },
+        "time-relaxed_start": {
+            "longitudinal": 1.0,
+            "lateral_near": 0.5,
+            "lateral_far": 1.2,
+        },
+        "time-relaxed_end": {
+            "longitudinal": 7.5,
+            "lateral_near": 2.0,
+            "lateral_far": 4.8,
+        },
+    },
+    CLASS_GROUP_BIKE: {
+        "strict": {
+            "longitudinal": 1.5,
+            "lateral_near": 0.35,
+            "lateral_far": 0.84,
+        },
+        "time-relaxed_start": {
+            "longitudinal": 0.5,
+            "lateral_near": 0.35,
+            "lateral_far": 0.84,
+        },
+        "time-relaxed_end": {
+            "longitudinal": 4.0,
+            "lateral_near": 1.5,
+            "lateral_far": 3.6,
+        },
+    },
+    CLASS_GROUP_PEDESTRIAN: {
+        "strict": {
+            "longitudinal": 0.7,
+            "lateral_near": 0.3,
+            "lateral_far": 0.6,
+        },
+        "time-relaxed_start": {
+            "longitudinal": 0.5,
+            "lateral_near": 0.3,
+            "lateral_far": 0.6,
+        },
+        "time-relaxed_end": {
+            "longitudinal": 0.8,
+            "lateral_near": 0.5,
+            "lateral_far": 1.0,
+        },
+    },
+}
+VELOCITY_HEADING_FALLBACK_THRESHOLD_MPS = 3.6 / 3.6
 VALIDATION_STATUSES = ("optimal", "ignore", "fail", "observed_ok", "observed_ng")
+OPTIMAL_SELECTION_GROUP_PRIORITY = {
+    "along": 0,
+    "opposite": 1,
+    "crossing": 2,
+    "other": 3,
+}
 VALIDATION_NS_ROOT = "/validation/eval"
-VALIDATION_OTHER_MAX_T = 3.0
 VSL_STOPLINE_ID = 500001
 VSL_CROSSING_MIN = 500100
+MIN_OBSERVED_EVAL_DURATION_SEC = 3.0
+APPROXIMATE_REQUIRED_STRICT_RATIO = 0.7
+APPROXIMATE_TOLERANCE_SCALE = 1.5
 
 
 def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> None:
@@ -78,7 +163,14 @@ def _default_threshold_summary(detail: str = "ok") -> dict:
 
 
 def default_side_summary(detail: str = "not_evaluated") -> dict:
-    return {threshold: _default_threshold_summary(detail) for threshold in VALIDATION_THRESHOLDS}
+    return {
+        horizon: {threshold: _default_threshold_summary(detail) for threshold in VALIDATION_THRESHOLDS}
+        for horizon in VALIDATION_HORIZONS
+    }
+
+
+def _validation_log_key(side: str, horizon: str, threshold: str) -> str:
+    return f"{side}-{horizon}-{threshold}"
 
 
 def _to_nsec(ts) -> int:
@@ -189,6 +281,18 @@ def _obj_id_of(obj) -> int:
         return -1
 
 
+def _obj_classification_of(obj) -> int:
+    base_obj = getattr(obj, "object", obj)
+    try:
+        return int(getattr(base_obj, "classification", CLASSIFICATION_UNCLASSIFIED))
+    except Exception:
+        return CLASSIFICATION_UNCLASSIFIED
+
+
+def _class_group_for_classification(classification: int) -> str:
+    return CLASS_GROUP_BY_CLASSIFICATION.get(int(classification), CLASS_GROUP_VEHICLE)
+
+
 def _has_predicted_path(traj_obj) -> bool:
     for path_msg in getattr(traj_obj, "trajectory_set", []) or []:
         if getattr(path_msg, "trajectory", []) or []:
@@ -222,11 +326,24 @@ def _sorted_traj_points(path_msg, max_t: float | None = None) -> list:
     return pts
 
 
+def _has_min_observed_duration(traj_obj, min_duration_sec: float = MIN_OBSERVED_EVAL_DURATION_SEC) -> bool:
+    traj_set = list(getattr(traj_obj, "trajectory_set", []) or [])
+    if not traj_set:
+        return False
+    pts = _sorted_traj_points(traj_set[0], max_t=None)
+    if not pts:
+        return False
+    end_t = float(pts[-1][0])
+    return end_t >= (float(min_duration_sec) - 1e-6)
+
+
 def _trajectory_within_threshold(
     observed_path,
     predicted_path,
-    longitudinal_tol: float,
-    lateral_tol: float,
+    horizon: str,
+    threshold: str,
+    horizon_max_t: float,
+    classification: int,
     max_t: float | None = None,
 ) -> tuple[bool, float]:
     obs_pts = _sorted_traj_points(observed_path, max_t=max_t)
@@ -237,8 +354,9 @@ def _trajectory_within_threshold(
     pred_times = [p[0] for p in pred_pts]
     cost = 0.0
     used = 0
+    strict_ok_steps = 0
     max_dt = 0.26
-    for obs_t, obs_x, obs_y, obs_yaw in obs_pts:
+    for i, (obs_t, obs_x, obs_y, obs_yaw) in enumerate(obs_pts):
         idx = bisect_left(pred_times, obs_t)
         candidates = []
         if idx < len(pred_pts):
@@ -253,12 +371,39 @@ def _trajectory_within_threshold(
 
         dx = pred_x - obs_x
         dy = pred_y - obs_y
-        c = math.cos(obs_yaw)
-        s = math.sin(obs_yaw)
+        heading = _observed_heading_from_velocity(obs_pts, i)
+        c = math.cos(heading)
+        s = math.sin(heading)
         longitudinal = c * dx + s * dy
         lateral = -s * dx + c * dy
-        if abs(longitudinal) > longitudinal_tol or abs(lateral) > lateral_tol:
-            return (False, float("inf"))
+        longitudinal_tol, lateral_near, lateral_far = _threshold_tolerances(
+            horizon,
+            threshold,
+            obs_t,
+            horizon_max_t,
+            classification,
+        )
+        lateral_tol = _trapezoid_lateral_tolerance(abs(longitudinal), longitudinal_tol, lateral_near, lateral_far)
+        strict_ok = abs(longitudinal) <= longitudinal_tol and abs(lateral) <= lateral_tol
+        if threshold == "strict":
+            if not strict_ok:
+                return (False, float("inf"))
+        elif threshold == "approximate":
+            expanded_longitudinal_tol = max(1e-6, longitudinal_tol * APPROXIMATE_TOLERANCE_SCALE)
+            expanded_lateral_near = max(1e-6, lateral_near * APPROXIMATE_TOLERANCE_SCALE)
+            expanded_lateral_far = max(1e-6, lateral_far * APPROXIMATE_TOLERANCE_SCALE)
+            expanded_lateral_tol = _trapezoid_lateral_tolerance(
+                abs(longitudinal),
+                expanded_longitudinal_tol,
+                expanded_lateral_near,
+                expanded_lateral_far,
+            )
+            if abs(longitudinal) > expanded_longitudinal_tol or abs(lateral) > expanded_lateral_tol:
+                return (False, float("inf"))
+            if strict_ok:
+                strict_ok_steps += 1
+        else:
+            raise ValueError(f"unsupported validation threshold: {threshold}")
 
         yaw_diff = _normalize_angle(pred_yaw - obs_yaw)
         cost += (
@@ -270,7 +415,92 @@ def _trajectory_within_threshold(
 
     if used <= 0:
         return (False, float("inf"))
+    if threshold == "approximate":
+        strict_ratio = float(strict_ok_steps) / float(used)
+        if strict_ratio + 1e-9 < APPROXIMATE_REQUIRED_STRICT_RATIO:
+            return (False, float("inf"))
     return (True, cost)
+
+
+def _threshold_tolerances(
+    horizon: str,
+    threshold: str,
+    step_t: float,
+    horizon_max_t: float,
+    classification: int,
+) -> tuple[float, float, float]:
+    del threshold
+    class_group = _class_group_for_classification(classification)
+    class_tolerances = CLASS_GROUP_TOLERANCES[class_group]
+    if horizon not in ("time-relaxed", "half-time-relaxed"):
+        raise ValueError(f"unsupported validation horizon: {horizon}")
+    denom = max(1e-6, float(horizon_max_t))
+    ratio = min(1.0, max(0.0, float(step_t) / denom))
+    start = class_tolerances["time-relaxed_start"]
+    end = class_tolerances["time-relaxed_end"]
+    longitudinal = (
+        start["longitudinal"]
+        + (end["longitudinal"] - start["longitudinal"]) * ratio
+    )
+    lateral_near = (
+        start["lateral_near"]
+        + (end["lateral_near"] - start["lateral_near"]) * ratio
+    )
+    lateral_far = (
+        start["lateral_far"]
+        + (end["lateral_far"] - start["lateral_far"]) * ratio
+    )
+    return (
+        max(1e-6, float(longitudinal)),
+        max(1e-6, float(lateral_near)),
+        max(1e-6, float(lateral_far)),
+    )
+
+
+def _trapezoid_lateral_tolerance(abs_longitudinal: float, longitudinal_tol: float, lateral_near: float, lateral_far: float) -> float:
+    ratio = min(1.0, max(0.0, float(abs_longitudinal) / max(1e-6, float(longitudinal_tol))))
+    return max(1e-6, float(lateral_near) + (float(lateral_far) - float(lateral_near)) * ratio)
+
+
+def _observed_heading_from_velocity(obs_pts: list[tuple[float, float, float, float]], idx: int) -> float:
+    _, _, _, yaw = obs_pts[idx]
+    n = len(obs_pts)
+    if n <= 1:
+        return yaw
+
+    def _calc(i0: int, i1: int):
+        if not (0 <= i0 < n and 0 <= i1 < n) or i0 == i1:
+            return None
+        t0, x0, y0, _ = obs_pts[i0]
+        t1, x1, y1, _ = obs_pts[i1]
+        dt = float(t1) - float(t0)
+        if dt <= 1e-6:
+            return None
+        dx = float(x1) - float(x0)
+        dy = float(y1) - float(y0)
+        speed = math.hypot(dx, dy) / dt
+        return dx, dy, speed
+
+    candidates = []
+    if 0 < idx < (n - 1):
+        c = _calc(idx - 1, idx + 1)
+        if c is not None:
+            candidates.append(c)
+    c = _calc(idx, idx + 1)
+    if c is not None:
+        candidates.append(c)
+    c = _calc(idx - 1, idx)
+    if c is not None:
+        candidates.append(c)
+    if not candidates:
+        return yaw
+
+    dx, dy, speed = candidates[0]
+    if speed <= VELOCITY_HEADING_FALLBACK_THRESHOLD_MPS:
+        return yaw
+    if math.hypot(dx, dy) <= 1e-9:
+        return yaw
+    return math.atan2(dy, dx)
 
 
 def _filter_obj_paths_by_indices(obj, indices: list[int]):
@@ -284,23 +514,27 @@ def _filter_obj_paths_by_indices(obj, indices: list[int]):
     return out
 
 
-def _make_validation_topic(side: str, threshold: str, group: str, status: str) -> str:
-    return f"{VALIDATION_NS_ROOT}/{side}/{threshold}/{group}/{status}{GROUP_TO_WM_SUFFIX['base']}"
+def _make_validation_topic(side: str, horizon: str, threshold: str, group: str, status: str) -> str:
+    horizon_topic = horizon.replace("-", "_")
+    threshold_topic = threshold.replace("-", "_")
+    return f"{VALIDATION_NS_ROOT}/{side}/{horizon_topic}/{threshold_topic}/{group}/{status}{GROUP_TO_WM_SUFFIX['base']}"
 
 
 def _build_validation_for_side_threshold(
     rel: str,
     out_dir: Path,
     side: str,
+    horizon: str,
     threshold: str,
-    longitudinal_tol: float,
-    lateral_tol: float,
+    max_t: float,
+    other_max_t: float,
     result_bag: Path,
     observed_bag: Path,
     result_ns: str,
     observed_ns: str,
 ) -> dict:
     summary = _default_threshold_summary("ok")
+    log_key = _validation_log_key(side, horizon, threshold)
     out_records: dict[str, dict[str, list[tuple]]] = {
         group: {status: [] for status in VALIDATION_STATUSES}
         for group in VALIDATION_GROUPS
@@ -326,7 +560,7 @@ def _build_validation_for_side_threshold(
         progress_state = {"last_percent": -1}
         if master_stamps:
             _print_progress_line(
-                f"[validation] {rel} {side}-{threshold}",
+                f"[validation] {rel} {log_key}",
                 0,
                 len(master_stamps),
                 progress_state,
@@ -355,7 +589,7 @@ def _build_validation_for_side_threshold(
                 ref_t, ref_msg = obs_base_rec
             else:
                 _print_progress_line(
-                    f"[validation] {rel} {side}-{threshold}",
+                    f"[validation] {rel} {log_key}",
                     idx,
                     len(master_stamps),
                     progress_state,
@@ -364,6 +598,7 @@ def _build_validation_for_side_threshold(
 
             observed_objs_by_group: dict[str, dict[int, object]] = {}
             predicted_objs_by_group: dict[str, dict[int, object]] = {}
+            excluded_short_observed_ids: set[int] = set()
             for group in VALIDATION_GROUPS:
                 observed_objs_by_group[group] = {}
                 observed_rec = observed_by_group.get(group, {}).get(stamp)
@@ -377,6 +612,8 @@ def _build_validation_for_side_threshold(
                             continue
                         if _has_predicted_path(obj):
                             observed_objs_by_group[group][oid] = obj
+                            if not _has_min_observed_duration(obj):
+                                excluded_short_observed_ids.add(oid)
 
                 predicted_objs_by_group[group] = {}
                 pred_rec = result_by_group.get(group, {}).get(stamp)
@@ -403,6 +640,11 @@ def _build_validation_for_side_threshold(
                     }
                 else:
                     observed_objs_by_group["other"] = {}
+                excluded_short_observed_ids = {
+                    oid for oid in excluded_short_observed_ids if oid in observed_objs_by_group["other"] or any(
+                        oid in observed_objs_by_group[g] for g in VALIDATION_GROUPS if g != "other"
+                    )
+                }
 
             status_pred_indices: dict[str, dict[str, dict[int, list[int]]]] = {
                 "optimal": {g: defaultdict(list) for g in VALIDATION_GROUPS},
@@ -416,13 +658,16 @@ def _build_validation_for_side_threshold(
 
             candidates_by_oid: dict[int, list[tuple[str, int, float]]] = {}
             for group in VALIDATION_GROUPS:
-                max_t = VALIDATION_OTHER_MAX_T if group == "other" else None
+                group_max_t = other_max_t if group == "other" else max_t
                 obs_map = observed_objs_by_group[group]
                 pred_map = predicted_objs_by_group[group]
                 for oid, obs_obj in obs_map.items():
+                    if oid in excluded_short_observed_ids:
+                        continue
                     obs_paths = list(getattr(obs_obj, "trajectory_set", []) or [])
                     if not obs_paths:
                         continue
+                    classification = _obj_classification_of(obs_obj)
                     pred_obj = pred_map.get(oid)
                     if pred_obj is None:
                         continue
@@ -431,9 +676,11 @@ def _build_validation_for_side_threshold(
                         matched, cost = _trajectory_within_threshold(
                             obs_paths[0],
                             pred_path,
-                            longitudinal_tol=longitudinal_tol,
-                            lateral_tol=lateral_tol,
-                            max_t=max_t,
+                            horizon=horizon,
+                            threshold=threshold,
+                            horizon_max_t=group_max_t,
+                            classification=classification,
+                            max_t=group_max_t,
                         )
                         if matched and (best is None or cost < best[1]):
                             best = (path_idx, cost)
@@ -446,11 +693,31 @@ def _build_validation_for_side_threshold(
 
             if stamp in eval_stamp_set:
                 for oid in sorted(observed_ids):
+                    if oid in excluded_short_observed_ids:
+                        # Out-of-scope for metrics (<3s observed), but keep in bags as observed_ok/ignore.
+                        for group in VALIDATION_GROUPS:
+                            obs_obj = observed_objs_by_group[group].get(oid)
+                            if obs_obj is not None:
+                                status_observed_objs["observed_ok"][group][oid] = copy.deepcopy(obs_obj)
+                        for group in VALIDATION_GROUPS:
+                            pred_obj = predicted_objs_by_group[group].get(oid)
+                            if pred_obj is None:
+                                continue
+                            n_paths = len(getattr(pred_obj, "trajectory_set", []) or [])
+                            for pidx in range(n_paths):
+                                status_pred_indices["ignore"][group][oid].append(pidx)
+                        continue
                     summary["total"] += 1
                     candidates = candidates_by_oid.get(oid, [])
                     if candidates:
                         summary["ok"] += 1
-                        opt_group, opt_idx, _opt_cost = min(candidates, key=lambda v: v[2])
+                        opt_group, opt_idx, _opt_cost = min(
+                            candidates,
+                            key=lambda v: (
+                                OPTIMAL_SELECTION_GROUP_PRIORITY.get(v[0], len(OPTIMAL_SELECTION_GROUP_PRIORITY)),
+                                v[2],
+                            ),
+                        )
                         for group in VALIDATION_GROUPS:
                             obs_obj = observed_objs_by_group[group].get(oid)
                             if obs_obj is not None:
@@ -499,7 +766,7 @@ def _build_validation_for_side_threshold(
                     out_records[group][status].append((ref_t, msg_out))
 
             _print_progress_line(
-                f"[validation] {rel} {side}-{threshold}",
+                f"[validation] {rel} {log_key}",
                 idx,
                 len(master_stamps),
                 progress_state,
@@ -514,7 +781,7 @@ def _build_validation_for_side_threshold(
     write_state = {"last_percent": -1}
     if total_write_steps > 0:
         _print_progress_line(
-            f"[validation] {rel} {side}-{threshold} write",
+            f"[validation] {rel} {log_key} write",
             0,
             total_write_steps,
             write_state,
@@ -522,15 +789,15 @@ def _build_validation_for_side_threshold(
     written = 0
     for group in VALIDATION_GROUPS:
         for status in VALIDATION_STATUSES:
-            bag_path = out_dir / f"{threshold}_{group}_{side}_{status}.bag"
-            topic = _make_validation_topic(side, threshold, group, status)
+            bag_path = out_dir / f"{horizon}_{threshold}_{group}_{side}_{status}.bag"
+            topic = _make_validation_topic(side, horizon, threshold, group, status)
             with rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024) as out_bag:
                 for t, msg in out_records[group][status]:
                     out_bag.write(topic, msg, t)
                     written += 1
                     if total_write_steps > 0:
                         _print_progress_line(
-                            f"[validation] {rel} {side}-{threshold} write",
+                            f"[validation] {rel} {log_key} write",
                             written,
                             total_write_steps,
                             write_state,
@@ -538,7 +805,7 @@ def _build_validation_for_side_threshold(
     if total_write_steps == 0:
         for group in VALIDATION_GROUPS:
             for status in VALIDATION_STATUSES:
-                bag_path = out_dir / f"{threshold}_{group}_{side}_{status}.bag"
+                bag_path = out_dir / f"{horizon}_{threshold}_{group}_{side}_{status}.bag"
                 with rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024):
                     pass
     return summary
@@ -554,24 +821,31 @@ def evaluate_validation_for_side(
     observed_ns: str,
 ) -> dict:
     summary = {}
-    for threshold, tol in VALIDATION_THRESHOLDS.items():
-        side_summary = _build_validation_for_side_threshold(
-            rel=rel,
-            out_dir=out_dir,
-            side=side,
-            threshold=threshold,
-            longitudinal_tol=float(tol["longitudinal"]),
-            lateral_tol=float(tol["lateral"]),
-            result_bag=result_bag,
-            observed_bag=observed_bag,
-            result_ns=result_ns,
-            observed_ns=observed_ns,
-        )
-        summary[threshold] = side_summary
-        print(
-            f"[validation] {rel} {side}-{threshold}: "
-            f"{side_summary['rate']:.1f}% ({side_summary['ok']}/{side_summary['total']})"
-        )
+    for horizon in VALIDATION_HORIZONS:
+        summary[horizon] = {}
+        window_cfg = VALIDATION_HORIZON_WINDOWS.get(horizon, VALIDATION_HORIZON_WINDOWS["half-time-relaxed"])
+        max_t = float(window_cfg.get("max_t", 5.0))
+        other_max_t = float(window_cfg.get("other_max_t", max_t))
+        for threshold in VALIDATION_THRESHOLDS:
+            side_summary = _build_validation_for_side_threshold(
+                rel=rel,
+                out_dir=out_dir,
+                side=side,
+                horizon=horizon,
+                threshold=threshold,
+                max_t=max_t,
+                other_max_t=other_max_t,
+                result_bag=result_bag,
+                observed_bag=observed_bag,
+                result_ns=result_ns,
+                observed_ns=observed_ns,
+            )
+            summary[horizon][threshold] = side_summary
+            log_key = _validation_log_key(side, horizon, threshold)
+            print(
+                f"[validation] {rel} {log_key}: "
+                f"{side_summary['rate']:.1f}% ({side_summary['ok']}/{side_summary['total']})"
+            )
     return summary
 
 
