@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Aggregate direct compare JSON and observed-validation JSON into comparison.json."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from common import discover_bag_directories, get_tester_root, load_settings
+
+VALIDATION_THRESHOLDS = ("strict", "loose")
+
+
+def _default_threshold_summary(detail: str) -> dict:
+    return {
+        "ok": 0,
+        "total": 0,
+        "rate": 0.0,
+        "detail": detail,
+    }
+
+
+def _default_side_summary(detail: str) -> dict:
+    return {threshold: _default_threshold_summary(detail) for threshold in VALIDATION_THRESHOLDS}
+
+
+def _load_json_dict(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _normalize_threshold_summary(node: dict, detail_fallback: str) -> dict:
+    if not isinstance(node, dict):
+        return _default_threshold_summary(detail_fallback)
+    try:
+        ok = int(node.get("ok", 0) or 0)
+    except Exception:
+        ok = 0
+    try:
+        total = int(node.get("total", 0) or 0)
+    except Exception:
+        total = 0
+    try:
+        rate = float(node.get("rate", 0.0) or 0.0)
+    except Exception:
+        rate = 0.0
+    if total > 0 and (rate <= 0.0 and ok > 0):
+        rate = (100.0 * float(ok)) / float(total)
+    detail = str(node.get("detail") or detail_fallback)
+    return {
+        "ok": ok,
+        "total": total,
+        "rate": rate,
+        "detail": detail,
+    }
+
+
+def _load_side_summary(path: Path, side: str) -> dict:
+    raw = _load_json_dict(path)
+    if raw is None:
+        return _default_side_summary(f"{side}_summary_missing")
+    out = {}
+    for threshold in VALIDATION_THRESHOLDS:
+        out[threshold] = _normalize_threshold_summary(
+            raw.get(threshold, {}),
+            detail_fallback=f"{side}_{threshold}_summary_missing",
+        )
+    return out
+
+
+def main() -> int:
+    root = get_tester_root()
+    settings = load_settings(root)
+    paths = settings["paths"]
+
+    baseline_root = root / paths["baseline_results"]
+    test_results_root = root / paths["test_results"]
+    dirs = discover_bag_directories(root / paths["test_bags"])
+    if not dirs:
+        return 0
+
+    written = 0
+    for rel, _dir_path in dirs:
+        out_dir = test_results_root / rel
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        direct_path = out_dir / "comparison_direct.json"
+        merged_path = out_dir / "comparison.json"
+        baseline_summary_path = baseline_root / rel / "validation_baseline_summary.json"
+        test_summary_path = out_dir / "validation_test_summary.json"
+
+        comp = _load_json_dict(direct_path)
+        if comp is None:
+            comp = {
+                "directory": rel,
+                "lane_ids_ok": None,
+                "vsl_ok": None,
+                "object_ids_ok": None,
+                "path_ok": None,
+                "traffic_ok": None,
+                "overall_ok": False,
+                "detail": "comparison_direct_missing",
+            }
+
+        comp["validation"] = {
+            "baseline": _load_side_summary(baseline_summary_path, "baseline"),
+            "test": _load_side_summary(test_summary_path, "test"),
+        }
+
+        with open(merged_path, "w", encoding="utf-8") as f:
+            json.dump(comp, f, indent=2, ensure_ascii=False)
+        written += 1
+
+    print(f"[aggregate] wrote {written} comparison.json file(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

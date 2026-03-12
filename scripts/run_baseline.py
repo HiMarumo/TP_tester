@@ -23,6 +23,7 @@ from common import (
     run_trajectory_predictor_offline,
     select_bag_files_by_topics,
 )
+from evaluate_observed_validation import evaluate_validation_for_side
 
 try:
     import rosbag
@@ -436,6 +437,13 @@ def _extract_object_id_from_traj_obj(obj) -> int:
         return -1
 
 
+def _has_predicted_path(traj_obj) -> bool:
+    for path_msg in getattr(traj_obj, "trajectory_set", []) or []:
+        if getattr(path_msg, "trajectory", []) or []:
+            return True
+    return False
+
+
 def _resolve_existing_topic(topics_info: dict, candidates: list[str]) -> str | None:
     for topic in candidates:
         topic_info = topics_info.get(topic)
@@ -470,7 +478,8 @@ def _collect_group_ids_by_stamp_from_result(
                 for obj in getattr(msg, "objects", []) or []:
                     oid = _extract_object_id_from_traj_obj(obj)
                     if oid >= 0:
-                        id_set.add(oid)
+                        if _has_predicted_path(obj):
+                            id_set.add(oid)
     return group_ids
 
 
@@ -897,6 +906,25 @@ def main() -> int:
             print(f"[baseline] {rel}: observed trajectories saved to {observed_bag} (source: {used_topic})")
         except Exception as e:
             print(f"[baseline] {rel}: observed_baseline.bag 作成に失敗: {e}", file=sys.stderr)
+            return 1
+
+        validation_summary_path = out_dir / "validation_baseline_summary.json"
+        try:
+            validation_summary = evaluate_validation_for_side(
+                rel=rel,
+                out_dir=out_dir,
+                side="baseline",
+                result_bag=out_bag,
+                observed_bag=observed_bag,
+                result_ns=VALIDATION_BASELINE_NS,
+                observed_ns=VALIDATION_OBSERVED_BASELINE_NS,
+            )
+            validation_summary_path.write_text(
+                json.dumps(validation_summary, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            print(f"[baseline] {rel}: baseline observed評価に失敗: {e}", file=sys.stderr)
             return 1
 
     print("[baseline] Done.")

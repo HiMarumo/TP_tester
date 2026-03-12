@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Compare baseline vs test result bags and write comparison.json per directory.
+Compare baseline vs test result bags and write comparison_direct.json per directory.
 All comparisons are timestamp-aligned: only messages with the same header.stamp (or bag time)
 are paired. Verifies:
   ① Lane IDs: 共通タイムスタンプ同士で曲線の集合が一致（曲線＝lane id の並び、格納順は不問）
@@ -79,6 +79,14 @@ WM_TOPIC_TO_SOURCE = {
     "/WM/oncoming_object_set_with_prediction": "opposite",
     "/WM/crossing_object_set_with_prediction": "crossing",
     "/WM/other_object_set_with_prediction": "other",
+}
+
+GROUP_TO_WM_SUFFIX = {
+    "base": "/WM/tracked_object_set_with_prediction",
+    "along": "/WM/along_object_set_with_prediction",
+    "opposite": "/WM/oncoming_object_set_with_prediction",
+    "crossing": "/WM/crossing_object_set_with_prediction",
+    "other": "/WM/other_object_set_with_prediction",
 }
 
 # VSL-related object IDs (from trajectory_predictor_data_type.h / core)
@@ -228,8 +236,24 @@ def _object_ids_with_path(msg) -> set:
         if oid is None:
             continue
         traj_set = getattr(obj, "trajectory_set", []) or []
-        if traj_set:
+        has_path = False
+        for path_msg in traj_set:
+            if getattr(path_msg, "trajectory", []) or []:
+                has_path = True
+                break
+        if has_path:
             ids.add(int(oid))
+    return ids
+
+
+def _object_ids_all(msg) -> set:
+    """TrackedObjectSet2WithTrajectory から全 object_id の集合を返す。"""
+    ids = set()
+    for obj in getattr(msg, "objects", []) or []:
+        oid = getattr(getattr(obj, "object", None), "object_id", None)
+        if oid is None:
+            continue
+        ids.add(int(oid))
     return ids
 
 
@@ -280,6 +304,8 @@ def _trajectory_counter(obj) -> Counter:
     - trajectory_set の path 並び順は不問（Counter 比較）"""
     cnt = Counter()
     for path_msg in getattr(obj, "trajectory_set", []) or []:
+        if not (getattr(path_msg, "trajectory", []) or []):
+            continue
         cnt[_trajectory_path_signature(path_msg)] += 1
     return cnt
 
@@ -316,7 +342,9 @@ def _object_trajectory_counters_by_id(msg) -> dict:
         if o is None:
             continue
         oid = int(getattr(o, "object_id", -1))
-        out[oid] = _trajectory_counter(obj)
+        traj_counter = _trajectory_counter(obj)
+        if traj_counter:
+            out[oid] = traj_counter
     return out
 
 
@@ -851,8 +879,12 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
         for stamp in common_stamps:
             _, m1 = bl_by[stamp]
             _, m2 = te_by[stamp]
-            ids_b = _object_ids_with_path(m1)
-            ids_t = _object_ids_with_path(m2)
+            if source == "base":
+                ids_b = _object_ids_all(m1)
+                ids_t = _object_ids_all(m2)
+            else:
+                ids_b = _object_ids_with_path(m1)
+                ids_t = _object_ids_with_path(m2)
             common_ids = ids_b & ids_t
             wm_common_obj[topic_b][stamp] = set()
             wm_common_traj_keep[topic_b][stamp] = {}
@@ -875,6 +907,7 @@ def _write_diff_bags_impl(baseline_bag: Path, test_bag: Path, out_dir: Path) -> 
                 b_counter = _trajectory_counter(b_map[oid])
                 t_counter = _trajectory_counter(t_map[oid])
                 if not b_counter and not t_counter:
+                    wm_common_obj[topic_b][stamp].add(oid)
                     continue
                 common_counter = b_counter & t_counter
                 b_only_counter = b_counter - t_counter
@@ -1201,7 +1234,7 @@ def main() -> int:
         all_results.append(res)
         out_dir = test_results_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)
-        with open(out_dir / "comparison.json", "w", encoding="utf-8") as f:
+        with open(out_dir / "comparison_direct.json", "w", encoding="utf-8") as f:
             json.dump(res, f, indent=2, ensure_ascii=False)
         try:
             _write_diff_bags(baseline_bag, test_bag, out_dir)
@@ -1253,7 +1286,7 @@ def main() -> int:
 
     n_ok = sum(1 for r in all_results if r["overall_ok"])
     n_ng = len(all_results) - n_ok
-    print(f"[compare] Done: {n_ok} Unchanged, {n_ng} Changed. Details: test_results/<dir>/comparison.json")
+    print(f"[compare] Done: {n_ok} Unchanged, {n_ng} Changed. Details: test_results/<dir>/comparison_direct.json")
     return 0 if all(r["overall_ok"] for r in all_results) else 1
 
 

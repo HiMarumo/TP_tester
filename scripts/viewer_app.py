@@ -101,15 +101,31 @@ DISPLAY_MODE_LABELS = [
     "Diff crossing path",
     "Diff other path",
     "Observed",
-    "Compare obs-baseline along",
-    "Compare obs-test along",
-    "Compare obs-baseline opposite",
-    "Compare obs-test opposite",
-    "Compare obs-baseline crossing",
-    "Compare obs-test crossing",
+    "Baseline strict validation along",
+    "Baseline strict validation opposite",
+    "Baseline strict validation crossing",
+    "Baseline strict validation other",
+    "Baseline loose validation along",
+    "Baseline loose validation opposite",
+    "Baseline loose validation crossing",
+    "Baseline loose validation other",
+    "Test strict validation along",
+    "Test strict validation opposite",
+    "Test strict validation crossing",
+    "Test strict validation other",
+    "Test loose validation along",
+    "Test loose validation opposite",
+    "Test loose validation crossing",
+    "Test loose validation other",
 ]
 VALIDATION_OBSERVED_BASELINE_NS = "/validation/observed_baseline"
 VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
+VALIDATION_THRESHOLDS = ("strict", "loose")
+VALIDATION_GROUPS = ("along", "opposite", "crossing", "other")
+VALIDATION_SIDES = ("baseline", "test")
+VALIDATION_STATUSES = ("optimal", "ignore", "fail", "observed_ok", "observed_ng")
+VALIDATION_SUMMARY_METRIC_WIDTH = 220
+VALIDATION_SUMMARY_VALUE_COL_RATIO = (1, 1)  # Baseline : Test
 
 
 class KeepSelectionColorDelegate(QStyledItemDelegate):
@@ -202,6 +218,41 @@ def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
     else:
         dt_status = f"{dt_status_label} ({max_val})"
     return ["■", rel, valid_str, a, b, c, d, e, seg, dt_status]
+
+
+def _validation_rate_stats(node: dict | None) -> tuple[str, float | None]:
+    if not isinstance(node, dict):
+        return "-", None
+    try:
+        ok = int(node.get("ok", 0) or 0)
+        total = int(node.get("total", 0) or 0)
+    except Exception:
+        return "-", None
+    if total <= 0:
+        return "-", None
+    rate = 100.0 * float(ok) / float(total)
+    return f"{rate:.1f}% ({ok}/{total})", rate
+
+
+def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QColor | None, QColor | None]]:
+    validation = comp.get("validation", {}) if isinstance(comp, dict) else {}
+    baseline = validation.get("baseline", {}) if isinstance(validation, dict) else {}
+    test = validation.get("test", {}) if isinstance(validation, dict) else {}
+    rows: list[tuple[str, str, str, QColor | None, QColor | None]] = []
+    for threshold in ("strict", "loose"):
+        b_text, b_rate = _validation_rate_stats(baseline.get(threshold))
+        t_text, t_rate = _validation_rate_stats(test.get(threshold))
+        b_color = None
+        t_color = None
+        if b_rate is not None and t_rate is not None and abs(b_rate - t_rate) > 1e-9:
+            if b_rate > t_rate:
+                b_color = COLOR_GREEN
+                t_color = COLOR_RED
+            else:
+                b_color = COLOR_RED
+                t_color = COLOR_GREEN
+        rows.append((f"{threshold} success rate", b_text, t_text, b_color, t_color))
+    return rows
 
 
 def _empty_diff_map(default_value):
@@ -370,7 +421,36 @@ class ViewerAppPyQt(QMainWindow):
         self._test_commit_info = self._load_commit_info(self.test_results_root / "commit_info.json")
         self._build_ui()
         self._refresh_list()
+        QTimer.singleShot(0, self._update_validation_table_column_widths)
         QTimer.singleShot(0, self._launch_viewer)
+
+    @staticmethod
+    def _terminate_process_tree(proc: subprocess.Popen | None, timeout_sec: float = 2.0) -> None:
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if os.name != "nt":
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
+            else:
+                proc.terminate()
+            proc.wait(timeout=timeout_sec)
+            return
+        except Exception:
+            pass
+        try:
+            if os.name != "nt":
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+            else:
+                proc.kill()
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
 
     @staticmethod
     def _load_commit_info(path: Path) -> dict:
@@ -424,6 +504,19 @@ class ViewerAppPyQt(QMainWindow):
         self.viewer_host.setFrameStyle(QFrame.StyledPanel)
         self.viewer_host.setMinimumSize(400, 300)
         viewer_host_layout = QVBoxLayout(self.viewer_host)
+        viewer_host_layout.addWidget(QLabel("Validation summary"))
+        self.validation_table = QTableWidget()
+        self.validation_table.setRowCount(2)
+        self.validation_table.setColumnCount(3)
+        self.validation_table.setHorizontalHeaderLabels(["Metric", "Baseline", "Test"])
+        self.validation_table.setVerticalHeaderLabels(["", ""])
+        self.validation_table.setSelectionMode(QTableWidget.NoSelection)
+        self.validation_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        # Metric は固定幅、Baseline/Test は残り幅を固定比率で配分する。
+        self.validation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.validation_table.verticalHeader().setVisible(False)
+        self.validation_table.setMaximumHeight(130)
+        viewer_host_layout.addWidget(self.validation_table)
         viewer_host_layout.addWidget(QLabel("Diff matrix"))
         self.diff_table = QTableWidget()
         self.diff_table.setRowCount(len(DIFF_CATEGORY_ROWS))
@@ -480,6 +573,7 @@ class ViewerAppPyQt(QMainWindow):
 
         layout.addWidget(splitter)
         self.resize(900, 600)
+        self._set_validation_table_rows(_validation_summary_rows(None))
         self._set_diff_table_empty()
         self._set_detail_table_rows([])
 
@@ -523,6 +617,47 @@ class ViewerAppPyQt(QMainWindow):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignCenter)
                 self.diff_table.setItem(r, c, item)
+
+    def _set_validation_table_rows(self, rows: list[tuple[str, str, str, QColor | None, QColor | None]]):
+        self.validation_table.setRowCount(len(rows))
+        for i, (name, baseline_text, test_text, baseline_color, test_color) in enumerate(rows):
+            metric_item = QTableWidgetItem(name)
+            metric_item.setBackground(QBrush(QColor(236, 236, 236)))
+            metric_item.setForeground(QBrush(QColor(0, 0, 0)))
+            metric_item.setTextAlignment(Qt.AlignCenter)
+            metric_font = metric_item.font()
+            metric_font.setBold(True)
+            metric_item.setFont(metric_font)
+            baseline_item = QTableWidgetItem(baseline_text)
+            test_item = QTableWidgetItem(test_text)
+            baseline_item.setTextAlignment(Qt.AlignCenter)
+            test_item.setTextAlignment(Qt.AlignCenter)
+            if baseline_color is not None:
+                baseline_item.setForeground(QBrush(baseline_color))
+            if test_color is not None:
+                test_item.setForeground(QBrush(test_color))
+            self.validation_table.setItem(i, 0, metric_item)
+            self.validation_table.setItem(i, 1, baseline_item)
+            self.validation_table.setItem(i, 2, test_item)
+        self.validation_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self._update_validation_table_column_widths()
+
+    def _update_validation_table_column_widths(self):
+        table = getattr(self, "validation_table", None)
+        if table is None:
+            return
+        vp_w = int(table.viewport().width())
+        if vp_w <= 0:
+            return
+        w0 = min(VALIDATION_SUMMARY_METRIC_WIDTH, vp_w)
+        remain = max(0, vp_w - w0)
+        r1, r2 = VALIDATION_SUMMARY_VALUE_COL_RATIO
+        total_r = max(1, r1 + r2)
+        w1 = int((remain * r1) / total_r)
+        w2 = max(0, remain - w1)
+        table.setColumnWidth(0, w0)
+        table.setColumnWidth(1, w1)
+        table.setColumnWidth(2, w2)
 
     def _set_detail_table_rows(self, rows: list[tuple[str, str]]):
         self.detail_table.setRowCount(len(rows))
@@ -573,6 +708,7 @@ class ViewerAppPyQt(QMainWindow):
                 comp = None
 
         if comp is None:
+            self._set_validation_table_rows(_validation_summary_rows(None))
             self._set_diff_table_no_data()
             baseline_bag = self.baseline_root / self.current_rel / "result_baseline.bag"
             test_bag = self.test_results_root / self.current_rel / "result_test.bag"
@@ -584,6 +720,7 @@ class ViewerAppPyQt(QMainWindow):
             ])
             return
 
+        self._set_validation_table_rows(_validation_summary_rows(comp))
         diff_map, diff_counts = _extract_diff_maps(comp)
         for r, (cat, _label) in enumerate(DIFF_CATEGORY_ROWS):
             supported = DIFF_SUPPORTED_SOURCES.get(cat, set())
@@ -684,6 +821,7 @@ class ViewerAppPyQt(QMainWindow):
             env=os.environ.copy(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
         self._viewer_launch_start = time.monotonic()
         self._viewer_launch_timer.start(400)
@@ -781,6 +919,14 @@ class ViewerAppPyQt(QMainWindow):
             play_bags.append(str(diff_baseline_bag))
         if diff_test_bag.exists():
             play_bags.append(str(diff_test_bag))
+        for threshold in VALIDATION_THRESHOLDS:
+            for group in VALIDATION_GROUPS:
+                for side in VALIDATION_SIDES:
+                    for status in VALIDATION_STATUSES:
+                        validation_root = self.baseline_root if side == "baseline" else self.test_results_root
+                        validation_bag = validation_root / rel / f"{threshold}_{group}_{side}_{status}.bag"
+                        if validation_bag.exists():
+                            play_bags.append(str(validation_bag))
         self._playing_rel = rel
         self._publish_display_mode(self.mode_combo.currentIndex())
         self._start_rosbag_play(play_bags)
@@ -794,6 +940,7 @@ class ViewerAppPyQt(QMainWindow):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
         except Exception as e:
             self._set_stopped_state()
@@ -862,14 +1009,16 @@ class ViewerAppPyQt(QMainWindow):
         if self._play_finished_timer and self._play_finished_timer.isActive():
             self._play_finished_timer.stop()
         try:
-            self.play_proc.send_signal(signal.SIGINT)
+            if os.name != "nt":
+                try:
+                    os.killpg(self.play_proc.pid, signal.SIGINT)
+                except Exception:
+                    self.play_proc.send_signal(signal.SIGINT)
+            else:
+                self.play_proc.send_signal(signal.SIGINT)
             self.play_proc.wait(timeout=3)
         except Exception:
-            try:
-                self.play_proc.terminate()
-                self.play_proc.wait(timeout=2)
-            except Exception:
-                pass
+            self._terminate_process_tree(self.play_proc, timeout_sec=2.0)
         self.play_proc = None
         self._play_paused = False
         self._set_stopped_state()
@@ -897,8 +1046,7 @@ class ViewerAppPyQt(QMainWindow):
         """再生プロセスを終了（新規 Play や終了時に使用）。"""
         self._play_paused = False
         if self.play_proc and self.play_proc.poll() is None:
-            self.play_proc.terminate()
-            self.play_proc.wait(timeout=2)
+            self._terminate_process_tree(self.play_proc, timeout_sec=2.0)
             self.play_proc = None
         if self._play_finished_timer and self._play_finished_timer.isActive():
             self._play_finished_timer.stop()
@@ -907,8 +1055,13 @@ class ViewerAppPyQt(QMainWindow):
     def closeEvent(self, event):
         self._stop()
         if self.viewer_proc and self.viewer_proc.poll() is None:
-            self.viewer_proc.terminate()
+            self._terminate_process_tree(self.viewer_proc, timeout_sec=2.0)
+            self.viewer_proc = None
         event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_validation_table_column_widths()
 
 
 def main() -> int:
