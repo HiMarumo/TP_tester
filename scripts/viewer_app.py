@@ -7,8 +7,10 @@ Viewer は別ウィンドウで起動します（同一アプリ内への埋め�
 """
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -25,6 +27,7 @@ from common import (
 
 # PyQt5 前提（Docker で python3-pyqt5 を入れている）
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QFrame,
@@ -39,19 +42,23 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QStyleOptionComboBox,
+    QStylePainter,
     QStyle,
     QVBoxLayout,
     QWidget,
 )
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QBrush, QPalette
+from PyQt5.QtGui import QColor, QBrush, QPalette, QTextDocument, QAbstractTextDocumentLayout
 
 
 # Column headers for comparison table (row 0 = what each column means)
-TABLE_HEADERS = ["", "", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
+TABLE_HEADERS = ["", "L", "O", "P", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
 COL_HALF_DELTA = 0
-COL_STATUS_MARK = 1
-COL_DIRECTORY = 2
+COL_MARK_L = 1
+COL_MARK_O = 2
+COL_MARK_P = 3
+COL_DIRECTORY = 4
 STATUS_CHANGED = "Changed"
 STATUS_UNCHANGED = "Unchanged"
 COLOR_GREEN = QColor(0, 140, 0)
@@ -92,7 +99,12 @@ LANE_SOURCE_PATTERNS = (
 )
 VALIDATION_OBSERVED_BASELINE_NS = "/validation/observed_baseline"
 VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
-VALIDATION_DISPLAY_HORIZONS = ("half-time-relaxed", "time-relaxed")
+VALIDATION_DISPLAY_HORIZONS = ("half-time-relaxed",)
+VALIDATION_MODE_LAYOUT_HORIZONS = ("half-time-relaxed", "time-relaxed")
+VALIDATION_MODE_HORIZON_CODE = {
+    "half-time-relaxed": 0,
+    "time-relaxed": 1,
+}
 VALIDATION_SUMMARY_HORIZONS = ("half-time-relaxed", "time-relaxed")
 VALIDATION_THRESHOLDS = ("approximate", "strict")
 VALIDATION_SUMMARY_ROWS = (
@@ -102,28 +114,42 @@ VALIDATION_SUMMARY_ROWS = (
     ("time-relaxed", "strict"),
 )
 VALIDATION_GROUPS = ("along", "opposite", "crossing", "other")
+VALIDATION_MODE_GROUPS = ("all", "along", "opposite", "crossing", "other")
+VALIDATION_MODE_GROUP_CODE = {
+    "along": 0,
+    "opposite": 1,
+    "crossing": 2,
+    "other": 3,
+    "all": 4,
+}
 VALIDATION_SIDES = ("baseline", "test")
 VALIDATION_STATUSES = ("optimal", "ignore", "fail", "observed_ok", "observed_ng")
-_DISPLAY_MODE_BASE_LABELS = [
-    "Baseline",
-    "Test",
-    "Diff overlay",
-    "Diff along lane",
-    "Diff opposite lane",
-    "Diff crossing lane",
-    "Diff along path",
-    "Diff opposite path",
-    "Diff crossing path",
-    "Diff other path",
-    "Observed",
+_DISPLAY_MODE_BASE_ITEMS = [
+    ("Baseline", 0),
+    ("Test", 1),
+    ("Diff overlay", 2),
+    ("Diff along lane", 3),
+    ("Diff opposite lane", 4),
+    ("Diff crossing lane", 5),
+    ("Diff along path", 6),
+    ("Diff along path with observed", 10),
+    ("Diff opposite path", 7),
+    ("Diff opposite path with observed", 11),
+    ("Diff crossing path", 8),
+    ("Diff crossing path with observed", 12),
+    ("Diff other path", 9),
+    ("Diff other path with observed", 13),
+    ("Observed", 14),
 ]
-DISPLAY_MODE_LABELS = list(_DISPLAY_MODE_BASE_LABELS)
-DISPLAY_MODE_VALUES = list(range(len(_DISPLAY_MODE_BASE_LABELS)))
-_validation_groups_per_horizon = len(VALIDATION_THRESHOLDS) * len(VALIDATION_GROUPS)
-_validation_modes_per_side = len(VALIDATION_DISPLAY_HORIZONS) * _validation_groups_per_horizon
+DISPLAY_MODE_VALIDATION_BEGIN = 15
+DISPLAY_MODE_LABELS = [label for (label, _value) in _DISPLAY_MODE_BASE_ITEMS]
+DISPLAY_MODE_VALUES = [value for (_label, value) in _DISPLAY_MODE_BASE_ITEMS]
+_validation_group_count_for_mode_value = len(VALIDATION_MODE_GROUP_CODE)
+_validation_groups_per_horizon = len(VALIDATION_THRESHOLDS) * _validation_group_count_for_mode_value
+_validation_modes_per_side = len(VALIDATION_MODE_LAYOUT_HORIZONS) * _validation_groups_per_horizon
 for horizon_index, _horizon in enumerate(VALIDATION_DISPLAY_HORIZONS):
     for threshold_index, _threshold in enumerate(VALIDATION_THRESHOLDS):
-        for group_index, _group in enumerate(VALIDATION_GROUPS):
+        for _group in VALIDATION_MODE_GROUPS:
             for _side_label, side_index in (("Baseline", 0), ("Test", 1)):
                 if _threshold == "approximate":
                     threshold_label = "approximate"
@@ -135,16 +161,17 @@ for horizon_index, _horizon in enumerate(VALIDATION_DISPLAY_HORIZONS):
                     label = f"{_side_label} time-relaxed {threshold_label} validation {_group}"
                 DISPLAY_MODE_LABELS.append(label)
                 mode_value = (
-                    11
+                    DISPLAY_MODE_VALIDATION_BEGIN
                     + side_index * _validation_modes_per_side
-                    + horizon_index * _validation_groups_per_horizon
-                    + threshold_index * len(VALIDATION_GROUPS)
-                    + group_index
+                    + VALIDATION_MODE_HORIZON_CODE[_horizon] * _validation_groups_per_horizon
+                    + threshold_index * _validation_group_count_for_mode_value
+                    + VALIDATION_MODE_GROUP_CODE[_group]
                 )
                 DISPLAY_MODE_VALUES.append(mode_value)
 
 VALIDATION_SUMMARY_METRIC_WIDTH = 220
 VALIDATION_SUMMARY_VALUE_COL_RATIO = (1, 1)  # Baseline : Test
+OVERALL_LABEL = "overall"
 
 
 class KeepSelectionColorDelegate(QStyledItemDelegate):
@@ -162,6 +189,84 @@ class KeepSelectionColorDelegate(QStyledItemDelegate):
             if color is not None and color.isValid():
                 opt.palette.setBrush(QPalette.HighlightedText, QBrush(color))
         super().paint(painter, opt, index)
+
+
+class StableHScrollTableWidget(QTableWidget):
+    """Keep horizontal scroll position stable on item selection/current-index changes."""
+
+    def scrollTo(self, index, hint=QAbstractItemView.EnsureVisible):
+        hbar = self.horizontalScrollBar()
+        hval = hbar.value() if hbar is not None else 0
+        super().scrollTo(index, hint)
+        if hbar is not None:
+            hbar.setValue(hval)
+
+
+def _styled_mode_label_html(text: str) -> str:
+    s = html.escape(text or "")
+    color_map = {
+        "along": "#1E8E3E",
+        "opposite": "#D93025",
+        "crossing": "#1A73E8",
+        "other": "#F57C00",
+    }
+    for token, color in color_map.items():
+        pat = re.compile(rf"\b({re.escape(token)})\b", re.IGNORECASE)
+        s = pat.sub(lambda m: f'<span style="color:{color};">{m.group(1)}</span>', s)
+    s = re.sub(r"\b(Baseline)\b", r"<b>\1</b>", s)
+    s = re.sub(r"\b(Test)\b", r"<b>\1</b>", s)
+    return s
+
+
+class RichTextComboItemDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        raw_text = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+
+        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget)
+        doc = QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setHtml(_styled_mode_label_html(raw_text))
+        doc.setTextWidth(max(0.0, float(text_rect.width())))
+
+        painter.save()
+        painter.setClipRect(text_rect)
+        y = text_rect.top() + (text_rect.height() - doc.size().height()) * 0.5
+        painter.translate(text_rect.left(), y)
+        ctx = QAbstractTextDocumentLayout.PaintContext()
+        doc.documentLayout().draw(painter, ctx)
+        painter.restore()
+
+
+class RichTextComboBox(QComboBox):
+    def paintEvent(self, event):
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        raw_text = opt.currentText
+        opt.currentText = ""
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
+
+        text_rect = self.style().subControlRect(
+            QStyle.CC_ComboBox, opt, QStyle.SC_ComboBoxEditField, self
+        )
+        doc = QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setHtml(_styled_mode_label_html(raw_text))
+        doc.setTextWidth(max(0.0, float(text_rect.width())))
+
+        painter.save()
+        painter.setClipRect(text_rect)
+        y = text_rect.top() + (text_rect.height() - doc.size().height()) * 0.5
+        painter.translate(text_rect.left(), y)
+        ctx = QAbstractTextDocumentLayout.PaintContext()
+        doc.documentLayout().draw(painter, ctx)
+        painter.restore()
 
 # TrajectoryPredictorViewer_validation のトピックパラメータ名（record_topics のキーと対応）
 # bag は /validation/baseline または /validation/test の名前空間で記録されているため、viewer 起動時に渡す
@@ -195,6 +300,19 @@ def _summary_state(comp: dict | None) -> str | None:
     if bool(comp.get("lane_ids_ok")) and bool(comp.get("vsl_ok")) and bool(comp.get("object_ids_ok")) and bool(path_ok) and bool(traffic_ok):
         return STATUS_UNCHANGED
     return STATUS_CHANGED
+
+
+def _lop_marker_states(comp: dict | None) -> tuple[str | None, str | None, str | None]:
+    if not isinstance(comp, dict):
+        return None, None, None
+    lane_ok = bool(comp.get("lane_ids_ok"))
+    vsl_ok = bool(comp.get("vsl_ok"))
+    object_ok = bool(comp.get("object_ids_ok"))
+    path_ok = bool(comp.get("path_ok")) if "path_ok" in comp else bool(comp.get("path_and_traffic_ok"))
+    lane_marker = STATUS_UNCHANGED if (lane_ok and vsl_ok) else STATUS_CHANGED
+    object_marker = STATUS_UNCHANGED if object_ok else STATUS_CHANGED
+    path_marker = STATUS_UNCHANGED if path_ok else STATUS_CHANGED
+    return lane_marker, object_marker, path_marker
 
 
 def _ok_total(node: dict | None) -> tuple[int, int]:
@@ -264,9 +382,9 @@ def _half_delta_mark(comp: dict | None) -> str:
 
 
 def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
-    """Return [half_delta, status_mark, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
+    """Return [half_delta, L, O, P, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
     if not comp:
-        return ["-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
+        return ["-", "-", "-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
     valid = comp.get("valid_frames")
     total = comp.get("total_frames")
     # 全体 = 和集合。古い JSON 用に total が無い場合は record_frames から算出
@@ -303,7 +421,7 @@ def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
     else:
         dt_status = f"{dt_status_label} ({max_val})"
     half_delta = _half_delta_mark(comp)
-    return [half_delta, "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
+    return [half_delta, "■", "■", "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
 
 
 def _validation_rate_stats(node: dict | None) -> tuple[str, float | None]:
@@ -478,6 +596,164 @@ def _collect_results(root: Path, test_results_path: str) -> list[tuple[str, Path
     return out
 
 
+def _comp_total_frames(comp: dict | None) -> int | None:
+    if not isinstance(comp, dict):
+        return None
+    total = comp.get("total_frames")
+    if total is not None:
+        try:
+            return max(0, int(total))
+        except Exception:
+            return None
+    valid = comp.get("valid_frames")
+    rb = comp.get("record_frames_baseline")
+    rt = comp.get("record_frames_test")
+    if valid is None or rb is None or rt is None:
+        return None
+    try:
+        return max(0, int(rb) + int(rt) - int(valid))
+    except Exception:
+        return None
+
+
+def _to_int_nonneg(value, default=0) -> int:
+    try:
+        return max(0, int(value))
+    except Exception:
+        return default
+
+
+def _to_float_or_none(value) -> float | None:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _dt_status_rank(status: str | None) -> int:
+    s = _dt_status_display(status)
+    if s == "invalid":
+        return 2
+    if s == "warning":
+        return 1
+    return 0
+
+
+def _dt_status_from_rank(rank: int) -> str:
+    if rank >= 2:
+        return "invalid"
+    if rank == 1:
+        return "warning"
+    return "valid"
+
+
+def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | None:
+    comps = [comp for _rel, _cmp_path, comp in rows if isinstance(comp, dict)]
+    if not comps:
+        return None
+
+    agg_valid = 0
+    agg_total = 0
+    has_total = False
+    lane_ok = True
+    vsl_ok = True
+    object_ok = True
+    path_ok = True
+    traffic_ok = True
+    segfault_baseline = False
+    segfault_test = False
+    dt_rank_baseline = 0
+    dt_rank_test = 0
+    dt_max_baseline = None
+    dt_max_test = None
+    diff_by_source = _empty_diff_map(False)
+    diff_counts_by_source = _empty_diff_map(0)
+
+    validation = {
+        side: {
+            horizon: {
+                threshold: {"ok": 0, "total": 0, "rate": 0.0, "detail": "overall"}
+                for threshold in VALIDATION_THRESHOLDS
+            }
+            for horizon in VALIDATION_SUMMARY_HORIZONS
+        }
+        for side in VALIDATION_SIDES
+    }
+
+    for comp in comps:
+        agg_valid += _to_int_nonneg(comp.get("valid_frames"), 0)
+        total = _comp_total_frames(comp)
+        if total is not None:
+            agg_total += total
+            has_total = True
+        lane_ok = lane_ok and bool(comp.get("lane_ids_ok"))
+        vsl_ok = vsl_ok and bool(comp.get("vsl_ok"))
+        object_ok = object_ok and bool(comp.get("object_ids_ok"))
+        _path_ok = comp.get("path_ok") if "path_ok" in comp else comp.get("path_and_traffic_ok")
+        _traffic_ok = comp.get("traffic_ok") if "traffic_ok" in comp else comp.get("path_and_traffic_ok")
+        path_ok = path_ok and bool(_path_ok)
+        traffic_ok = traffic_ok and bool(_traffic_ok)
+        segfault_baseline = segfault_baseline or bool(comp.get("segfault_baseline"))
+        segfault_test = segfault_test or bool(comp.get("segfault_test"))
+        dt_rank_baseline = max(dt_rank_baseline, _dt_status_rank(comp.get("dt_status_baseline")))
+        dt_rank_test = max(dt_rank_test, _dt_status_rank(comp.get("dt_status_test")))
+        max_b = _to_float_or_none(comp.get("dt_max_baseline"))
+        max_t = _to_float_or_none(comp.get("dt_max_test"))
+        if max_b is not None and (dt_max_baseline is None or max_b > dt_max_baseline):
+            dt_max_baseline = max_b
+        if max_t is not None and (dt_max_test is None or max_t > dt_max_test):
+            dt_max_test = max_t
+
+        comp_diff_map, comp_diff_counts = _extract_diff_maps(comp)
+        for cat, _label in DIFF_CATEGORY_ROWS:
+            for src in DIFF_SUPPORTED_SOURCES.get(cat, set()):
+                diff_by_source[cat][src] = bool(diff_by_source[cat][src]) or bool(comp_diff_map.get(cat, {}).get(src, False))
+                diff_counts_by_source[cat][src] += _to_int_nonneg(comp_diff_counts.get(cat, {}).get(src, 0), 0)
+
+        comp_validation = comp.get("validation", {})
+        for side in VALIDATION_SIDES:
+            side_validation = comp_validation.get(side, {}) if isinstance(comp_validation, dict) else {}
+            for horizon in VALIDATION_SUMMARY_HORIZONS:
+                for threshold in VALIDATION_THRESHOLDS:
+                    node = _validation_metric_node(side_validation, horizon, threshold)
+                    ok, total_cnt = _ok_total(node)
+                    validation[side][horizon][threshold]["ok"] += ok
+                    validation[side][horizon][threshold]["total"] += total_cnt
+
+    for side in VALIDATION_SIDES:
+        for horizon in VALIDATION_SUMMARY_HORIZONS:
+            for threshold in VALIDATION_THRESHOLDS:
+                node = validation[side][horizon][threshold]
+                total_cnt = _to_int_nonneg(node.get("total"), 0)
+                ok = _to_int_nonneg(node.get("ok"), 0)
+                node["rate"] = (float(ok) / float(total_cnt)) if total_cnt > 0 else 0.0
+                node["detail"] = "overall_aggregated"
+
+    out = {
+        "valid_frames": agg_valid,
+        "lane_ids_ok": lane_ok,
+        "vsl_ok": vsl_ok,
+        "object_ids_ok": object_ok,
+        "path_ok": path_ok,
+        "traffic_ok": traffic_ok,
+        "path_and_traffic_ok": bool(path_ok and traffic_ok),
+        "segfault_baseline": segfault_baseline,
+        "segfault_test": segfault_test,
+        "dt_status_baseline": _dt_status_from_rank(dt_rank_baseline),
+        "dt_status_test": _dt_status_from_rank(dt_rank_test),
+        "dt_max_baseline": "-" if dt_max_baseline is None else dt_max_baseline,
+        "dt_max_test": "-" if dt_max_test is None else dt_max_test,
+        "diff_by_source": diff_by_source,
+        "diff_counts_by_source": diff_counts_by_source,
+        "validation": validation,
+        "_overall_total_dirs": len(rows),
+        "_overall_loaded_dirs": len(comps),
+    }
+    if has_total:
+        out["total_frames"] = agg_total
+    return out
+
+
 def set_viewer_rosparams(settings: dict) -> None:
     """settings の rosparam（use_sim_time, map_name）を ROS に設定する。失敗時は stderr に出力する。"""
     rosparam = settings.get("rosparam", {})
@@ -513,6 +789,7 @@ class ViewerAppPyQt(QMainWindow):
         self._viewer_launch_timer = QTimer(self)
         self._viewer_launch_timer.timeout.connect(self._check_viewer_launched)
         self._viewer_launch_start = None
+        self._table_rows: list[dict] = []
         self._baseline_commit_info = self._load_commit_info(self.baseline_root / "commit_info.json")
         self._test_commit_info = self._load_commit_info(self.test_results_root / "commit_info.json")
         self._build_ui()
@@ -576,11 +853,12 @@ class ViewerAppPyQt(QMainWindow):
         left.setFrameStyle(QFrame.StyledPanel)
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(QLabel("Results"))
-        self.table = QTableWidget()
+        self.table = StableHScrollTableWidget()
         self.table.setColumnCount(len(TABLE_HEADERS))
         self.table.setHorizontalHeaderLabels(TABLE_HEADERS)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setItemDelegate(KeepSelectionColorDelegate(self.table))
         self.table.setStyleSheet(
             "QTableWidget::item:selected {"
@@ -647,7 +925,8 @@ class ViewerAppPyQt(QMainWindow):
         right_layout.addWidget(self.detail_table)
 
         right_layout.addWidget(QLabel("Playback mode"))
-        self.mode_combo = QComboBox()
+        self.mode_combo = RichTextComboBox()
+        self.mode_combo.setItemDelegate(RichTextComboItemDelegate(self.mode_combo))
         self.mode_combo.addItems(DISPLAY_MODE_LABELS)
         self.mode_combo.currentIndexChanged.connect(self._publish_display_mode)
         right_layout.addWidget(self.mode_combo)
@@ -655,6 +934,7 @@ class ViewerAppPyQt(QMainWindow):
         btn_layout = QHBoxLayout()
         self.btn_play = QPushButton("Play")
         self.btn_play.clicked.connect(self._play)
+        self.btn_play.setEnabled(False)
         btn_layout.addWidget(self.btn_play)
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setEnabled(False)
@@ -672,6 +952,19 @@ class ViewerAppPyQt(QMainWindow):
         self._set_validation_table_rows(_validation_summary_rows(None))
         self._set_diff_table_empty()
         self._set_detail_table_rows([])
+
+    def _restore_indicator_columns(self):
+        self.table.setColumnHidden(COL_HALF_DELTA, False)
+        self.table.setColumnHidden(COL_MARK_L, False)
+        self.table.setColumnHidden(COL_MARK_O, False)
+        self.table.setColumnHidden(COL_MARK_P, False)
+        self.table.setColumnWidth(COL_HALF_DELTA, 28)
+        self.table.setColumnWidth(COL_MARK_L, 24)
+        self.table.setColumnWidth(COL_MARK_O, 24)
+        self.table.setColumnWidth(COL_MARK_P, 24)
+
+    def _restore_list_viewport(self):
+        self._restore_indicator_columns()
 
     @staticmethod
     def _set_status_color(item: QTableWidgetItem) -> None:
@@ -767,9 +1060,18 @@ class ViewerAppPyQt(QMainWindow):
 
     def _refresh_list(self):
         rows = _collect_results(self.root, self.paths["test_results"])
-        self.table.setRowCount(len(rows))
-        for i, (rel, _cmp_path, comp) in enumerate(rows):
+        overall_comp = _aggregate_comparison(rows)
+        table_rows = [{"rel": OVERALL_LABEL, "comp": overall_comp, "is_overall": True}]
+        for rel, cmp_path, comp in rows:
+            table_rows.append({"rel": rel, "cmp_path": cmp_path, "comp": comp, "is_overall": False})
+        self._table_rows = table_rows
+
+        self.table.setRowCount(len(table_rows))
+        for i, row_data in enumerate(table_rows):
+            rel = row_data.get("rel")
+            comp = row_data.get("comp")
             cells = _row_from_comp(rel, comp)
+            lane_marker, object_marker, path_marker = _lop_marker_states(comp)
             for j, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if j == COL_HALF_DELTA:
@@ -778,49 +1080,66 @@ class ViewerAppPyQt(QMainWindow):
                         item.setForeground(COLOR_GREEN)
                     elif text == "↓":
                         item.setForeground(COLOR_RED)
-                elif j == COL_STATUS_MARK:
+                elif j in (COL_MARK_L, COL_MARK_O, COL_MARK_P):
                     item.setTextAlignment(Qt.AlignCenter)
-                    marker_state = _summary_state(comp)
+                    marker_state = None
+                    if j == COL_MARK_L:
+                        marker_state = lane_marker
+                    elif j == COL_MARK_O:
+                        marker_state = object_marker
+                    elif j == COL_MARK_P:
+                        marker_state = path_marker
                     if marker_state in STATUS_COLOR:
                         item.setForeground(STATUS_COLOR[marker_state])
                 else:
                     self._set_status_color(item)
                 self.table.setItem(i, j, item)
         self.table.resizeColumnsToContents()
-        self.table.setColumnWidth(COL_HALF_DELTA, 28)
-        self.table.setColumnWidth(COL_STATUS_MARK, 24)
+        self._restore_list_viewport()
+        if self.table.rowCount() > 0:
+            self.table.selectRow(0)
+        self._refresh_play_button_enabled()
 
     def _on_select(self):
+        self._restore_list_viewport()
         sel = self.table.selectedIndexes()
         if not sel:
+            self._refresh_play_button_enabled()
             return
         row = sel[0].row()
-        item0 = self.table.item(row, COL_DIRECTORY)
-        self.current_rel = item0.text() if item0 else None
-        if not self.current_rel:
+        if row < 0 or row >= len(self._table_rows):
+            self._refresh_play_button_enabled()
+            return
+        row_data = self._table_rows[row]
+        is_overall = bool(row_data.get("is_overall"))
+        selected_rel = str(row_data.get("rel") or "")
+        self.current_rel = None if is_overall else selected_rel
+        if not is_overall and not self.current_rel:
+            self._refresh_play_button_enabled()
             return
         if self.play_proc and self.play_proc.poll() is None and self._playing_rel is not None and self.current_rel != self._playing_rel:
             self._end_playback()
-        cmp_path = self.test_results_root / self.current_rel / "comparison.json"
-        comp = None
-        if cmp_path.exists():
-            try:
-                with open(cmp_path, "r", encoding="utf-8") as f:
-                    comp = json.load(f)
-            except Exception:
-                comp = None
+        comp = row_data.get("comp")
 
         if comp is None:
             self._set_validation_table_rows(_validation_summary_rows(None))
             self._set_diff_table_no_data()
-            baseline_bag = self.baseline_root / self.current_rel / "result_baseline.bag"
-            test_bag = self.test_results_root / self.current_rel / "result_test.bag"
-            self._set_detail_table_rows([
-                ("Directory", self.current_rel),
-                ("Baseline bag", str(baseline_bag)),
-                ("Test bag", str(test_bag)),
-                ("comparison.json", "not found or parse error"),
-            ])
+            if is_overall:
+                total_dirs = len(self._table_rows) - 1 if self._table_rows else 0
+                self._set_detail_table_rows([
+                    ("Directory", OVERALL_LABEL),
+                    ("comparison.json", f"loaded 0/{total_dirs}"),
+                ])
+            else:
+                baseline_bag = self.baseline_root / self.current_rel / "result_baseline.bag"
+                test_bag = self.test_results_root / self.current_rel / "result_test.bag"
+                self._set_detail_table_rows([
+                    ("Directory", self.current_rel),
+                    ("Baseline bag", str(baseline_bag)),
+                    ("Test bag", str(test_bag)),
+                    ("comparison.json", "not found or parse error"),
+                ])
+            self._refresh_play_button_enabled()
             return
 
         self._set_validation_table_rows(_validation_summary_rows(comp))
@@ -845,8 +1164,6 @@ class ViewerAppPyQt(QMainWindow):
                     item.setForeground(STATUS_COLOR[STATUS_UNCHANGED])
                 self.diff_table.setItem(r, c, item)
 
-        baseline_bag = self.baseline_root / self.current_rel / "result_baseline.bag"
-        test_bag = self.test_results_root / self.current_rel / "result_test.bag"
         valid = comp.get("valid_frames") if comp else None
         total = comp.get("total_frames") if comp else None
         if total is None and comp and valid is not None:
@@ -874,20 +1191,40 @@ class ViewerAppPyQt(QMainWindow):
             dt_max_t = comp.get("dt_max_test") or "-"
             dt_text = f"B:{dt_b}({dt_max_b}) / T:{dt_t}({dt_max_t})"
 
-        detail_rows = [
-            ("Directory", self.current_rel),
-            ("Valid/Total", valid_text),
-            ("Lane IDs", lane_text),
-            ("VSL", vsl_text),
-            ("Object IDs", object_text),
-            ("Path", path_text),
-            ("Traffic", traffic_text),
-            ("Seg fault", seg_text),
-            ("DT status", dt_text),
-            ("Baseline bag", str(baseline_bag)),
-            ("Test bag", str(test_bag)),
-        ]
+        if is_overall:
+            loaded_dirs = _to_int_nonneg(comp.get("_overall_loaded_dirs"), 0)
+            total_dirs = _to_int_nonneg(comp.get("_overall_total_dirs"), max(0, len(self._table_rows) - 1))
+            detail_rows = [
+                ("Directory", OVERALL_LABEL),
+                ("comparison.json", f"loaded {loaded_dirs}/{total_dirs}"),
+                ("Valid/Total", valid_text),
+                ("Lane IDs", lane_text),
+                ("VSL", vsl_text),
+                ("Object IDs", object_text),
+                ("Path", path_text),
+                ("Traffic", traffic_text),
+                ("Seg fault", seg_text),
+                ("DT status", dt_text),
+            ]
+        else:
+            baseline_bag = self.baseline_root / self.current_rel / "result_baseline.bag"
+            test_bag = self.test_results_root / self.current_rel / "result_test.bag"
+            detail_rows = [
+                ("Directory", self.current_rel),
+                ("Valid/Total", valid_text),
+                ("Lane IDs", lane_text),
+                ("VSL", vsl_text),
+                ("Object IDs", object_text),
+                ("Path", path_text),
+                ("Traffic", traffic_text),
+                ("Seg fault", seg_text),
+                ("DT status", dt_text),
+                ("Baseline bag", str(baseline_bag)),
+                ("Test bag", str(test_bag)),
+            ]
         self._set_detail_table_rows(detail_rows)
+        self._restore_list_viewport()
+        self._refresh_play_button_enabled()
 
     def _publish_display_mode(self, mode=None):
         try:
@@ -979,13 +1316,24 @@ class ViewerAppPyQt(QMainWindow):
         if not sel:
             return None
         row = sel[0].row()
-        item0 = self.table.item(row, COL_DIRECTORY)
-        return item0.text() if item0 else None
+        if row < 0 or row >= len(self._table_rows):
+            return None
+        row_data = self._table_rows[row]
+        if row_data.get("is_overall"):
+            return None
+        rel = row_data.get("rel")
+        return str(rel) if rel else None
+
+    def _refresh_play_button_enabled(self):
+        if self.play_proc and self.play_proc.poll() is None:
+            self.btn_play.setEnabled(False)
+            return
+        self.btn_play.setEnabled(self._get_selected_rel() is not None)
 
     def _play(self):
         rel = self._get_selected_rel()
         if not rel:
-            QMessageBox.warning(self, "Play", "Select a data row first.")
+            QMessageBox.warning(self, "Play", "Select a non-overall data row first.")
             return
         self.btn_play.setText("Preparing...")
         self.btn_play.setEnabled(False)
@@ -1003,7 +1351,7 @@ class ViewerAppPyQt(QMainWindow):
         diff_test_bag = out_dir / "diff_test.bag"
         if not baseline_bag.exists():
             self.btn_play.setText("Play")
-            self.btn_play.setEnabled(True)
+            self._refresh_play_button_enabled()
             QMessageBox.warning(self, "Play", f"Baseline bag not found: {baseline_bag}")
             return
         # どのモードで再生開始しても常に全 bag を再生し、表示側でモード切り替えだけする
@@ -1024,7 +1372,7 @@ class ViewerAppPyQt(QMainWindow):
             play_bags.append(str(diff_baseline_bag))
         if diff_test_bag.exists():
             play_bags.append(str(diff_test_bag))
-        for horizon in VALIDATION_DISPLAY_HORIZONS:
+        for horizon in VALIDATION_MODE_LAYOUT_HORIZONS:
             for threshold in VALIDATION_THRESHOLDS:
                 for group in VALIDATION_GROUPS:
                     for side in VALIDATION_SIDES:
@@ -1091,8 +1439,8 @@ class ViewerAppPyQt(QMainWindow):
 
     def _set_stopped_state(self):
         self._playing_rel = None
-        self.btn_play.setEnabled(True)
         self.btn_play.setText("Play")
+        self._refresh_play_button_enabled()
         self.btn_stop.setEnabled(False)
         self.btn_stop.setText("Stop")
         self.btn_end_play.setEnabled(False)
