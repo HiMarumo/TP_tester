@@ -9,6 +9,7 @@ from common import discover_bag_directories, get_tester_root, load_settings
 
 VALIDATION_HORIZONS = ("half-time-relaxed", "time-relaxed")
 VALIDATION_THRESHOLDS = ("approximate", "strict")
+COLLISION_KINDS = ("hard", "soft")
 
 
 def _default_threshold_summary(detail: str) -> dict:
@@ -25,6 +26,19 @@ def _default_side_summary(detail: str) -> dict:
         horizon: {threshold: _default_threshold_summary(detail) for threshold in VALIDATION_THRESHOLDS}
         for horizon in VALIDATION_HORIZONS
     }
+
+
+def _default_collision_kind_summary(detail: str) -> dict:
+    return {
+        "has_collision": False,
+        "collision_paths": 0,
+        "checked_paths": 0,
+        "detail": detail,
+    }
+
+
+def _default_collision_side_summary(detail: str) -> dict:
+    return {kind: _default_collision_kind_summary(detail) for kind in COLLISION_KINDS}
 
 
 def _load_json_dict(path: Path) -> dict | None:
@@ -99,6 +113,45 @@ def _load_side_summary(path: Path, side: str) -> dict:
     return out
 
 
+def _normalize_collision_kind_summary(node: dict, detail_fallback: str) -> dict:
+    if not isinstance(node, dict):
+        return _default_collision_kind_summary(detail_fallback)
+    has_collision = bool(node.get("has_collision", False))
+    try:
+        collision_paths = max(0, int(node.get("collision_paths", 0) or 0))
+    except Exception:
+        collision_paths = 0
+    try:
+        checked_paths = max(0, int(node.get("checked_paths", 0) or 0))
+    except Exception:
+        checked_paths = 0
+    detail = str(node.get("detail") or detail_fallback)
+    if collision_paths > 0:
+        has_collision = True
+    return {
+        "has_collision": has_collision,
+        "collision_paths": collision_paths,
+        "checked_paths": checked_paths,
+        "detail": detail,
+    }
+
+
+def _load_side_collision(path: Path, side: str) -> dict:
+    raw = _load_json_dict(path)
+    if raw is None:
+        return _default_collision_side_summary(f"{side}_collision_summary_missing")
+    collision = raw.get("collision", {})
+    if not isinstance(collision, dict):
+        return _default_collision_side_summary(f"{side}_collision_summary_missing")
+    out = _default_collision_side_summary(f"{side}_collision_summary_missing")
+    for kind in COLLISION_KINDS:
+        out[kind] = _normalize_collision_kind_summary(
+            collision.get(kind, {}),
+            detail_fallback=f"{side}_{kind}_collision_summary_missing",
+        )
+    return out
+
+
 def main() -> int:
     root = get_tester_root()
     settings = load_settings(root)
@@ -136,6 +189,10 @@ def main() -> int:
         comp["validation"] = {
             "baseline": _load_side_summary(baseline_summary_path, "baseline"),
             "test": _load_side_summary(test_summary_path, "test"),
+        }
+        comp["collision"] = {
+            "baseline": _load_side_collision(baseline_summary_path, "baseline"),
+            "test": _load_side_collision(test_summary_path, "test"),
         }
 
         with open(merged_path, "w", encoding="utf-8") as f:

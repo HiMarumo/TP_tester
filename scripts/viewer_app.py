@@ -107,6 +107,7 @@ VALIDATION_MODE_HORIZON_CODE = {
 }
 VALIDATION_SUMMARY_HORIZONS = ("half-time-relaxed", "time-relaxed")
 VALIDATION_THRESHOLDS = ("approximate", "strict")
+COLLISION_KINDS = ("hard", "soft")
 VALIDATION_SUMMARY_ROWS = (
     ("half-time-relaxed", "approximate"),
     ("half-time-relaxed", "strict"),
@@ -142,6 +143,10 @@ _DISPLAY_MODE_BASE_ITEMS = [
     ("Observed", 14),
 ]
 DISPLAY_MODE_VALIDATION_BEGIN = 15
+DISPLAY_MODE_COLLISION_HARD_BASELINE = 55
+DISPLAY_MODE_COLLISION_HARD_TEST = 56
+DISPLAY_MODE_COLLISION_SOFT_BASELINE = 57
+DISPLAY_MODE_COLLISION_SOFT_TEST = 58
 DISPLAY_MODE_LABELS = [label for (label, _value) in _DISPLAY_MODE_BASE_ITEMS]
 DISPLAY_MODE_VALUES = [value for (_label, value) in _DISPLAY_MODE_BASE_ITEMS]
 _validation_group_count_for_mode_value = len(VALIDATION_MODE_GROUP_CODE)
@@ -168,6 +173,22 @@ for horizon_index, _horizon in enumerate(VALIDATION_DISPLAY_HORIZONS):
                     + VALIDATION_MODE_GROUP_CODE[_group]
                 )
                 DISPLAY_MODE_VALUES.append(mode_value)
+DISPLAY_MODE_LABELS.extend(
+    [
+        "Baseline hard collision",
+        "Test hard collision",
+        "Baseline soft collision",
+        "Test soft collision",
+    ]
+)
+DISPLAY_MODE_VALUES.extend(
+    [
+        DISPLAY_MODE_COLLISION_HARD_BASELINE,
+        DISPLAY_MODE_COLLISION_HARD_TEST,
+        DISPLAY_MODE_COLLISION_SOFT_BASELINE,
+        DISPLAY_MODE_COLLISION_SOFT_TEST,
+    ]
+)
 
 VALIDATION_SUMMARY_METRIC_WIDTH = 220
 VALIDATION_SUMMARY_VALUE_COL_RATIO = (1, 1)  # Baseline : Test
@@ -438,11 +459,34 @@ def _validation_rate_stats(node: dict | None) -> tuple[str, float | None]:
     return f"{rate:.1f}% ({ok}/{total})", rate
 
 
+def _collision_kind_node(side_collision: dict | None, kind: str):
+    if not isinstance(side_collision, dict):
+        return None
+    node = side_collision.get(kind)
+    return node if isinstance(node, dict) else None
+
+
+def _collision_state_stats(node: dict | None) -> tuple[str, QColor | None]:
+    if not isinstance(node, dict):
+        return "-", None
+    has_collision = bool(node.get("has_collision", False))
+    if has_collision:
+        return "Collision", COLOR_RED
+    return "Safe", COLOR_GREEN
+
+
 def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QColor | None, QColor | None]]:
     validation = comp.get("validation", {}) if isinstance(comp, dict) else {}
     baseline = validation.get("baseline", {}) if isinstance(validation, dict) else {}
     test = validation.get("test", {}) if isinstance(validation, dict) else {}
+    collision = comp.get("collision", {}) if isinstance(comp, dict) else {}
+    collision_baseline = collision.get("baseline", {}) if isinstance(collision, dict) else {}
+    collision_test = collision.get("test", {}) if isinstance(collision, dict) else {}
     rows: list[tuple[str, str, str, QColor | None, QColor | None]] = []
+    for kind in COLLISION_KINDS:
+        b_text, b_color = _collision_state_stats(_collision_kind_node(collision_baseline, kind))
+        t_text, t_color = _collision_state_stats(_collision_kind_node(collision_test, kind))
+        rows.append((f"{kind}-collision judgement", b_text, t_text, b_color, t_color))
     for horizon, threshold in VALIDATION_SUMMARY_ROWS:
         b_node = _validation_metric_node(baseline, horizon, threshold)
         t_node = _validation_metric_node(test, horizon, threshold)
@@ -679,6 +723,18 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
         }
         for side in VALIDATION_SIDES
     }
+    collision = {
+        side: {
+            kind: {
+                "has_collision": False,
+                "collision_paths": 0,
+                "checked_paths": 0,
+                "detail": "overall",
+            }
+            for kind in COLLISION_KINDS
+        }
+        for side in VALIDATION_SIDES
+    }
 
     for comp in comps:
         agg_valid += _to_int_nonneg(comp.get("valid_frames"), 0)
@@ -719,6 +775,18 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                     ok, total_cnt = _ok_total(node)
                     validation[side][horizon][threshold]["ok"] += ok
                     validation[side][horizon][threshold]["total"] += total_cnt
+        comp_collision = comp.get("collision", {})
+        for side in VALIDATION_SIDES:
+            side_collision = comp_collision.get(side, {}) if isinstance(comp_collision, dict) else {}
+            for kind in COLLISION_KINDS:
+                node = _collision_kind_node(side_collision, kind)
+                if not isinstance(node, dict):
+                    continue
+                collision[side][kind]["has_collision"] = (
+                    bool(collision[side][kind]["has_collision"]) or bool(node.get("has_collision", False))
+                )
+                collision[side][kind]["collision_paths"] += _to_int_nonneg(node.get("collision_paths"), 0)
+                collision[side][kind]["checked_paths"] += _to_int_nonneg(node.get("checked_paths"), 0)
 
     for side in VALIDATION_SIDES:
         for horizon in VALIDATION_SUMMARY_HORIZONS:
@@ -746,6 +814,7 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
         "diff_by_source": diff_by_source,
         "diff_counts_by_source": diff_counts_by_source,
         "validation": validation,
+        "collision": collision,
         "_overall_total_dirs": len(rows),
         "_overall_loaded_dirs": len(comps),
     }
@@ -880,7 +949,7 @@ class ViewerAppPyQt(QMainWindow):
         viewer_host_layout = QVBoxLayout(self.viewer_host)
         viewer_host_layout.addWidget(QLabel("Validation summary"))
         self.validation_table = QTableWidget()
-        self.validation_table.setRowCount(len(VALIDATION_SUMMARY_ROWS))
+        self.validation_table.setRowCount(len(VALIDATION_SUMMARY_ROWS) + len(COLLISION_KINDS))
         self.validation_table.setColumnCount(3)
         self.validation_table.setHorizontalHeaderLabels(["Metric", "Baseline", "Test"])
         self.validation_table.setVerticalHeaderLabels(["", ""])
@@ -889,7 +958,7 @@ class ViewerAppPyQt(QMainWindow):
         # Metric は固定幅、Baseline/Test は残り幅を固定比率で配分する。
         self.validation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.validation_table.verticalHeader().setVisible(False)
-        self.validation_table.setMaximumHeight(190)
+        self.validation_table.setMaximumHeight(240)
         viewer_host_layout.addWidget(self.validation_table)
         viewer_host_layout.addWidget(QLabel("Diff matrix"))
         self.diff_table = QTableWidget()
@@ -1343,8 +1412,14 @@ class ViewerAppPyQt(QMainWindow):
         set_viewer_rosparams(self.settings)
         baseline_bag = self.baseline_root / rel / "result_baseline.bag"
         observed_baseline_bag = self.baseline_root / rel / "observed_baseline.bag"
+        collision_baseline_bag = self.baseline_root / rel / "collision_judgement_baseline.bag"
+        collision_baseline_bag_legacy = self.baseline_root / rel / "collision_judgement.bag"
+        validation_baseline_bag = self.baseline_root / rel / "validation_baseline.bag"
         test_bag = self.test_results_root / rel / "result_test.bag"
         observed_test_bag = self.test_results_root / rel / "observed_test.bag"
+        collision_test_bag = self.test_results_root / rel / "collision_judgement_test.bag"
+        collision_test_bag_legacy = self.test_results_root / rel / "collision_judgement.bag"
+        validation_test_bag = self.test_results_root / rel / "validation_test.bag"
         out_dir = self.test_results_root / rel
         common_bag = out_dir / "common.bag"
         diff_baseline_bag = out_dir / "diff_baseline.bag"
@@ -1362,25 +1437,39 @@ class ViewerAppPyQt(QMainWindow):
         play_bags.append(str(baseline_bag))
         if observed_baseline_bag.exists():
             play_bags.append(str(observed_baseline_bag))
+        if collision_baseline_bag.exists():
+            play_bags.append(str(collision_baseline_bag))
+        elif collision_baseline_bag_legacy.exists():
+            play_bags.append(str(collision_baseline_bag_legacy))
+        if validation_baseline_bag.exists():
+            play_bags.append(str(validation_baseline_bag))
         if test_bag.exists():
             play_bags.append(str(test_bag))
         if observed_test_bag.exists():
             play_bags.append(str(observed_test_bag))
+        if collision_test_bag.exists():
+            play_bags.append(str(collision_test_bag))
+        elif collision_test_bag_legacy.exists():
+            play_bags.append(str(collision_test_bag_legacy))
+        if validation_test_bag.exists():
+            play_bags.append(str(validation_test_bag))
         if common_bag.exists():
             play_bags.append(str(common_bag))
         if diff_baseline_bag.exists():
             play_bags.append(str(diff_baseline_bag))
         if diff_test_bag.exists():
             play_bags.append(str(diff_test_bag))
-        for horizon in VALIDATION_MODE_LAYOUT_HORIZONS:
-            for threshold in VALIDATION_THRESHOLDS:
-                for group in VALIDATION_GROUPS:
-                    for side in VALIDATION_SIDES:
-                        for status in VALIDATION_STATUSES:
-                            validation_root = self.baseline_root if side == "baseline" else self.test_results_root
-                            validation_bag = validation_root / rel / f"{horizon}_{threshold}_{group}_{side}_{status}.bag"
-                            if validation_bag.exists():
-                                play_bags.append(str(validation_bag))
+        # backward compatibility: when unified validation bag is absent, load legacy split bags.
+        if (not validation_baseline_bag.exists()) or (not validation_test_bag.exists()):
+            for horizon in VALIDATION_MODE_LAYOUT_HORIZONS:
+                for threshold in VALIDATION_THRESHOLDS:
+                    for group in VALIDATION_GROUPS:
+                        for side in VALIDATION_SIDES:
+                            for status in VALIDATION_STATUSES:
+                                validation_root = self.baseline_root if side == "baseline" else self.test_results_root
+                                validation_bag = validation_root / rel / f"{horizon}_{threshold}_{group}_{side}_{status}.bag"
+                                if validation_bag.exists():
+                                    play_bags.append(str(validation_bag))
         self._playing_rel = rel
         self._publish_display_mode(self.mode_combo.currentIndex())
         self._start_rosbag_play(play_bags)

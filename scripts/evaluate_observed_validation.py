@@ -125,8 +125,25 @@ OPTIMAL_SELECTION_GROUP_PRIORITY = {
     "other": 3,
 }
 VALIDATION_NS_ROOT = "/validation/eval"
+COLLISION_NS_ROOT = "/validation/collision"
+COLLISION_KINDS = ("hard", "soft")
+COLLISION_GROUPED_STATUSES = ("pred_collision", "pred_safe", "ego_pred_collision", "ego_pred_safe")
+COLLISION_BASE_STATUSES = ("ego_observed_collision", "ego_observed_safe")
+COLLISION_ALL_STATUSES = COLLISION_GROUPED_STATUSES + COLLISION_BASE_STATUSES
+COLLISION_KIND_MULTIPLIERS = {
+    "hard": {
+        "size_scale": 1.0,
+        "major_scale": 1.0,
+    },
+    "soft": {
+        "size_scale": 1.1,
+        "major_scale": 2.0,
+    },
+}
+COLLISION_POINT_MATCH_MAX_DT = 0.26
 VSL_STOPLINE_ID = 500001
 VSL_CROSSING_MIN = 500100
+EGO_OBJECT_IDS = (0, 500000)
 MIN_OBSERVED_EVAL_DURATION_SEC = 3.0
 APPROXIMATE_REQUIRED_STRICT_RATIO = 0.7
 APPROXIMATE_TOLERANCE_SCALE = 1.5
@@ -162,11 +179,26 @@ def _default_threshold_summary(detail: str = "ok") -> dict:
     }
 
 
-def default_side_summary(detail: str = "not_evaluated") -> dict:
+def _default_collision_kind_summary(detail: str = "ok") -> dict:
     return {
+        "has_collision": False,
+        "collision_paths": 0,
+        "checked_paths": 0,
+        "detail": detail,
+    }
+
+
+def _default_collision_summary(detail: str = "ok") -> dict:
+    return {kind: _default_collision_kind_summary(detail) for kind in COLLISION_KINDS}
+
+
+def default_side_summary(detail: str = "not_evaluated") -> dict:
+    out = {
         horizon: {threshold: _default_threshold_summary(detail) for threshold in VALIDATION_THRESHOLDS}
         for horizon in VALIDATION_HORIZONS
     }
+    out["collision"] = _default_collision_summary(detail)
+    return out
 
 
 def _validation_log_key(side: str, horizon: str, threshold: str) -> str:
@@ -301,7 +333,11 @@ def _has_predicted_path(traj_obj) -> bool:
 
 
 def _is_vsl_id(object_id: int) -> bool:
-    return object_id == VSL_STOPLINE_ID or object_id >= VSL_CROSSING_MIN
+    return object_id in (1, VSL_STOPLINE_ID) or object_id >= VSL_CROSSING_MIN
+
+
+def _is_ego_id(object_id: int) -> bool:
+    return int(object_id) in EGO_OBJECT_IDS
 
 
 def _normalize_angle(angle: float) -> float:
@@ -503,6 +539,316 @@ def _observed_heading_from_velocity(obs_pts: list[tuple[float, float, float, flo
     return math.atan2(dy, dx)
 
 
+def _obj_dimensions_of(obj) -> tuple[float, float]:
+    base_obj = getattr(obj, "object", obj)
+    dims = getattr(base_obj, "dimensions", None)
+    length = float(getattr(dims, "x", 0.0) or 0.0) if dims is not None else 0.0
+    width = float(getattr(dims, "y", 0.0) or 0.0) if dims is not None else 0.0
+    if length <= 1e-3:
+        length = float(getattr(base_obj, "length", 0.0) or 0.0)
+    if width <= 1e-3:
+        width = float(getattr(base_obj, "width", 0.0) or 0.0)
+    if length <= 1e-3:
+        length = 4.0
+    if width <= 1e-3:
+        width = 1.8
+    return (max(0.1, length), max(0.1, width))
+
+
+def _sorted_collision_points(path_msg, max_t: float | None = None) -> list[dict]:
+    pts = []
+    for pt in getattr(path_msg, "trajectory", []) or []:
+        t = float(getattr(pt, "t", 0.0) or 0.0)
+        if max_t is not None and t > max_t + 1e-6:
+            continue
+        x = float(getattr(pt, "x", 0.0) or 0.0)
+        y = float(getattr(pt, "y", 0.0) or 0.0)
+        yaw = float(getattr(pt, "yaw", 0.0) or 0.0)
+        speed = float(getattr(pt, "velocity", 0.0) or 0.0) if hasattr(pt, "velocity") else 0.0
+        pts.append({"t": t, "x": x, "y": y, "yaw": yaw, "speed_hint": abs(speed)})
+    pts.sort(key=lambda v: v["t"])
+    return pts
+
+
+def _path_heading_speed(points: list[dict], idx: int) -> tuple[float, float]:
+    p = points[idx]
+    yaw = float(p.get("yaw", 0.0))
+    speed_hint = float(p.get("speed_hint", 0.0) or 0.0)
+    n = len(points)
+    if n <= 1:
+        return yaw, max(0.0, speed_hint)
+
+    def _calc(i0: int, i1: int):
+        if not (0 <= i0 < n and 0 <= i1 < n) or i0 == i1:
+            return None
+        p0 = points[i0]
+        p1 = points[i1]
+        dt = float(p1["t"]) - float(p0["t"])
+        if dt <= 1e-6:
+            return None
+        dx = float(p1["x"]) - float(p0["x"])
+        dy = float(p1["y"]) - float(p0["y"])
+        speed = math.hypot(dx, dy) / dt
+        return dx, dy, speed
+
+    derived_speed = 0.0
+    derived_heading = None
+    for pair in ((idx - 1, idx + 1), (idx, idx + 1), (idx - 1, idx)):
+        c = _calc(pair[0], pair[1])
+        if c is None:
+            continue
+        dx, dy, speed = c
+        if speed > derived_speed:
+            derived_speed = speed
+        if derived_heading is None and math.hypot(dx, dy) > 1e-9 and speed > 1e-6:
+            derived_heading = math.atan2(dy, dx)
+
+    step_speed = speed_hint if speed_hint > 1e-6 else derived_speed
+    step_speed = max(0.0, step_speed)
+    # At low speed, collider heading must use the path yaw at this step.
+    if step_speed <= VELOCITY_HEADING_FALLBACK_THRESHOLD_MPS:
+        return (yaw, step_speed)
+    # At higher speed, use position-delta heading if available; otherwise yaw.
+    if derived_heading is not None:
+        return (derived_heading, step_speed)
+    return (yaw, max(0.0, step_speed))
+
+
+def _build_collision_curve(points: list[dict]) -> dict:
+    s_vals: list[float] = []
+    segments: list[dict] = []
+    seg_s1: list[float] = []
+    if not points:
+        return {"points": [], "s": s_vals, "segments": segments, "seg_s1": seg_s1}
+    s_vals = [0.0] * len(points)
+    accum = 0.0
+    for i in range(1, len(points)):
+        x0 = float(points[i - 1]["x"])
+        y0 = float(points[i - 1]["y"])
+        x1 = float(points[i]["x"])
+        y1 = float(points[i]["y"])
+        dx = x1 - x0
+        dy = y1 - y0
+        seg_len = math.hypot(dx, dy)
+        accum += seg_len
+        s_vals[i] = accum
+        if seg_len > 1e-9:
+            ux = dx / seg_len
+            uy = dy / seg_len
+            seg = {
+                "s0": s_vals[i - 1],
+                "s1": s_vals[i],
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                "ux": ux,
+                "uy": uy,
+            }
+            segments.append(seg)
+            seg_s1.append(seg["s1"])
+    return {"points": points, "s": s_vals, "segments": segments, "seg_s1": seg_s1}
+
+
+def _sample_collision_curve(
+    curve: dict,
+    target_s: float,
+    anchor_idx: int,
+    fallback_heading: float,
+) -> tuple[float, float, float, float]:
+    points = curve.get("points", [])
+    s_vals = curve.get("s", [])
+    segments = curve.get("segments", [])
+    seg_s1 = curve.get("seg_s1", [])
+    if not points:
+        tx = math.cos(fallback_heading)
+        ty = math.sin(fallback_heading)
+        return (0.0, 0.0, tx, ty)
+
+    if not segments:
+        use_idx = min(max(0, int(anchor_idx)), len(points) - 1)
+        anchor = points[use_idx]
+        anchor_s = float(s_vals[use_idx]) if use_idx < len(s_vals) else 0.0
+        tx = math.cos(fallback_heading)
+        ty = math.sin(fallback_heading)
+        delta = float(target_s) - anchor_s
+        x = float(anchor["x"]) + tx * delta
+        y = float(anchor["y"]) + ty * delta
+        return (x, y, tx, ty)
+
+    if target_s <= float(segments[0]["s0"]):
+        seg = segments[0]
+        delta = float(target_s) - float(seg["s0"])
+        x = float(seg["x0"]) + float(seg["ux"]) * delta
+        y = float(seg["y0"]) + float(seg["uy"]) * delta
+        return (x, y, float(seg["ux"]), float(seg["uy"]))
+    if target_s >= float(segments[-1]["s1"]):
+        seg = segments[-1]
+        delta = float(target_s) - float(seg["s1"])
+        x = float(seg["x1"]) + float(seg["ux"]) * delta
+        y = float(seg["y1"]) + float(seg["uy"]) * delta
+        return (x, y, float(seg["ux"]), float(seg["uy"]))
+
+    idx = bisect_left(seg_s1, float(target_s))
+    if idx >= len(segments):
+        idx = len(segments) - 1
+    seg = segments[idx]
+    delta = float(target_s) - float(seg["s0"])
+    x = float(seg["x0"]) + float(seg["ux"]) * delta
+    y = float(seg["y0"]) + float(seg["uy"]) * delta
+    return (x, y, float(seg["ux"]), float(seg["uy"]))
+
+
+def _nearest_point_by_time(points: list[dict], times: list[float], t: float, max_dt: float = COLLISION_POINT_MATCH_MAX_DT):
+    if not points or not times:
+        return None
+    idx = bisect_left(times, t)
+    candidates = []
+    if idx < len(points):
+        candidates.append((idx, points[idx]))
+    if idx - 1 >= 0:
+        candidates.append((idx - 1, points[idx - 1]))
+    if not candidates:
+        return None
+    best_idx, best = min(candidates, key=lambda ip: abs(float(ip[1]["t"]) - float(t)))
+    if abs(float(best["t"]) - float(t)) > max_dt:
+        return None
+    return (best_idx, best)
+
+
+def _collider_polygon(
+    curve: dict,
+    base_idx: int,
+    fallback_heading: float,
+    speed: float,
+    length: float,
+    width: float,
+    kind: str,
+) -> list[tuple[float, float]]:
+    cfg = COLLISION_KIND_MULTIPLIERS.get(kind, COLLISION_KIND_MULTIPLIERS["soft"])
+    scale = float(cfg["size_scale"])
+    major_scale = float(cfg["major_scale"])
+    rect_l = max(0.1, float(length) * scale)
+    rect_w = max(0.1, float(width) * scale)
+    half_l = 0.5 * rect_l
+    half_w = 0.5 * rect_w
+    speed_step = max(0.0, float(speed))
+    # At very low speed, do not append the forward half-ellipse component.
+    # The half-ellipse major axis uses step speed with kind-specific scaling.
+    major = 0.0
+    if speed_step > VELOCITY_HEADING_FALLBACK_THRESHOLD_MPS:
+        major = max(0.0, speed_step * major_scale)
+    half_major = 0.5 * major
+
+    local_pts: list[tuple[float, float]] = [
+        (-half_l, -half_w),
+        (-half_l, +half_w),
+        (+half_l, +half_w),
+    ]
+    if half_major > 1e-6:
+        steps = 10
+        for i in range(steps + 1):
+            ratio = float(i) / float(steps)
+            theta = (math.pi * 0.5) - ratio * math.pi
+            ex = +half_l + half_major * math.cos(theta)
+            ey = half_w * math.sin(theta)
+            local_pts.append((ex, ey))
+    local_pts.append((+half_l, -half_w))
+
+    out = []
+    s_vals = curve.get("s", [])
+    if s_vals and 0 <= int(base_idx) < len(s_vals):
+        base_s = float(s_vals[int(base_idx)])
+    else:
+        base_s = 0.0
+    for ds, d in local_pts:
+        cx, cy, tx, ty = _sample_collision_curve(
+            curve,
+            base_s + float(ds),
+            int(base_idx),
+            float(fallback_heading),
+        )
+        nx = -ty
+        ny = tx
+        gx = cx + nx * float(d)
+        gy = cy + ny * float(d)
+        out.append((gx, gy))
+    return out
+
+
+def _project_polygon(poly: list[tuple[float, float]], axis_x: float, axis_y: float) -> tuple[float, float]:
+    dots = [p[0] * axis_x + p[1] * axis_y for p in poly]
+    return (min(dots), max(dots))
+
+
+def _polygons_intersect(poly_a: list[tuple[float, float]], poly_b: list[tuple[float, float]]) -> bool:
+    if len(poly_a) < 3 or len(poly_b) < 3:
+        return False
+    for poly in (poly_a, poly_b):
+        n = len(poly)
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            ex = x2 - x1
+            ey = y2 - y1
+            nx = -ey
+            ny = ex
+            norm = math.hypot(nx, ny)
+            if norm <= 1e-9:
+                continue
+            nx /= norm
+            ny /= norm
+            a_min, a_max = _project_polygon(poly_a, nx, ny)
+            b_min, b_max = _project_polygon(poly_b, nx, ny)
+            if a_max < b_min - 1e-9 or b_max < a_min - 1e-9:
+                return False
+    return True
+
+
+def _path_has_collision_with_ego(
+    pred_path,
+    pred_dims: tuple[float, float],
+    ego_path,
+    ego_dims: tuple[float, float],
+    other_kind: str,
+) -> bool:
+    pred_pts = _sorted_collision_points(pred_path)
+    ego_pts = _sorted_collision_points(ego_path)
+    if not pred_pts or not ego_pts:
+        return False
+    pred_curve = _build_collision_curve(pred_pts)
+    ego_curve = _build_collision_curve(ego_pts)
+    ego_times = [float(p["t"]) for p in ego_pts]
+    for i, pred in enumerate(pred_pts):
+        heading, speed = _path_heading_speed(pred_pts, i)
+        ego_pair = _nearest_point_by_time(ego_pts, ego_times, float(pred["t"]))
+        if ego_pair is None:
+            continue
+        ego_idx, _ = ego_pair
+        ego_heading, ego_speed = _path_heading_speed(ego_pts, ego_idx)
+        pred_poly = _collider_polygon(
+            pred_curve,
+            i,
+            heading,
+            speed,
+            pred_dims[0],
+            pred_dims[1],
+            other_kind,
+        )
+        ego_poly = _collider_polygon(
+            ego_curve,
+            ego_idx,
+            ego_heading,
+            ego_speed,
+            ego_dims[0],
+            ego_dims[1],
+            "soft",
+        )
+        if _polygons_intersect(pred_poly, ego_poly):
+            return True
+    return False
+
+
 def _filter_obj_paths_by_indices(obj, indices: list[int]):
     out = copy.deepcopy(obj)
     kept = []
@@ -520,6 +866,337 @@ def _make_validation_topic(side: str, horizon: str, threshold: str, group: str, 
     return f"{VALIDATION_NS_ROOT}/{side}/{horizon_topic}/{threshold_topic}/{group}/{status}{GROUP_TO_WM_SUFFIX['base']}"
 
 
+def _empty_validation_out_records() -> dict[str, dict[str, list[tuple]]]:
+    return {
+        group: {status: [] for status in VALIDATION_STATUSES}
+        for group in VALIDATION_GROUPS
+    }
+
+
+def _make_collision_topic(side: str, kind: str, status: str, group: str | None = None) -> str:
+    if status in COLLISION_GROUPED_STATUSES:
+        suffix = GROUP_TO_WM_SUFFIX.get(group or "other", GROUP_TO_WM_SUFFIX["other"])
+    else:
+        suffix = GROUP_TO_WM_SUFFIX["base"]
+    return f"{COLLISION_NS_ROOT}/{side}/{kind}/{status}{suffix}"
+
+
+def _write_validation_records_to_bag(
+    rel: str,
+    side: str,
+    horizon: str,
+    threshold: str,
+    out_records: dict[str, dict[str, list[tuple]]],
+    out_bag,
+) -> None:
+    log_key = _validation_log_key(side, horizon, threshold)
+    total_write_steps = sum(len(out_records[g][s]) for g in VALIDATION_GROUPS for s in VALIDATION_STATUSES)
+    write_state = {"last_percent": -1}
+    if total_write_steps > 0:
+        _print_progress_line(
+            f"[validation] {rel} {log_key} write",
+            0,
+            total_write_steps,
+            write_state,
+        )
+    written = 0
+    for group in VALIDATION_GROUPS:
+        for status in VALIDATION_STATUSES:
+            topic = _make_validation_topic(side, horizon, threshold, group, status)
+            for t, msg in out_records[group][status]:
+                out_bag.write(topic, msg, t)
+                written += 1
+                if total_write_steps > 0:
+                    _print_progress_line(
+                        f"[validation] {rel} {log_key} write",
+                        written,
+                        total_write_steps,
+                        write_state,
+                    )
+
+
+def _build_collision_for_side(
+    rel: str,
+    out_dir: Path,
+    side: str,
+    result_bag: Path,
+    observed_bag: Path,
+    result_ns: str,
+    observed_ns: str,
+) -> dict:
+    summary = _default_collision_summary("ok")
+    out_grouped: dict[str, dict[str, dict[str, list[tuple]]]] = {
+        kind: {status: {group: [] for group in VALIDATION_GROUPS} for status in COLLISION_GROUPED_STATUSES}
+        for kind in COLLISION_KINDS
+    }
+    out_base: dict[str, dict[str, list[tuple]]] = {
+        kind: {status: [] for status in COLLISION_BASE_STATUSES}
+        for kind in COLLISION_KINDS
+    }
+
+    if not HAS_ROSBAG:
+        for kind in COLLISION_KINDS:
+            summary[kind]["detail"] = "rosbag not available"
+    elif not result_bag.exists():
+        for kind in COLLISION_KINDS:
+            summary[kind]["detail"] = f"result bag missing: {result_bag}"
+    elif not observed_bag.exists():
+        for kind in COLLISION_KINDS:
+            summary[kind]["detail"] = f"observed bag missing: {observed_bag}"
+    else:
+        result_topics = _resolve_group_topics(result_bag, result_ns)
+        observed_topics = _resolve_group_topics(observed_bag, observed_ns)
+        result_by_group = _collect_group_messages_by_stamp(result_bag, result_topics)
+        observed_by_group = _collect_group_messages_by_stamp(observed_bag, observed_topics)
+
+        result_base_stamps = set(result_by_group.get("base", {}).keys())
+        observed_base_stamps = set(observed_by_group.get("base", {}).keys())
+        eval_stamp_set = result_base_stamps & observed_base_stamps
+        master_stamps = sorted(result_base_stamps)
+
+        progress_state = {"last_percent": -1}
+        if master_stamps:
+            _print_progress_line(
+                f"[collision] {rel} {side}",
+                0,
+                len(master_stamps),
+                progress_state,
+            )
+
+        def _first_template(group: str):
+            by_group_o = observed_by_group.get(group, {})
+            if by_group_o:
+                return next(iter(by_group_o.values()))[1]
+            by_group_r = result_by_group.get(group, {})
+            if by_group_r:
+                return next(iter(by_group_r.values()))[1]
+            return None
+
+        group_templates = {g: _first_template(g) for g in VALIDATION_GROUPS}
+        base_template = _first_template("base")
+
+        for idx, stamp in enumerate(master_stamps, start=1):
+            res_base_rec = result_by_group.get("base", {}).get(stamp)
+            if res_base_rec is None:
+                _print_progress_line(
+                    f"[collision] {rel} {side}",
+                    idx,
+                    len(master_stamps),
+                    progress_state,
+                )
+                continue
+            ref_t, ref_msg = res_base_rec
+
+            predicted_objs_by_group: dict[str, dict[int, object]] = {g: {} for g in VALIDATION_GROUPS}
+            for group in VALIDATION_GROUPS:
+                pred_rec = result_by_group.get(group, {}).get(stamp)
+                if pred_rec is None:
+                    continue
+                _t_pred, msg_pred = pred_rec
+                for obj in getattr(msg_pred, "objects", []) or []:
+                    oid = _obj_id_of(obj)
+                    if oid < 0:
+                        continue
+                    if _has_predicted_path(obj):
+                        predicted_objs_by_group[group][oid] = obj
+
+            # VSL objects are not collision-judged, but must be exported as no-collision targets.
+            vsl_safe_indices = {g: defaultdict(list) for g in VALIDATION_GROUPS}
+            for group in VALIDATION_GROUPS:
+                for oid, pred_obj in predicted_objs_by_group[group].items():
+                    if not _is_vsl_id(oid):
+                        continue
+                    traj_set = list(getattr(pred_obj, "trajectory_set", []) or [])
+                    for path_idx, _ in enumerate(traj_set):
+                        vsl_safe_indices[group][oid].append(path_idx)
+
+            observed_base_rec = observed_by_group.get("base", {}).get(stamp)
+            ego_observed_obj = None
+            if observed_base_rec is not None:
+                _t_obs, msg_obs = observed_base_rec
+                for obj in getattr(msg_obs, "objects", []) or []:
+                    oid = _obj_id_of(obj)
+                    if oid < 0:
+                        continue
+                    if _is_ego_id(oid) and _has_predicted_path(obj):
+                        ego_observed_obj = obj
+                        break
+            if ego_observed_obj is None:
+                for group in VALIDATION_GROUPS:
+                    obs_rec = observed_by_group.get(group, {}).get(stamp)
+                    if obs_rec is None:
+                        continue
+                    _t_obs, msg_obs = obs_rec
+                    for obj in getattr(msg_obs, "objects", []) or []:
+                        oid = _obj_id_of(obj)
+                        if oid >= 0 and _is_ego_id(oid) and _has_predicted_path(obj):
+                            ego_observed_obj = obj
+                            break
+                    if ego_observed_obj is not None:
+                        break
+            ego_observed_path = None
+            ego_observed_dims = (4.7, 1.85)
+            if ego_observed_obj is not None:
+                ego_paths = list(getattr(ego_observed_obj, "trajectory_set", []) or [])
+                if ego_paths:
+                    ego_observed_path = ego_paths[0]
+                    ego_observed_dims = _obj_dimensions_of(ego_observed_obj)
+
+            ego_pred_objs_by_group: dict[str, object] = {}
+            for group in VALIDATION_GROUPS:
+                for oid, obj in predicted_objs_by_group[group].items():
+                    if _is_ego_id(oid):
+                        ego_pred_objs_by_group[group] = obj
+                        break
+
+            for kind in COLLISION_KINDS:
+                pred_collision_indices = {g: defaultdict(list) for g in VALIDATION_GROUPS}
+                pred_safe_indices = {g: defaultdict(list) for g in VALIDATION_GROUPS}
+                kind_collision_count = 0
+                kind_checked_count = 0
+                stamp_has_collision = False
+
+                for group in VALIDATION_GROUPS:
+                    for oid, pred_obj in predicted_objs_by_group[group].items():
+                        if _is_ego_id(oid) or _is_vsl_id(oid):
+                            continue
+                        pred_dims = _obj_dimensions_of(pred_obj)
+                        traj_set = list(getattr(pred_obj, "trajectory_set", []) or [])
+                        for path_idx, pred_path in enumerate(traj_set):
+                            collided = False
+                            if ego_observed_path is not None and stamp in eval_stamp_set:
+                                collided = _path_has_collision_with_ego(
+                                    pred_path=pred_path,
+                                    pred_dims=pred_dims,
+                                    ego_path=ego_observed_path,
+                                    ego_dims=ego_observed_dims,
+                                    other_kind=kind,
+                                )
+                                kind_checked_count += 1
+                            if collided:
+                                pred_collision_indices[group][oid].append(path_idx)
+                                kind_collision_count += 1
+                                stamp_has_collision = True
+                            else:
+                                pred_safe_indices[group][oid].append(path_idx)
+
+                # Keep VSL visible in collision outputs as always safe.
+                for group in VALIDATION_GROUPS:
+                    for oid, idx_list in vsl_safe_indices[group].items():
+                        pred_safe_indices[group][oid].extend(idx_list)
+
+                if stamp in eval_stamp_set:
+                    summary[kind]["checked_paths"] += kind_checked_count
+                    summary[kind]["collision_paths"] += kind_collision_count
+                    summary[kind]["has_collision"] = bool(summary[kind]["has_collision"] or stamp_has_collision)
+
+                for group in VALIDATION_GROUPS:
+                    group_template_msg = group_templates.get(group) or ref_msg or base_template
+                    for status in COLLISION_GROUPED_STATUSES:
+                        msg_out = _make_empty_object_set_like(group_template_msg, stamp)
+                        if msg_out is None:
+                            continue
+                        if status == "pred_collision":
+                            idx_map = pred_collision_indices[group]
+                            for oid, idx_list in idx_map.items():
+                                src_obj = predicted_objs_by_group[group].get(oid)
+                                if src_obj is None:
+                                    continue
+                                filtered = _filter_obj_paths_by_indices(src_obj, idx_list)
+                                if getattr(filtered, "trajectory_set", []) or []:
+                                    msg_out.objects.append(filtered)
+                        elif status == "pred_safe":
+                            idx_map = pred_safe_indices[group]
+                            for oid, idx_list in idx_map.items():
+                                src_obj = predicted_objs_by_group[group].get(oid)
+                                if src_obj is None:
+                                    continue
+                                filtered = _filter_obj_paths_by_indices(src_obj, idx_list)
+                                if getattr(filtered, "trajectory_set", []) or []:
+                                    msg_out.objects.append(filtered)
+                        elif status == "ego_pred_collision":
+                            ego_pred_obj = ego_pred_objs_by_group.get(group)
+                            if ego_pred_obj is not None and stamp_has_collision:
+                                msg_out.objects.append(copy.deepcopy(ego_pred_obj))
+                        elif status == "ego_pred_safe":
+                            ego_pred_obj = ego_pred_objs_by_group.get(group)
+                            if ego_pred_obj is not None and (not stamp_has_collision):
+                                msg_out.objects.append(copy.deepcopy(ego_pred_obj))
+                        out_grouped[kind][status][group].append((ref_t, msg_out))
+
+                base_template_msg = base_template or ref_msg
+                for status in COLLISION_BASE_STATUSES:
+                    msg_out = _make_empty_object_set_like(base_template_msg, stamp)
+                    if msg_out is None:
+                        continue
+                    if ego_observed_obj is not None:
+                        if status == "ego_observed_collision" and stamp_has_collision:
+                            msg_out.objects.append(copy.deepcopy(ego_observed_obj))
+                        elif status == "ego_observed_safe" and (not stamp_has_collision):
+                            msg_out.objects.append(copy.deepcopy(ego_observed_obj))
+                    out_base[kind][status].append((ref_t, msg_out))
+
+            _print_progress_line(
+                f"[collision] {rel} {side}",
+                idx,
+                len(master_stamps),
+                progress_state,
+            )
+
+    for kind in COLLISION_KINDS:
+        summary[kind]["has_collision"] = bool(summary[kind]["collision_paths"] > 0)
+
+    bag_path = out_dir / f"collision_judgement_{side}.bag"
+    if HAS_ROSBAG:
+        total_write_steps = 0
+        for kind in COLLISION_KINDS:
+            for status in COLLISION_GROUPED_STATUSES:
+                for group in VALIDATION_GROUPS:
+                    total_write_steps += len(out_grouped[kind][status][group])
+            for status in COLLISION_BASE_STATUSES:
+                total_write_steps += len(out_base[kind][status])
+        write_state = {"last_percent": -1}
+        if total_write_steps > 0:
+            _print_progress_line(
+                f"[collision] {rel} {side} write",
+                0,
+                total_write_steps,
+                write_state,
+            )
+        written = 0
+        with rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024) as out_bag:
+            for kind in COLLISION_KINDS:
+                for status in COLLISION_GROUPED_STATUSES:
+                    for group in VALIDATION_GROUPS:
+                        topic = _make_collision_topic(side, kind, status, group)
+                        for t, msg in out_grouped[kind][status][group]:
+                            out_bag.write(topic, msg, t)
+                            written += 1
+                            if total_write_steps > 0:
+                                _print_progress_line(
+                                    f"[collision] {rel} {side} write",
+                                    written,
+                                    total_write_steps,
+                                    write_state,
+                                )
+                for status in COLLISION_BASE_STATUSES:
+                    topic = _make_collision_topic(side, kind, status)
+                    for t, msg in out_base[kind][status]:
+                        out_bag.write(topic, msg, t)
+                        written += 1
+                        if total_write_steps > 0:
+                            _print_progress_line(
+                                f"[collision] {rel} {side} write",
+                                written,
+                                total_write_steps,
+                                write_state,
+                            )
+    elif not bag_path.exists():
+        bag_path.write_bytes(b"")
+
+    return summary
+
+
 def _build_validation_for_side_threshold(
     rel: str,
     out_dir: Path,
@@ -532,13 +1209,10 @@ def _build_validation_for_side_threshold(
     observed_bag: Path,
     result_ns: str,
     observed_ns: str,
-) -> dict:
+) -> tuple[dict, dict[str, dict[str, list[tuple]]]]:
     summary = _default_threshold_summary("ok")
     log_key = _validation_log_key(side, horizon, threshold)
-    out_records: dict[str, dict[str, list[tuple]]] = {
-        group: {status: [] for status in VALIDATION_STATUSES}
-        for group in VALIDATION_GROUPS
-    }
+    out_records = _empty_validation_out_records()
 
     if not HAS_ROSBAG:
         summary["detail"] = "rosbag not available"
@@ -777,38 +1451,7 @@ def _build_validation_for_side_threshold(
     else:
         summary["rate"] = 0.0
 
-    total_write_steps = sum(len(out_records[g][s]) for g in VALIDATION_GROUPS for s in VALIDATION_STATUSES)
-    write_state = {"last_percent": -1}
-    if total_write_steps > 0:
-        _print_progress_line(
-            f"[validation] {rel} {log_key} write",
-            0,
-            total_write_steps,
-            write_state,
-        )
-    written = 0
-    for group in VALIDATION_GROUPS:
-        for status in VALIDATION_STATUSES:
-            bag_path = out_dir / f"{horizon}_{threshold}_{group}_{side}_{status}.bag"
-            topic = _make_validation_topic(side, horizon, threshold, group, status)
-            with rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024) as out_bag:
-                for t, msg in out_records[group][status]:
-                    out_bag.write(topic, msg, t)
-                    written += 1
-                    if total_write_steps > 0:
-                        _print_progress_line(
-                            f"[validation] {rel} {log_key} write",
-                            written,
-                            total_write_steps,
-                            write_state,
-                        )
-    if total_write_steps == 0:
-        for group in VALIDATION_GROUPS:
-            for status in VALIDATION_STATUSES:
-                bag_path = out_dir / f"{horizon}_{threshold}_{group}_{side}_{status}.bag"
-                with rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024):
-                    pass
-    return summary
+    return summary, out_records
 
 
 def evaluate_validation_for_side(
@@ -821,31 +1464,67 @@ def evaluate_validation_for_side(
     observed_ns: str,
 ) -> dict:
     summary = {}
-    for horizon in VALIDATION_HORIZONS:
-        summary[horizon] = {}
-        window_cfg = VALIDATION_HORIZON_WINDOWS.get(horizon, VALIDATION_HORIZON_WINDOWS["half-time-relaxed"])
-        max_t = float(window_cfg.get("max_t", 5.0))
-        other_max_t = float(window_cfg.get("other_max_t", max_t))
-        for threshold in VALIDATION_THRESHOLDS:
-            side_summary = _build_validation_for_side_threshold(
-                rel=rel,
-                out_dir=out_dir,
-                side=side,
-                horizon=horizon,
-                threshold=threshold,
-                max_t=max_t,
-                other_max_t=other_max_t,
-                result_bag=result_bag,
-                observed_bag=observed_bag,
-                result_ns=result_ns,
-                observed_ns=observed_ns,
-            )
-            summary[horizon][threshold] = side_summary
-            log_key = _validation_log_key(side, horizon, threshold)
-            print(
-                f"[validation] {rel} {log_key}: "
-                f"{side_summary['rate']:.1f}% ({side_summary['ok']}/{side_summary['total']})"
-            )
+    validation_bag_path = out_dir / f"validation_{side}.bag"
+    validation_bag = None
+    try:
+        if HAS_ROSBAG:
+            validation_bag = rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024)
+        for horizon in VALIDATION_HORIZONS:
+            summary[horizon] = {}
+            window_cfg = VALIDATION_HORIZON_WINDOWS.get(horizon, VALIDATION_HORIZON_WINDOWS["half-time-relaxed"])
+            max_t = float(window_cfg.get("max_t", 5.0))
+            other_max_t = float(window_cfg.get("other_max_t", max_t))
+            for threshold in VALIDATION_THRESHOLDS:
+                side_summary, out_records = _build_validation_for_side_threshold(
+                    rel=rel,
+                    out_dir=out_dir,
+                    side=side,
+                    horizon=horizon,
+                    threshold=threshold,
+                    max_t=max_t,
+                    other_max_t=other_max_t,
+                    result_bag=result_bag,
+                    observed_bag=observed_bag,
+                    result_ns=result_ns,
+                    observed_ns=observed_ns,
+                )
+                summary[horizon][threshold] = side_summary
+                if validation_bag is not None:
+                    _write_validation_records_to_bag(
+                        rel=rel,
+                        side=side,
+                        horizon=horizon,
+                        threshold=threshold,
+                        out_records=out_records,
+                        out_bag=validation_bag,
+                    )
+                log_key = _validation_log_key(side, horizon, threshold)
+                print(
+                    f"[validation] {rel} {log_key}: "
+                    f"{side_summary['rate']:.1f}% ({side_summary['ok']}/{side_summary['total']})"
+                )
+    finally:
+        if validation_bag is not None:
+            validation_bag.close()
+    if not HAS_ROSBAG and not validation_bag_path.exists():
+        validation_bag_path.write_bytes(b"")
+    collision_summary = _build_collision_for_side(
+        rel=rel,
+        out_dir=out_dir,
+        side=side,
+        result_bag=result_bag,
+        observed_bag=observed_bag,
+        result_ns=result_ns,
+        observed_ns=observed_ns,
+    )
+    summary["collision"] = collision_summary
+    for kind in COLLISION_KINDS:
+        node = collision_summary.get(kind, {})
+        state = "Collision" if bool(node.get("has_collision")) else "Safe"
+        print(
+            f"[collision] {rel} {side}-{kind}: {state} "
+            f"({int(node.get('collision_paths', 0))}/{int(node.get('checked_paths', 0))})"
+        )
     return summary
 
 
