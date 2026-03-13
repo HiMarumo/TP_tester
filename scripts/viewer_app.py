@@ -53,12 +53,13 @@ from PyQt5.QtGui import QColor, QBrush, QPalette, QTextDocument, QAbstractTextDo
 
 
 # Column headers for comparison table (row 0 = what each column means)
-TABLE_HEADERS = ["", "L", "O", "P", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
+TABLE_HEADERS = ["", "C", "L", "O", "P", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
 COL_HALF_DELTA = 0
-COL_MARK_L = 1
-COL_MARK_O = 2
-COL_MARK_P = 3
-COL_DIRECTORY = 4
+COL_COLLISION = 1
+COL_MARK_L = 2
+COL_MARK_O = 3
+COL_MARK_P = 4
+COL_DIRECTORY = 5
 STATUS_CHANGED = "Changed"
 STATUS_UNCHANGED = "Unchanged"
 COLOR_GREEN = QColor(0, 140, 0)
@@ -402,10 +403,33 @@ def _half_delta_mark(comp: dict | None) -> str:
     return "↑" if test_rate > baseline_rate else "↓"
 
 
+def _collision_mark(comp: dict | None) -> str:
+    if not isinstance(comp, dict):
+        return "-"
+    collision = comp.get("collision", {})
+    if not isinstance(collision, dict):
+        return "-"
+    found = False
+    for side in VALIDATION_SIDES:
+        side_collision = collision.get(side, {})
+        if not isinstance(side_collision, dict):
+            continue
+        for kind in COLLISION_KINDS:
+            node = _collision_kind_node(side_collision, kind)
+            if not isinstance(node, dict):
+                continue
+            found = True
+            if bool(node.get("has_collision", False)):
+                return "×"
+    if found:
+        return "○"
+    return "-"
+
+
 def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
-    """Return [half_delta, L, O, P, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
+    """Return [half_delta, collision, L, O, P, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
     if not comp:
-        return ["-", "-", "-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
+        return ["-", "-", "-", "-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
     valid = comp.get("valid_frames")
     total = comp.get("total_frames")
     # 全体 = 和集合。古い JSON 用に total が無い場合は record_frames から算出
@@ -442,7 +466,8 @@ def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
     else:
         dt_status = f"{dt_status_label} ({max_val})"
     half_delta = _half_delta_mark(comp)
-    return [half_delta, "■", "■", "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
+    collision_mark = _collision_mark(comp)
+    return [half_delta, collision_mark, "■", "■", "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
 
 
 def _validation_rate_stats(node: dict | None) -> tuple[str, float | None]:
@@ -1024,10 +1049,12 @@ class ViewerAppPyQt(QMainWindow):
 
     def _restore_indicator_columns(self):
         self.table.setColumnHidden(COL_HALF_DELTA, False)
+        self.table.setColumnHidden(COL_COLLISION, False)
         self.table.setColumnHidden(COL_MARK_L, False)
         self.table.setColumnHidden(COL_MARK_O, False)
         self.table.setColumnHidden(COL_MARK_P, False)
         self.table.setColumnWidth(COL_HALF_DELTA, 28)
+        self.table.setColumnWidth(COL_COLLISION, 24)
         self.table.setColumnWidth(COL_MARK_L, 24)
         self.table.setColumnWidth(COL_MARK_O, 24)
         self.table.setColumnWidth(COL_MARK_P, 24)
@@ -1148,6 +1175,12 @@ class ViewerAppPyQt(QMainWindow):
                     if text == "↑":
                         item.setForeground(COLOR_GREEN)
                     elif text == "↓":
+                        item.setForeground(COLOR_RED)
+                elif j == COL_COLLISION:
+                    item.setTextAlignment(Qt.AlignCenter)
+                    if text == "○":
+                        item.setForeground(COLOR_GREEN)
+                    elif text == "×":
                         item.setForeground(COLOR_RED)
                 elif j in (COL_MARK_L, COL_MARK_O, COL_MARK_P):
                     item.setTextAlignment(Qt.AlignCenter)

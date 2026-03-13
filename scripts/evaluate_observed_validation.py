@@ -65,54 +65,33 @@ CLASS_GROUP_BY_CLASSIFICATION = {
 
 CLASS_GROUP_TOLERANCES = {
     CLASS_GROUP_VEHICLE: {
-        "strict": {
-            "longitudinal": 2.0,
-            "lateral_near": 0.5,
-            "lateral_far": 1.2,
-        },
         "time-relaxed_start": {
             "longitudinal": 1.0,
-            "lateral_near": 0.5,
-            "lateral_far": 1.2,
+            "lateral": 0.5,
         },
         "time-relaxed_end": {
             "longitudinal": 7.5,
-            "lateral_near": 2.0,
-            "lateral_far": 4.8,
+            "lateral": 2.0,
         },
     },
     CLASS_GROUP_BIKE: {
-        "strict": {
-            "longitudinal": 1.5,
-            "lateral_near": 0.35,
-            "lateral_far": 0.84,
-        },
         "time-relaxed_start": {
             "longitudinal": 0.5,
-            "lateral_near": 0.35,
-            "lateral_far": 0.84,
+            "lateral": 0.35,
         },
         "time-relaxed_end": {
             "longitudinal": 4.0,
-            "lateral_near": 1.5,
-            "lateral_far": 3.6,
+            "lateral": 1.5,
         },
     },
     CLASS_GROUP_PEDESTRIAN: {
-        "strict": {
-            "longitudinal": 0.7,
-            "lateral_near": 0.3,
-            "lateral_far": 0.6,
-        },
         "time-relaxed_start": {
             "longitudinal": 0.5,
-            "lateral_near": 0.3,
-            "lateral_far": 0.6,
+            "lateral": 0.3,
         },
         "time-relaxed_end": {
             "longitudinal": 0.8,
-            "lateral_near": 0.5,
-            "lateral_far": 1.0,
+            "lateral": 0.5,
         },
     },
 }
@@ -373,6 +352,131 @@ def _has_min_observed_duration(traj_obj, min_duration_sec: float = MIN_OBSERVED_
     return end_t >= (float(min_duration_sec) - 1e-6)
 
 
+def _build_observed_curve(obs_pts: list[tuple[float, float, float, float]]) -> dict:
+    s_vals: list[float] = []
+    segments: list[dict] = []
+    seg_s1: list[float] = []
+    if not obs_pts:
+        return {"points": [], "s": s_vals, "segments": segments, "seg_s1": seg_s1}
+    s_vals = [0.0] * len(obs_pts)
+    accum = 0.0
+    for i in range(1, len(obs_pts)):
+        _, x0, y0, _ = obs_pts[i - 1]
+        _, x1, y1, _ = obs_pts[i]
+        dx = float(x1) - float(x0)
+        dy = float(y1) - float(y0)
+        seg_len = math.hypot(dx, dy)
+        accum += seg_len
+        s_vals[i] = accum
+        if seg_len > 1e-9:
+            ux = dx / seg_len
+            uy = dy / seg_len
+            seg = {
+                "s0": s_vals[i - 1],
+                "s1": s_vals[i],
+                "x0": float(x0),
+                "y0": float(y0),
+                "x1": float(x1),
+                "y1": float(y1),
+                "ux": ux,
+                "uy": uy,
+            }
+            segments.append(seg)
+            seg_s1.append(seg["s1"])
+    return {"points": obs_pts, "s": s_vals, "segments": segments, "seg_s1": seg_s1}
+
+
+def _project_xy_to_observed_sd(
+    curve: dict,
+    x: float,
+    y: float,
+    anchor_idx: int | None = None,
+    fallback_heading: float = 0.0,
+) -> tuple[float, float]:
+    points = curve.get("points", [])
+    s_vals = curve.get("s", [])
+    segments = curve.get("segments", [])
+    if not points:
+        return (0.0, 0.0)
+
+    px = float(x)
+    py = float(y)
+
+    if not segments:
+        use_idx = 0 if anchor_idx is None else min(max(0, int(anchor_idx)), len(points) - 1)
+        _, ox, oy, yaw = points[use_idx]
+        heading = float(fallback_heading) if math.isfinite(float(fallback_heading)) else float(yaw)
+        tx = math.cos(heading)
+        ty = math.sin(heading)
+        vx = px - float(ox)
+        vy = py - float(oy)
+        s_proj = (float(s_vals[use_idx]) if use_idx < len(s_vals) else 0.0) + (tx * vx + ty * vy)
+        d_proj = -ty * vx + tx * vy
+        return (s_proj, d_proj)
+
+    best_dist2 = float("inf")
+    best_s = 0.0
+    best_d = 0.0
+
+    def _consider_candidate(base_x: float, base_y: float, tx: float, ty: float, along: float, s_origin: float):
+        nonlocal best_dist2, best_s, best_d
+        qx = base_x + tx * along
+        qy = base_y + ty * along
+        dx = px - qx
+        dy = py - qy
+        dist2 = dx * dx + dy * dy
+        if dist2 >= best_dist2:
+            return
+        best_dist2 = dist2
+        best_s = float(s_origin) + float(along)
+        best_d = tx * dy - ty * dx
+
+    for seg in segments:
+        seg_len = max(0.0, float(seg["s1"]) - float(seg["s0"]))
+        vx = px - float(seg["x0"])
+        vy = py - float(seg["y0"])
+        along = vx * float(seg["ux"]) + vy * float(seg["uy"])
+        along = min(seg_len, max(0.0, along))
+        _consider_candidate(
+            float(seg["x0"]),
+            float(seg["y0"]),
+            float(seg["ux"]),
+            float(seg["uy"]),
+            along,
+            float(seg["s0"]),
+        )
+
+    first = segments[0]
+    vx0 = px - float(first["x0"])
+    vy0 = py - float(first["y0"])
+    along0 = vx0 * float(first["ux"]) + vy0 * float(first["uy"])
+    if along0 < 0.0:
+        _consider_candidate(
+            float(first["x0"]),
+            float(first["y0"]),
+            float(first["ux"]),
+            float(first["uy"]),
+            along0,
+            float(first["s0"]),
+        )
+
+    last = segments[-1]
+    vx1 = px - float(last["x1"])
+    vy1 = py - float(last["y1"])
+    along1 = vx1 * float(last["ux"]) + vy1 * float(last["uy"])
+    if along1 > 0.0:
+        _consider_candidate(
+            float(last["x1"]),
+            float(last["y1"]),
+            float(last["ux"]),
+            float(last["uy"]),
+            along1,
+            float(last["s1"]),
+        )
+
+    return (best_s, best_d)
+
+
 def _trajectory_within_threshold(
     observed_path,
     predicted_path,
@@ -386,13 +490,14 @@ def _trajectory_within_threshold(
     pred_pts = _sorted_traj_points(predicted_path, max_t=max_t)
     if not obs_pts or not pred_pts:
         return (False, float("inf"))
+    obs_curve = _build_observed_curve(obs_pts)
 
     pred_times = [p[0] for p in pred_pts]
     cost = 0.0
     used = 0
     strict_ok_steps = 0
     max_dt = 0.26
-    for i, (obs_t, obs_x, obs_y, obs_yaw) in enumerate(obs_pts):
+    for i, (obs_t, _obs_x, _obs_y, obs_yaw) in enumerate(obs_pts):
         idx = bisect_left(pred_times, obs_t)
         candidates = []
         if idx < len(pred_pts):
@@ -405,35 +510,31 @@ def _trajectory_within_threshold(
         if abs(pred_t - obs_t) > max_dt:
             return (False, float("inf"))
 
-        dx = pred_x - obs_x
-        dy = pred_y - obs_y
-        heading = _observed_heading_from_velocity(obs_pts, i)
-        c = math.cos(heading)
-        s = math.sin(heading)
-        longitudinal = c * dx + s * dy
-        lateral = -s * dx + c * dy
-        longitudinal_tol, lateral_near, lateral_far = _threshold_tolerances(
+        fallback_heading = _observed_heading_from_velocity(obs_pts, i)
+        s_pred, d_pred = _project_xy_to_observed_sd(
+            obs_curve,
+            float(pred_x),
+            float(pred_y),
+            anchor_idx=i,
+            fallback_heading=fallback_heading,
+        )
+        s_obs = float(obs_curve["s"][i]) if i < len(obs_curve.get("s", [])) else 0.0
+        longitudinal = s_pred - s_obs
+        lateral = d_pred
+        longitudinal_tol, lateral_tol = _threshold_tolerances(
             horizon,
             threshold,
             obs_t,
             horizon_max_t,
             classification,
         )
-        lateral_tol = _trapezoid_lateral_tolerance(abs(longitudinal), longitudinal_tol, lateral_near, lateral_far)
         strict_ok = abs(longitudinal) <= longitudinal_tol and abs(lateral) <= lateral_tol
         if threshold == "strict":
             if not strict_ok:
                 return (False, float("inf"))
         elif threshold == "approximate":
             expanded_longitudinal_tol = max(1e-6, longitudinal_tol * APPROXIMATE_TOLERANCE_SCALE)
-            expanded_lateral_near = max(1e-6, lateral_near * APPROXIMATE_TOLERANCE_SCALE)
-            expanded_lateral_far = max(1e-6, lateral_far * APPROXIMATE_TOLERANCE_SCALE)
-            expanded_lateral_tol = _trapezoid_lateral_tolerance(
-                abs(longitudinal),
-                expanded_longitudinal_tol,
-                expanded_lateral_near,
-                expanded_lateral_far,
-            )
+            expanded_lateral_tol = max(1e-6, lateral_tol * APPROXIMATE_TOLERANCE_SCALE)
             if abs(longitudinal) > expanded_longitudinal_tol or abs(lateral) > expanded_lateral_tol:
                 return (False, float("inf"))
             if strict_ok:
@@ -464,7 +565,7 @@ def _threshold_tolerances(
     step_t: float,
     horizon_max_t: float,
     classification: int,
-) -> tuple[float, float, float]:
+) -> tuple[float, float]:
     del threshold
     class_group = _class_group_for_classification(classification)
     class_tolerances = CLASS_GROUP_TOLERANCES[class_group]
@@ -478,24 +579,14 @@ def _threshold_tolerances(
         start["longitudinal"]
         + (end["longitudinal"] - start["longitudinal"]) * ratio
     )
-    lateral_near = (
-        start["lateral_near"]
-        + (end["lateral_near"] - start["lateral_near"]) * ratio
-    )
-    lateral_far = (
-        start["lateral_far"]
-        + (end["lateral_far"] - start["lateral_far"]) * ratio
+    lateral = (
+        start["lateral"]
+        + (end["lateral"] - start["lateral"]) * ratio
     )
     return (
         max(1e-6, float(longitudinal)),
-        max(1e-6, float(lateral_near)),
-        max(1e-6, float(lateral_far)),
+        max(1e-6, float(lateral)),
     )
-
-
-def _trapezoid_lateral_tolerance(abs_longitudinal: float, longitudinal_tol: float, lateral_near: float, lateral_far: float) -> float:
-    ratio = min(1.0, max(0.0, float(abs_longitudinal) / max(1e-6, float(longitudinal_tol))))
-    return max(1e-6, float(lateral_near) + (float(lateral_far) - float(lateral_near)) * ratio)
 
 
 def _observed_heading_from_velocity(obs_pts: list[tuple[float, float, float, float]], idx: int) -> float:
