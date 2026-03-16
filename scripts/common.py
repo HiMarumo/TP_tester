@@ -470,6 +470,287 @@ def select_bag_files_by_topics(
     return (selected, matched_topics)
 
 
+SCENE_SUBSCENE_SPLIT_MIN_DURATION_SEC = 40.0
+SCENE_SUBSCENE_WINDOW_SEC = 30.0
+SCENE_SUBSCENE_MIN_TAIL_SEC = 20.0
+DT_WARNING_THRESHOLD_MS = 70.0
+DT_INVALID_THRESHOLD_MS = 100.0
+
+
+def _format_scene_offset_label(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def get_bag_time_bounds_ns(bag_files: list[Path]) -> tuple[int, int] | None:
+    """Return (min_start_ns, max_end_ns) across input bag files, or None."""
+    if not HAS_ROSBAG or not bag_files:
+        return None
+
+    start_ns = None
+    end_ns = None
+    for bag_path in bag_files:
+        if not bag_path.exists():
+            continue
+        try:
+            with rosbag.Bag(str(bag_path), "r") as bag:
+                bag_start_ns = int(float(bag.get_start_time()) * 1e9)
+                bag_end_ns = int(float(bag.get_end_time()) * 1e9)
+        except Exception:
+            continue
+        if start_ns is None or bag_start_ns < start_ns:
+            start_ns = bag_start_ns
+        if end_ns is None or bag_end_ns > end_ns:
+            end_ns = bag_end_ns
+
+    if start_ns is None or end_ns is None:
+        return None
+    return (int(start_ns), int(end_ns))
+
+
+def collect_clock_stamps_in_bags(bag_files: list[Path]) -> list[int]:
+    """Return sorted unique bag-time timestamps of /clock messages, in nsec."""
+    if not HAS_ROSBAG or not bag_files:
+        return []
+
+    stamps: set[int] = set()
+    for bag_path in bag_files:
+        if not bag_path.exists():
+            continue
+        try:
+            with rosbag.Bag(str(bag_path), "r") as bag:
+                info = bag.get_type_and_topic_info()
+                topics = info[1] if isinstance(info, tuple) and len(info) >= 2 else getattr(info, "topics", {})
+                if "/clock" not in topics:
+                    continue
+                for _topic, _msg, bag_t in bag.read_messages(topics=["/clock"]):
+                    if hasattr(bag_t, "to_nsec"):
+                        stamps.add(int(bag_t.to_nsec()))
+                        continue
+                    sec = getattr(bag_t, "secs", getattr(bag_t, "sec", 0)) or 0
+                    nsec = getattr(bag_t, "nsecs", getattr(bag_t, "nsec", getattr(bag_t, "nanosec", 0))) or 0
+                    stamps.add(int(sec) * 10**9 + int(nsec))
+        except Exception:
+            continue
+    return sorted(stamps)
+
+
+def collect_clock_timeline_in_bags(bag_files: list[Path]) -> list[int]:
+    """Return sorted /clock bag-time timestamps including duplicates, in nsec."""
+    if not HAS_ROSBAG or not bag_files:
+        return []
+
+    stamps: list[int] = []
+    for bag_path in bag_files:
+        if not bag_path.exists():
+            continue
+        try:
+            with rosbag.Bag(str(bag_path), "r") as bag:
+                info = bag.get_type_and_topic_info()
+                topics = info[1] if isinstance(info, tuple) and len(info) >= 2 else getattr(info, "topics", {})
+                if "/clock" not in topics:
+                    continue
+                for _topic, _msg, bag_t in bag.read_messages(topics=["/clock"]):
+                    if hasattr(bag_t, "to_nsec"):
+                        stamps.append(int(bag_t.to_nsec()))
+                        continue
+                    sec = getattr(bag_t, "secs", getattr(bag_t, "sec", 0)) or 0
+                    nsec = getattr(bag_t, "nsecs", getattr(bag_t, "nsec", getattr(bag_t, "nanosec", 0))) or 0
+                    stamps.append(int(sec) * 10**9 + int(nsec))
+        except Exception:
+            continue
+    return sorted(stamps)
+
+
+def build_scene_timing(
+    bag_files: list[Path],
+    split_min_duration_sec: float = SCENE_SUBSCENE_SPLIT_MIN_DURATION_SEC,
+    window_sec: float = SCENE_SUBSCENE_WINDOW_SEC,
+    min_tail_sec: float = SCENE_SUBSCENE_MIN_TAIL_SEC,
+) -> dict | None:
+    """
+    Build scene timing metadata from input bags.
+    Long scenes (>= split_min_duration_sec) are split into window_sec subscenes,
+    dropping a final tail no longer than min_tail_sec.
+    """
+    bounds = get_bag_time_bounds_ns(bag_files)
+    if bounds is None:
+        return None
+
+    start_ns, end_ns = bounds
+    if end_ns < start_ns:
+        end_ns = start_ns
+    duration_sec = max(0.0, float(end_ns - start_ns) / 1e9)
+    scene_timing = {
+        "start_ns": int(start_ns),
+        "end_ns": int(end_ns),
+        "duration_sec": duration_sec,
+        "split_min_duration_sec": float(split_min_duration_sec),
+        "window_sec": float(window_sec),
+        "min_tail_sec": float(min_tail_sec),
+        "subscenes": [],
+    }
+
+    if duration_sec + 1e-9 < float(split_min_duration_sec):
+        return scene_timing
+
+    offset = 0.0
+    index = 0
+    while offset < duration_sec - 1e-9:
+        remaining = duration_sec - offset
+        if remaining <= float(min_tail_sec) + 1e-9:
+            break
+        end_offset = min(duration_sec, offset + float(window_sec))
+        scene_timing["subscenes"].append(
+            {
+                "index": index,
+                "label": f"{_format_scene_offset_label(offset)}-{_format_scene_offset_label(end_offset)}",
+                "start_offset_sec": float(offset),
+                "end_offset_sec": float(end_offset),
+                "duration_sec": float(end_offset - offset),
+            }
+        )
+        offset += float(window_sec)
+        index += 1
+    return scene_timing
+
+
+def is_stamp_in_evaluation_range(
+    stamp_ns: int,
+    scene_timing: dict | None,
+) -> bool:
+    """
+    Return whether a bag timestamp belongs to the scene's evaluation range.
+    If subscenes are defined, only timestamps mapped to one of them are evaluated.
+    Otherwise the whole scene remains evaluable.
+    """
+    if not isinstance(scene_timing, dict):
+        return True
+    subscenes = scene_timing.get("subscenes", [])
+    if not isinstance(subscenes, list) or not subscenes:
+        return True
+    start_ns = scene_timing.get("start_ns")
+    if start_ns is None:
+        return True
+    return find_subscene_index(stamp_ns, scene_timing) is not None
+
+
+def summarize_dt_values(dt_values: list[float]) -> dict:
+    """Return scene-level dt summary compatible with dt_status / dt_max files."""
+    if any(v >= DT_INVALID_THRESHOLD_MS for v in dt_values):
+        status = "invalid"
+    elif any(v >= DT_WARNING_THRESHOLD_MS for v in dt_values):
+        status = "warning"
+    else:
+        status = "valid"
+    max_dt = max(dt_values) if dt_values else None
+    return {
+        "dt_status": status,
+        "dt_max": "-" if max_dt is None else str(max_dt),
+        "sample_count": len(dt_values),
+    }
+
+
+def build_subscene_dt_summary(
+    dt_values: list[float],
+    clock_timeline_ns: list[int],
+    scene_timing: dict | None,
+) -> dict:
+    """
+    Build dt summary for a scene and its subscenes.
+    Runtime samples are aligned to /clock order; subscene buckets only receive samples
+    whose clock stamp falls into a generated subscene window.
+    """
+    summary = summarize_dt_values(dt_values)
+    summary["subscenes"] = []
+    if not isinstance(scene_timing, dict):
+        return summary
+
+    subscenes = scene_timing.get("subscenes", [])
+    if not isinstance(subscenes, list) or not subscenes:
+        return summary
+
+    buckets: list[list[float]] = []
+    for idx, sub in enumerate(subscenes):
+        if not isinstance(sub, dict):
+            continue
+        buckets.append([])
+        node = {
+            "index": int(sub.get("index", idx) or idx),
+            "label": str(sub.get("label", "")),
+            "start_offset_sec": float(sub.get("start_offset_sec", 0.0) or 0.0),
+            "end_offset_sec": float(sub.get("end_offset_sec", 0.0) or 0.0),
+            "duration_sec": float(sub.get("duration_sec", 0.0) or 0.0),
+        }
+        node.update(summarize_dt_values([]))
+        summary["subscenes"].append(node)
+
+    if len(clock_timeline_ns) != len(dt_values):
+        summary["mapping"] = {
+            "status": "clock_count_mismatch",
+            "clock_count": len(clock_timeline_ns),
+            "dt_count": len(dt_values),
+        }
+        return summary
+
+    index_by_subscene: dict[int, int] = {
+        int(sub.get("index", idx) or idx): idx
+        for idx, sub in enumerate(summary["subscenes"])
+    }
+    for stamp_ns, dt in zip(clock_timeline_ns, dt_values):
+        sub_idx = find_subscene_index(stamp_ns, scene_timing)
+        if sub_idx is None:
+            continue
+        bucket_idx = index_by_subscene.get(sub_idx)
+        if bucket_idx is None or not (0 <= bucket_idx < len(buckets)):
+            continue
+        buckets[bucket_idx].append(float(dt))
+
+    for idx, node in enumerate(summary["subscenes"]):
+        node.update(summarize_dt_values(buckets[idx]))
+    summary["mapping"] = {
+        "status": "clock_aligned",
+        "clock_count": len(clock_timeline_ns),
+        "dt_count": len(dt_values),
+    }
+    return summary
+
+
+def find_subscene_index(
+    stamp_ns: int,
+    scene_timing: dict | None,
+) -> int | None:
+    """Return subscene index for absolute timestamp, or None if outside/unavailable."""
+    if not isinstance(scene_timing, dict):
+        return None
+    subscenes = scene_timing.get("subscenes", [])
+    if not isinstance(subscenes, list) or not subscenes:
+        return None
+    start_ns = scene_timing.get("start_ns")
+    if start_ns is None:
+        return None
+    try:
+        rel_sec = (int(stamp_ns) - int(start_ns)) / 1e9
+    except Exception:
+        return None
+    for idx, sub in enumerate(subscenes):
+        try:
+            begin = float(sub.get("start_offset_sec", 0.0) or 0.0)
+            end = float(sub.get("end_offset_sec", begin) or begin)
+        except Exception:
+            continue
+        is_last = idx == (len(subscenes) - 1)
+        if rel_sec < begin - 1e-9:
+            continue
+        if rel_sec < end - 1e-9 or (is_last and rel_sec <= end + 1e-9):
+            return idx
+    return None
+
+
 def get_git_commit_info(repo_path: Path) -> dict:
     """
     Return dict with commit, describe, branch, dirty from the given path (git repo root).

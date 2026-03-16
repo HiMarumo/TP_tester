@@ -11,7 +11,12 @@ from bisect import bisect_left
 from collections import defaultdict
 from pathlib import Path
 
-from common import VALIDATION_BASELINE_NS, VALIDATION_TEST_NS
+from common import (
+    VALIDATION_BASELINE_NS,
+    VALIDATION_TEST_NS,
+    find_subscene_index,
+    is_stamp_in_evaluation_range,
+)
 
 try:
     import rosbag
@@ -178,6 +183,46 @@ def default_side_summary(detail: str = "not_evaluated") -> dict:
     }
     out["collision"] = _default_collision_summary(detail)
     return out
+
+
+def _build_subscene_side_summaries(scene_timing: dict | None, detail: str = "not_evaluated") -> list[dict]:
+    if not isinstance(scene_timing, dict):
+        return []
+    subscenes = scene_timing.get("subscenes", [])
+    if not isinstance(subscenes, list):
+        return []
+    out = []
+    for base in subscenes:
+        if not isinstance(base, dict):
+            continue
+        node = {
+            "index": int(base.get("index", len(out)) or len(out)),
+            "label": str(base.get("label", "")),
+            "start_offset_sec": float(base.get("start_offset_sec", 0.0) or 0.0),
+            "end_offset_sec": float(base.get("end_offset_sec", 0.0) or 0.0),
+            "duration_sec": float(base.get("duration_sec", 0.0) or 0.0),
+        }
+        for horizon in VALIDATION_HORIZONS:
+            node[horizon] = {
+                threshold: _default_threshold_summary(detail)
+                for threshold in VALIDATION_THRESHOLDS
+            }
+        node["collision"] = _default_collision_summary(detail)
+        out.append(node)
+    return out
+
+
+def _subscene_summary_for_stamp(
+    stamp_ns: int,
+    scene_timing: dict | None,
+    subscene_summaries: list[dict],
+) -> dict | None:
+    subscene_index = find_subscene_index(stamp_ns, scene_timing)
+    if subscene_index is None:
+        return None
+    if not (0 <= subscene_index < len(subscene_summaries)):
+        return None
+    return subscene_summaries[subscene_index]
 
 
 def _validation_log_key(side: str, horizon: str, threshold: str) -> str:
@@ -1014,8 +1059,10 @@ def _build_collision_for_side(
     observed_bag: Path,
     result_ns: str,
     observed_ns: str,
-) -> dict:
+    scene_timing: dict | None = None,
+) -> tuple[dict, list[dict]]:
     summary = _default_collision_summary("ok")
+    subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
     out_grouped: dict[str, dict[str, dict[str, list[tuple]]]] = {
         kind: {status: {group: [] for group in VALIDATION_GROUPS} for status in COLLISION_GROUPED_STATUSES}
         for kind in COLLISION_KINDS
@@ -1028,20 +1075,34 @@ def _build_collision_for_side(
     if not HAS_ROSBAG:
         for kind in COLLISION_KINDS:
             summary[kind]["detail"] = "rosbag not available"
+            for sub in subscene_summaries:
+                sub["collision"][kind]["detail"] = summary[kind]["detail"]
     elif not result_bag.exists():
         for kind in COLLISION_KINDS:
             summary[kind]["detail"] = f"result bag missing: {result_bag}"
+            for sub in subscene_summaries:
+                sub["collision"][kind]["detail"] = summary[kind]["detail"]
     elif not observed_bag.exists():
         for kind in COLLISION_KINDS:
             summary[kind]["detail"] = f"observed bag missing: {observed_bag}"
+            for sub in subscene_summaries:
+                sub["collision"][kind]["detail"] = summary[kind]["detail"]
     else:
         result_topics = _resolve_group_topics(result_bag, result_ns)
         observed_topics = _resolve_group_topics(observed_bag, observed_ns)
         result_by_group = _collect_group_messages_by_stamp(result_bag, result_topics)
         observed_by_group = _collect_group_messages_by_stamp(observed_bag, observed_topics)
 
-        result_base_stamps = set(result_by_group.get("base", {}).keys())
-        observed_base_stamps = set(observed_by_group.get("base", {}).keys())
+        result_base_stamps = {
+            stamp
+            for stamp, record in result_by_group.get("base", {}).items()
+            if is_stamp_in_evaluation_range(_to_nsec(record[0]), scene_timing)
+        }
+        observed_base_stamps = {
+            stamp
+            for stamp, record in observed_by_group.get("base", {}).items()
+            if is_stamp_in_evaluation_range(_to_nsec(record[0]), scene_timing)
+        }
         eval_stamp_set = result_base_stamps & observed_base_stamps
         master_stamps = sorted(result_base_stamps)
 
@@ -1180,6 +1241,13 @@ def _build_collision_for_side(
                     summary[kind]["checked_paths"] += kind_checked_count
                     summary[kind]["collision_paths"] += kind_collision_count
                     summary[kind]["has_collision"] = bool(summary[kind]["has_collision"] or stamp_has_collision)
+                    sub_summary = _subscene_summary_for_stamp(_to_nsec(ref_t), scene_timing, subscene_summaries)
+                    if sub_summary is not None:
+                        sub_summary["collision"][kind]["checked_paths"] += kind_checked_count
+                        sub_summary["collision"][kind]["collision_paths"] += kind_collision_count
+                        sub_summary["collision"][kind]["has_collision"] = bool(
+                            sub_summary["collision"][kind]["has_collision"] or stamp_has_collision
+                        )
 
                 for group in VALIDATION_GROUPS:
                     group_template_msg = group_templates.get(group) or ref_msg or base_template
@@ -1236,6 +1304,8 @@ def _build_collision_for_side(
 
     for kind in COLLISION_KINDS:
         summary[kind]["has_collision"] = bool(summary[kind]["collision_paths"] > 0)
+        for sub in subscene_summaries:
+            sub["collision"][kind]["has_collision"] = bool(sub["collision"][kind]["collision_paths"] > 0)
 
     bag_path = out_dir / f"collision_judgement_{side}.bag"
     if HAS_ROSBAG:
@@ -1285,7 +1355,7 @@ def _build_collision_for_side(
     elif not bag_path.exists():
         bag_path.write_bytes(b"")
 
-    return summary
+    return summary, subscene_summaries
 
 
 def _build_validation_for_side_threshold(
@@ -1300,25 +1370,41 @@ def _build_validation_for_side_threshold(
     observed_bag: Path,
     result_ns: str,
     observed_ns: str,
-) -> tuple[dict, dict[str, dict[str, list[tuple]]]]:
+    scene_timing: dict | None = None,
+) -> tuple[dict, dict[str, dict[str, list[tuple]]], list[dict]]:
     summary = _default_threshold_summary("ok")
     log_key = _validation_log_key(side, horizon, threshold)
     out_records = _empty_validation_out_records()
+    subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
 
     if not HAS_ROSBAG:
         summary["detail"] = "rosbag not available"
+        for sub in subscene_summaries:
+            sub[horizon][threshold]["detail"] = summary["detail"]
     elif not result_bag.exists():
         summary["detail"] = f"result bag missing: {result_bag}"
+        for sub in subscene_summaries:
+            sub[horizon][threshold]["detail"] = summary["detail"]
     elif not observed_bag.exists():
         summary["detail"] = f"observed bag missing: {observed_bag}"
+        for sub in subscene_summaries:
+            sub[horizon][threshold]["detail"] = summary["detail"]
     else:
         result_topics = _resolve_group_topics(result_bag, result_ns)
         observed_topics = _resolve_group_topics(observed_bag, observed_ns)
         result_by_group = _collect_group_messages_by_stamp(result_bag, result_topics)
         observed_by_group = _collect_group_messages_by_stamp(observed_bag, observed_topics)
 
-        result_base_stamps = set(result_by_group.get("base", {}).keys())
-        observed_base_stamps = set(observed_by_group.get("base", {}).keys())
+        result_base_stamps = {
+            stamp
+            for stamp, record in result_by_group.get("base", {}).items()
+            if is_stamp_in_evaluation_range(_to_nsec(record[0]), scene_timing)
+        }
+        observed_base_stamps = {
+            stamp
+            for stamp, record in observed_by_group.get("base", {}).items()
+            if is_stamp_in_evaluation_range(_to_nsec(record[0]), scene_timing)
+        }
         eval_stamp_set = result_base_stamps & observed_base_stamps
         master_stamps = sorted(result_base_stamps) if result_base_stamps else sorted(eval_stamp_set)
 
@@ -1474,8 +1560,13 @@ def _build_validation_for_side_threshold(
                         continue
                     summary["total"] += 1
                     candidates = candidates_by_oid.get(oid, [])
+                    sub_summary = _subscene_summary_for_stamp(_to_nsec(ref_t), scene_timing, subscene_summaries)
+                    if sub_summary is not None:
+                        sub_summary[horizon][threshold]["total"] += 1
                     if candidates:
                         summary["ok"] += 1
+                        if sub_summary is not None:
+                            sub_summary[horizon][threshold]["ok"] += 1
                         opt_group, opt_idx, _opt_cost = min(
                             candidates,
                             key=lambda v: (
@@ -1542,7 +1633,14 @@ def _build_validation_for_side_threshold(
     else:
         summary["rate"] = 0.0
 
-    return summary, out_records
+    for sub in subscene_summaries:
+        sub_summary = sub[horizon][threshold]
+        if sub_summary["total"] > 0:
+            sub_summary["rate"] = (100.0 * float(sub_summary["ok"])) / float(sub_summary["total"])
+        else:
+            sub_summary["rate"] = 0.0
+
+    return summary, out_records, subscene_summaries
 
 
 def evaluate_validation_for_side(
@@ -1553,8 +1651,12 @@ def evaluate_validation_for_side(
     observed_bag: Path,
     result_ns: str,
     observed_ns: str,
+    scene_timing: dict | None = None,
 ) -> dict:
-    summary = {}
+    summary = {
+        "scene_timing": scene_timing,
+        "subscenes": _build_subscene_side_summaries(scene_timing, "not_evaluated"),
+    }
     validation_bag_path = out_dir / f"validation_{side}.bag"
     validation_bag = None
     try:
@@ -1566,7 +1668,7 @@ def evaluate_validation_for_side(
             max_t = float(window_cfg.get("max_t", 5.0))
             other_max_t = float(window_cfg.get("other_max_t", max_t))
             for threshold in VALIDATION_THRESHOLDS:
-                side_summary, out_records = _build_validation_for_side_threshold(
+                side_summary, out_records, subscene_threshold_summaries = _build_validation_for_side_threshold(
                     rel=rel,
                     out_dir=out_dir,
                     side=side,
@@ -1578,8 +1680,12 @@ def evaluate_validation_for_side(
                     observed_bag=observed_bag,
                     result_ns=result_ns,
                     observed_ns=observed_ns,
+                    scene_timing=scene_timing,
                 )
                 summary[horizon][threshold] = side_summary
+                for idx, sub in enumerate(subscene_threshold_summaries):
+                    if idx < len(summary["subscenes"]):
+                        summary["subscenes"][idx][horizon][threshold] = sub[horizon][threshold]
                 if validation_bag is not None:
                     _write_validation_records_to_bag(
                         rel=rel,
@@ -1599,7 +1705,7 @@ def evaluate_validation_for_side(
             validation_bag.close()
     if not HAS_ROSBAG and not validation_bag_path.exists():
         validation_bag_path.write_bytes(b"")
-    collision_summary = _build_collision_for_side(
+    collision_summary, collision_subscenes = _build_collision_for_side(
         rel=rel,
         out_dir=out_dir,
         side=side,
@@ -1607,8 +1713,12 @@ def evaluate_validation_for_side(
         observed_bag=observed_bag,
         result_ns=result_ns,
         observed_ns=observed_ns,
+        scene_timing=scene_timing,
     )
     summary["collision"] = collision_summary
+    for idx, sub in enumerate(collision_subscenes):
+        if idx < len(summary["subscenes"]):
+            summary["subscenes"][idx]["collision"] = sub["collision"]
     for kind in COLLISION_KINDS:
         node = collision_summary.get(kind, {})
         state = "Collision" if bool(node.get("has_collision")) else "Safe"

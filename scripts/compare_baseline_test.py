@@ -19,6 +19,10 @@ from collections import Counter
 from pathlib import Path
 
 from common import (
+    build_scene_timing,
+    collect_clock_stamps_in_bags,
+    find_subscene_index,
+    is_stamp_in_evaluation_range,
     VALIDATION_BASELINE_NS,
     VALIDATION_TEST_NS,
     discover_bag_directories,
@@ -358,7 +362,10 @@ def _traffic_state_signature(msg) -> list:
     return sorted(sig, key=lambda x: (x[0] is None, x[0]))
 
 
-def _count_clock_in_bags(bag_paths: list[Path]) -> int | None:
+def _count_clock_in_bags(
+    bag_paths: list[Path],
+    scene_timing: dict | None = None,
+) -> int | None:
     """入力 bag 群の /clock メッセージ総数（再生時の発火回数＝全体フレーム数）。取れなければ None。"""
     if not HAS_ROSBAG or not bag_paths:
         return None
@@ -372,16 +379,17 @@ def _count_clock_in_bags(bag_paths: list[Path]) -> int | None:
                 topics = info[1] if isinstance(info, tuple) and len(info) >= 2 else getattr(info, "topics", {})
                 if "/clock" not in topics:
                     continue
-                for _topic, _msg, _t in bag.read_messages(topics=["/clock"]):
+                for _topic, _msg, bag_t in bag.read_messages(topics=["/clock"]):
+                    if not is_stamp_in_evaluation_range(_to_nsec(bag_t), scene_timing):
+                        continue
                     total += 1
         except Exception:
             continue
     return total if total > 0 else None
 
 
-def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[Path] | None = None) -> dict:
-    """Run all four checks for one directory. Returns result dict."""
-    result = {
+def _empty_direct_compare_result(rel: str) -> dict:
+    return {
         "directory": rel,
         "lane_ids_ok": None,
         "lane_ids_detail": "",
@@ -407,6 +415,96 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
             "path": {k: 0 for k in OBJECT_PATH_SOURCES},
         },
     }
+
+
+def _make_subscene_compare_entry(base_subscene: dict) -> dict:
+    entry = _empty_direct_compare_result(str(base_subscene.get("label", "")))
+    entry["index"] = int(base_subscene.get("index", 0) or 0)
+    entry["label"] = str(base_subscene.get("label", ""))
+    entry["start_offset_sec"] = float(base_subscene.get("start_offset_sec", 0.0) or 0.0)
+    entry["end_offset_sec"] = float(base_subscene.get("end_offset_sec", entry["start_offset_sec"]) or entry["start_offset_sec"])
+    entry["duration_sec"] = float(base_subscene.get("duration_sec", 0.0) or 0.0)
+    entry["directory"] = None
+    entry["lane_ids_ok"] = True
+    entry["vsl_ok"] = True
+    entry["object_ids_ok"] = True
+    entry["path_and_traffic_ok"] = True
+    entry["path_ok"] = True
+    entry["traffic_ok"] = True
+    entry["overall_ok"] = True
+    return entry
+
+
+def _finalize_compare_summary(summary: dict) -> None:
+    lane_ok = bool(summary.get("lane_ids_ok"))
+    vsl_ok = bool(summary.get("vsl_ok"))
+    obj_ok = bool(summary.get("object_ids_ok"))
+    path_ok = bool(summary.get("path_ok"))
+    traffic_ok = bool(summary.get("traffic_ok"))
+    summary["path_and_traffic_ok"] = bool(path_ok and traffic_ok)
+    summary["overall_ok"] = bool(lane_ok and vsl_ok and obj_ok and path_ok and traffic_ok)
+
+
+def _load_dt_summary(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _merge_dt_summary_into_result(result: dict, side: str, summary: dict | None) -> None:
+    if not isinstance(summary, dict):
+        return
+    result[f"dt_status_{side}"] = str(summary.get("dt_status") or result.get(f"dt_status_{side}") or "valid")
+    result[f"dt_max_{side}"] = str(summary.get("dt_max") or result.get(f"dt_max_{side}") or "-")
+
+    sub_by_index: dict[int, dict] = {}
+    for idx, sub in enumerate(result.get("subscenes", []) or []):
+        if not isinstance(sub, dict):
+            continue
+        sub_by_index[int(sub.get("index", idx) or idx)] = sub
+
+    for idx, sub_summary in enumerate(summary.get("subscenes", []) or []):
+        if not isinstance(sub_summary, dict):
+            continue
+        sub_idx = int(sub_summary.get("index", idx) or idx)
+        sub = sub_by_index.get(sub_idx)
+        if sub is None:
+            continue
+        sub[f"dt_status_{side}"] = str(sub_summary.get("dt_status") or "valid")
+        sub[f"dt_max_{side}"] = str(sub_summary.get("dt_max") or "-")
+
+
+def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[Path] | None = None) -> dict:
+    """Run all four checks for one directory. Returns result dict."""
+    result = _empty_direct_compare_result(rel)
+    scene_timing = build_scene_timing(input_bags or [])
+    result["scene_timing"] = scene_timing
+    result["subscenes"] = [
+        _make_subscene_compare_entry(sub)
+        for sub in ((scene_timing or {}).get("subscenes", []) or [])
+        if isinstance(sub, dict)
+    ]
+    clock_stamps = collect_clock_stamps_in_bags(input_bags or []) if input_bags else []
+    if clock_stamps:
+        clock_stamps = [
+            stamp for stamp in clock_stamps
+            if is_stamp_in_evaluation_range(stamp, scene_timing)
+        ]
+
+    def _subscene_entry_for_stamp(stamp_ns: int) -> dict | None:
+        bag_ref = bl_ref_by.get(stamp_ns) or te_ref_by.get(stamp_ns)
+        stamp_for_scene = _to_nsec(bag_ref[0]) if bag_ref is not None else int(stamp_ns)
+        subscene_index = find_subscene_index(stamp_for_scene, scene_timing)
+        if subscene_index is None:
+            return None
+        if not (0 <= subscene_index < len(result["subscenes"])):
+            return None
+        return result["subscenes"][subscene_index]
 
     if not HAS_ROSBAG:
         result["lane_ids_detail"] = "rosbag not available (run in ROS env)"
@@ -471,8 +569,16 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
 
     ref_topic_b = baseline_wm[0]
     ref_topic_t = test_wm[0]
-    bl_ref_stamps = set(_list_by_stamp(bl_wm[ref_topic_b]).keys())
-    te_ref_stamps = set(_list_by_stamp(te_wm[ref_topic_t]).keys())
+    bl_ref_by = _list_by_stamp(bl_wm[ref_topic_b])
+    te_ref_by = _list_by_stamp(te_wm[ref_topic_t])
+    bl_ref_stamps = {
+        stamp for stamp, bag_ref in bl_ref_by.items()
+        if is_stamp_in_evaluation_range(_to_nsec(bag_ref[0]), scene_timing)
+    }
+    te_ref_stamps = {
+        stamp for stamp, bag_ref in te_ref_by.items()
+        if is_stamp_in_evaluation_range(_to_nsec(bag_ref[0]), scene_timing)
+    }
     common_ref_stamps = bl_ref_stamps & te_ref_stamps
     only_baseline_stamps = sorted(bl_ref_stamps - te_ref_stamps)
     only_test_stamps = sorted(te_ref_stamps - bl_ref_stamps)
@@ -486,12 +592,32 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
     result["record_baseline_topic_counts"] = {t: len(bl_wm[t]) for t in baseline_wm}
     result["record_test_topic_counts"] = {t: len(te_wm[t]) for t in test_wm}
     # 全体 = publish 発火回数（記録メッセージ数）。入力 /clock が取れない場合は ref トピックのメッセージ数を使う
-    total_from_input = _count_clock_in_bags(input_bags) if input_bags else None
-    msg_count_ref = max(
-        result["record_baseline_topic_counts"].get(ref_topic_b, 0),
-        result["record_test_topic_counts"].get(ref_topic_t, 0),
-    )
+    total_from_input = _count_clock_in_bags(input_bags, scene_timing=scene_timing) if input_bags else None
+    msg_count_ref = max(len(bl_ref_stamps), len(te_ref_stamps))
     result["total_frames"] = total_from_input if total_from_input is not None else (msg_count_ref if msg_count_ref > 0 else len(bl_ref_stamps | te_ref_stamps))
+    for stamp in bl_ref_stamps:
+        sub = _subscene_entry_for_stamp(stamp)
+        if sub is not None:
+            sub["record_frames_baseline"] = int(sub.get("record_frames_baseline", 0) or 0) + 1
+    for stamp in te_ref_stamps:
+        sub = _subscene_entry_for_stamp(stamp)
+        if sub is not None:
+            sub["record_frames_test"] = int(sub.get("record_frames_test", 0) or 0) + 1
+    for stamp in common_ref_stamps:
+        sub = _subscene_entry_for_stamp(stamp)
+        if sub is not None:
+            sub["valid_frames"] = int(sub.get("valid_frames", 0) or 0) + 1
+    if clock_stamps:
+        for stamp in clock_stamps:
+            sub = _subscene_entry_for_stamp(stamp)
+            if sub is not None:
+                sub["total_frames"] = int(sub.get("total_frames", 0) or 0) + 1
+    else:
+        union_ref_stamps = bl_ref_stamps | te_ref_stamps
+        for stamp in union_ref_stamps:
+            sub = _subscene_entry_for_stamp(stamp)
+            if sub is not None:
+                sub["total_frames"] = int(sub.get("total_frames", 0) or 0) + 1
 
     # 比較は「共通スタンプ」のみ。lane/WM/traffic ともこのスタンプ集合で揃える（別トピックの stamp で別フレームを比較しない）
     common_sorted = sorted(common_ref_stamps)
@@ -540,6 +666,11 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
                 if source in LANE_SOURCES:
                     result["diff_by_source"]["lane"][source] = True
                     result["diff_counts_by_source"]["lane"][source] += 1
+                    sub = _subscene_entry_for_stamp(stamp)
+                    if sub is not None:
+                        sub["lane_ids_ok"] = False
+                        sub["diff_by_source"]["lane"][source] = True
+                        sub["diff_counts_by_source"]["lane"][source] += 1
             _tick_compare_progress()
     result["lane_ids_ok"] = lane_ok
     if not result["lane_ids_detail"]:
@@ -547,6 +678,8 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
 
     obj_ids_union_b = {k: set() for k in OBJECT_PATH_SOURCES}
     obj_ids_union_t = {k: set() for k in OBJECT_PATH_SOURCES}
+    subscene_obj_ids_union_b = [{k: set() for k in OBJECT_PATH_SOURCES} for _ in result["subscenes"]]
+    subscene_obj_ids_union_t = [{k: set() for k in OBJECT_PATH_SOURCES} for _ in result["subscenes"]]
     vsl_ok = True
     path_ok = True
     traffic_ok = True
@@ -567,12 +700,21 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
             if source in OBJECT_PATH_SOURCES:
                 obj_ids_union_b[source] |= ids_b
                 obj_ids_union_t[source] |= ids_t
+                sub_idx = find_subscene_index(stamp, scene_timing)
+                if sub_idx is not None and 0 <= sub_idx < len(result["subscenes"]):
+                    subscene_obj_ids_union_b[sub_idx][source] |= ids_b
+                    subscene_obj_ids_union_t[sub_idx][source] |= ids_t
                 if ids_b != ids_t:
                     result["diff_by_source"]["object_ids"][source] = True
                     result["diff_counts_by_source"]["object_ids"][source] += 1
                     result["object_ids_detail"] += (
                         f"{topic_b} object ID set differs (stamp={stamp}). "
                     )
+                    sub = _subscene_entry_for_stamp(stamp)
+                    if sub is not None:
+                        sub["object_ids_ok"] = False
+                        sub["diff_by_source"]["object_ids"][source] = True
+                        sub["diff_counts_by_source"]["object_ids"][source] += 1
             vb = _vsl_pose_counter(m1)
             vt = _vsl_pose_counter(m2)
             if source in VSL_SOURCES:
@@ -581,6 +723,11 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
                     vsl_ok = False
                     result["diff_by_source"]["vsl"][source] = True
                     result["diff_counts_by_source"]["vsl"][source] += 1
+                    sub = _subscene_entry_for_stamp(stamp)
+                    if sub is not None:
+                        sub["vsl_ok"] = False
+                        sub["diff_by_source"]["vsl"][source] = True
+                        sub["diff_counts_by_source"]["vsl"][source] += 1
             if source in PATH_COMPARE_SOURCES:
                 tb = _object_trajectory_counters_by_id(m1)
                 tt = _object_trajectory_counters_by_id(m2)
@@ -594,6 +741,11 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
                         path_ok = False
                         result["diff_by_source"]["path"][source] = True
                         result["diff_counts_by_source"]["path"][source] += 1
+                        sub = _subscene_entry_for_stamp(stamp)
+                        if sub is not None:
+                            sub["path_ok"] = False
+                            sub["diff_by_source"]["path"][source] = True
+                            sub["diff_counts_by_source"]["path"][source] += 1
             _tick_compare_progress()
 
     result["object_ids_ok"] = not any(result["diff_by_source"]["object_ids"].values())
@@ -603,6 +755,12 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
             if result["diff_counts_by_source"]["object_ids"][source] == 0:
                 result["diff_counts_by_source"]["object_ids"][source] = 1
             result["object_ids_ok"] = False
+        for sub_idx, sub in enumerate(result["subscenes"]):
+            if subscene_obj_ids_union_b[sub_idx][source] != subscene_obj_ids_union_t[sub_idx][source]:
+                sub["diff_by_source"]["object_ids"][source] = True
+                if sub["diff_counts_by_source"]["object_ids"][source] == 0:
+                    sub["diff_counts_by_source"]["object_ids"][source] = 1
+                sub["object_ids_ok"] = False
     if not result["object_ids_ok"]:
         by_source = []
         for source in OBJECT_PATH_SOURCES:
@@ -627,6 +785,9 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
         if _traffic_state_signature(mb) != _traffic_state_signature(mt):
             result["path_and_traffic_detail"] += f"traffic_light_state at stamp {stamp} differs. "
             traffic_ok = False
+            sub = _subscene_entry_for_stamp(stamp)
+            if sub is not None:
+                sub["traffic_ok"] = False
         _tick_compare_progress()
     result["path_ok"] = path_ok
     result["traffic_ok"] = traffic_ok
@@ -634,12 +795,17 @@ def compare_one(rel: str, baseline_bag: Path, test_bag: Path, input_bags: list[P
     if not result["path_and_traffic_detail"]:
         result["path_and_traffic_detail"] = "Unchanged"
 
-    result["overall_ok"] = (
-        result["lane_ids_ok"]
-        and result["vsl_ok"]
-        and result["object_ids_ok"]
-        and result["path_and_traffic_ok"]
-    )
+    _finalize_compare_summary(result)
+    for sub in result["subscenes"]:
+        if not sub.get("lane_ids_detail"):
+            sub["lane_ids_detail"] = "Unchanged"
+        if not sub.get("vsl_detail"):
+            sub["vsl_detail"] = "Unchanged"
+        if not sub.get("object_ids_detail"):
+            sub["object_ids_detail"] = "Unchanged"
+        if not sub.get("path_and_traffic_detail"):
+            sub["path_and_traffic_detail"] = "Unchanged"
+        _finalize_compare_summary(sub)
     return result
 
 
@@ -1227,10 +1393,14 @@ def main() -> int:
         )
         _read_dt = lambda p: _normalize_dt(p.read_text().strip()) if p.exists() else "valid"
         _read_dt_max = lambda p: p.read_text().strip() if p.exists() else "-"
+        baseline_dt_summary = _load_dt_summary(baseline_root / rel / "dt_summary.json")
+        test_dt_summary = _load_dt_summary(test_results_root / rel / "dt_summary.json")
         res["dt_status_baseline"] = _read_dt(baseline_root / rel / "dt_status")
         res["dt_status_test"] = _read_dt(test_results_root / rel / "dt_status")
         res["dt_max_baseline"] = _read_dt_max(baseline_root / rel / "dt_max")
         res["dt_max_test"] = _read_dt_max(test_results_root / rel / "dt_max")
+        _merge_dt_summary_into_result(res, "baseline", baseline_dt_summary)
+        _merge_dt_summary_into_result(res, "test", test_dt_summary)
         all_results.append(res)
         out_dir = test_results_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)

@@ -12,8 +12,11 @@ from collections import defaultdict
 from pathlib import Path
 
 from common import (
+    build_scene_timing,
+    build_subscene_dt_summary,
     check_offline_binary_supports_map_name,
     VALIDATION_BASELINE_NS,
+    collect_clock_timeline_in_bags,
     discover_bag_directories,
     get_bag_files_in_dir,
     get_commit_info_for_run,
@@ -831,6 +834,7 @@ def main() -> int:
         bags = get_bag_files_in_dir(dir_path)
         if not bags:
             continue
+        scene_timing = build_scene_timing(bags)
 
         selected_bags, matched_topics = select_bag_files_by_topics(
             bags, TP_SIM_OFFLINE_INPUT_TOPICS
@@ -849,6 +853,11 @@ def main() -> int:
 
         out_dir = baseline_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)
+        if scene_timing is not None:
+            (out_dir / "scene_timing.json").write_text(
+                json.dumps(scene_timing, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
         out_bag = out_dir / "result_baseline.bag"
         if out_bag.exists():
             out_bag.unlink()
@@ -874,6 +883,15 @@ def main() -> int:
         else:
             (out_dir / "dt_status").write_text("valid")
         (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
+        dt_summary = build_subscene_dt_summary(
+            dt_values=dt_values,
+            clock_timeline_ns=collect_clock_timeline_in_bags(bags),
+            scene_timing=scene_timing,
+        )
+        (out_dir / "dt_summary.json").write_text(
+            json.dumps(dt_summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
         if rc != 0:
             (out_dir / "segfault").touch()
@@ -918,6 +936,7 @@ def main() -> int:
                 observed_bag=observed_bag,
                 result_ns=VALIDATION_BASELINE_NS,
                 observed_ns=VALIDATION_OBSERVED_BASELINE_NS,
+                scene_timing=scene_timing,
             )
             validation_summary_path.write_text(
                 json.dumps(validation_summary, indent=2, ensure_ascii=False),

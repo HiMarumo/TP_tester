@@ -40,6 +40,7 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyleOptionComboBox,
@@ -52,14 +53,15 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QBrush, QPalette, QTextDocument, QAbstractTextDocumentLayout
 
 
-# Column headers for comparison table (row 0 = what each column means)
-TABLE_HEADERS = ["", "C", "L", "O", "P", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
-COL_HALF_DELTA = 0
-COL_COLLISION = 1
-COL_MARK_L = 2
-COL_MARK_O = 3
-COL_MARK_P = 4
-COL_DIRECTORY = 5
+# Column headers for comparison table (leftmost column is scene expand/collapse toggle)
+TABLE_HEADERS = ["", "", "C", "L", "O", "P", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
+COL_TOGGLE = 0
+COL_HALF_DELTA = 1
+COL_COLLISION = 2
+COL_MARK_L = 3
+COL_MARK_O = 4
+COL_MARK_P = 5
+COL_DIRECTORY = 6
 STATUS_CHANGED = "Changed"
 STATUS_UNCHANGED = "Unchanged"
 COLOR_GREEN = QColor(0, 140, 0)
@@ -314,6 +316,44 @@ def _dt_status_display(status: str | None) -> str:
     return "valid"
 
 
+def _has_dt_fields(comp: dict | None) -> bool:
+    if not isinstance(comp, dict):
+        return False
+    return ("dt_status_baseline" in comp) and ("dt_status_test" in comp)
+
+
+def _dt_summary_text(comp: dict | None) -> str:
+    if not _has_dt_fields(comp):
+        return "-"
+    sb = _dt_status_display(comp.get("dt_status_baseline"))
+    st = _dt_status_display(comp.get("dt_status_test"))
+    if sb == "invalid" or st == "invalid":
+        dt_status_label = "Invalid"
+    elif sb == "warning" or st == "warning":
+        dt_status_label = "Warning"
+    else:
+        dt_status_label = "Valid"
+    max_b = comp.get("dt_max_baseline") or "-"
+    max_t = comp.get("dt_max_test") or "-"
+    try:
+        max_val = max_b if max_b != "-" and (max_t == "-" or float(max_b) >= float(max_t)) else max_t
+    except (ValueError, TypeError):
+        max_val = max_b if max_b != "-" else max_t
+    if max_val == "-":
+        return dt_status_label
+    return f"{dt_status_label} ({max_val})"
+
+
+def _dt_detail_text(comp: dict | None) -> str:
+    if not _has_dt_fields(comp):
+        return "-"
+    dt_b = _dt_status_display(comp.get("dt_status_baseline"))
+    dt_t = _dt_status_display(comp.get("dt_status_test"))
+    dt_max_b = comp.get("dt_max_baseline") or "-"
+    dt_max_t = comp.get("dt_max_test") or "-"
+    return f"B:{dt_b}({dt_max_b}) / T:{dt_t}({dt_max_t})"
+
+
 def _summary_state(comp: dict | None) -> str | None:
     if not comp:
         return None
@@ -427,9 +467,9 @@ def _collision_mark(comp: dict | None) -> str:
 
 
 def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
-    """Return [half_delta, collision, L, O, P, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
+    """Return [toggle, half_delta, collision, L, O, P, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
     if not comp:
-        return ["-", "-", "-", "-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
+        return ["", "-", "-", "-", "-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
     valid = comp.get("valid_frames")
     total = comp.get("total_frames")
     # 全体 = 和集合。古い JSON 用に total が無い場合は record_frames から算出
@@ -447,27 +487,10 @@ def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
     d = STATUS_UNCHANGED if path_ok else STATUS_CHANGED
     e = STATUS_UNCHANGED if traffic_ok else STATUS_CHANGED
     seg = "Yes" if comp.get("segfault_baseline") or comp.get("segfault_test") else "No"
-    sb = _dt_status_display(comp.get("dt_status_baseline"))
-    st = _dt_status_display(comp.get("dt_status_test"))
-    if sb == "invalid" or st == "invalid":
-        dt_status_label = "Invalid"
-    elif sb == "warning" or st == "warning":
-        dt_status_label = "Warning"
-    else:
-        dt_status_label = "Valid"
-    max_b = comp.get("dt_max_baseline") or "-"
-    max_t = comp.get("dt_max_test") or "-"
-    try:
-        max_val = max_b if max_b != "-" and (max_t == "-" or float(max_b) >= float(max_t)) else max_t
-    except (ValueError, TypeError):
-        max_val = max_b if max_b != "-" else max_t
-    if max_val == "-":
-        dt_status = dt_status_label
-    else:
-        dt_status = f"{dt_status_label} ({max_val})"
+    dt_status = _dt_summary_text(comp)
     half_delta = _half_delta_mark(comp)
     collision_mark = _collision_mark(comp)
-    return [half_delta, collision_mark, "■", "■", "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
+    return ["", half_delta, collision_mark, "■", "■", "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
 
 
 def _validation_rate_stats(node: dict | None) -> tuple[str, float | None]:
@@ -663,6 +686,15 @@ def _collect_results(root: Path, test_results_path: str) -> list[tuple[str, Path
             rel = f"{top.name}/{sub.name}"
             out.append((rel, cmp_path, comp))
     return out
+
+
+def _row_key(row_data: dict) -> tuple[str, str | None, int | None]:
+    if row_data.get("is_overall"):
+        return ("overall", None, None)
+    rel = str(row_data.get("rel") or "")
+    if row_data.get("is_subscene"):
+        return ("subscene", rel, _to_int_nonneg(row_data.get("subscene_index"), 0))
+    return ("scene", rel, None)
 
 
 def _comp_total_frames(comp: dict | None) -> int | None:
@@ -873,17 +905,23 @@ class ViewerAppPyQt(QMainWindow):
         self.baseline_root = self.root / self.paths["baseline_results"]
         self.test_results_root = self.root / self.paths["test_results"]
         self.current_rel = None
+        self.current_subscene_index = None
         self.play_proc = None
         self.viewer_proc = None
         self.viewer_embed = None
         self._play_finished_timer = None
         self._play_paused = False
         self._playing_rel = None
+        self._playing_subscene_index = None
         self._play_start_time = None
         self._viewer_launch_timer = QTimer(self)
         self._viewer_launch_timer.timeout.connect(self._check_viewer_launched)
         self._viewer_launch_start = None
         self._table_rows: list[dict] = []
+        self._expanded_scene_rels: set[str] = set()
+        self._selected_row_data: dict | None = None
+        self._selected_subscene_table = None
+        self._handling_selection_change = False
         self._baseline_commit_info = self._load_commit_info(self.baseline_root / "commit_info.json")
         self._test_commit_info = self._load_commit_info(self.test_results_root / "commit_info.json")
         self._build_ui()
@@ -1048,11 +1086,13 @@ class ViewerAppPyQt(QMainWindow):
         self._set_detail_table_rows([])
 
     def _restore_indicator_columns(self):
+        self.table.setColumnHidden(COL_TOGGLE, False)
         self.table.setColumnHidden(COL_HALF_DELTA, False)
         self.table.setColumnHidden(COL_COLLISION, False)
         self.table.setColumnHidden(COL_MARK_L, False)
         self.table.setColumnHidden(COL_MARK_O, False)
         self.table.setColumnHidden(COL_MARK_P, False)
+        self.table.setColumnWidth(COL_TOGGLE, 28)
         self.table.setColumnWidth(COL_HALF_DELTA, 28)
         self.table.setColumnWidth(COL_COLLISION, 24)
         self.table.setColumnWidth(COL_MARK_L, 24)
@@ -1154,72 +1194,278 @@ class ViewerAppPyQt(QMainWindow):
             self.detail_table.setItem(i, 1, right)
         self.detail_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
 
+    def _make_scene_toggle_button(self, rel: str, expanded: bool) -> QToolButton:
+        button = QToolButton(self.table)
+        button.setText("▾" if expanded else "▸")
+        button.setAutoRaise(True)
+        button.clicked.connect(lambda _checked=False, scene_rel=rel: self._toggle_scene_expansion(scene_rel))
+        return button
+
+    def _populate_result_row(self, table: QTableWidget, row_index: int, row_data: dict):
+        rel = str(row_data.get("display_rel") or row_data.get("rel") or "")
+        comp = row_data.get("comp")
+        cells = _row_from_comp(rel, comp)
+        lane_marker, object_marker, path_marker = _lop_marker_states(comp)
+        for j, text in enumerate(cells):
+            item = QTableWidgetItem(text)
+            if j == COL_HALF_DELTA:
+                item.setTextAlignment(Qt.AlignCenter)
+                if text == "↑":
+                    item.setForeground(COLOR_GREEN)
+                elif text == "↓":
+                    item.setForeground(COLOR_RED)
+            elif j == COL_COLLISION:
+                item.setTextAlignment(Qt.AlignCenter)
+                if text == "○":
+                    item.setForeground(COLOR_GREEN)
+                elif text == "×":
+                    item.setForeground(COLOR_RED)
+            elif j in (COL_MARK_L, COL_MARK_O, COL_MARK_P):
+                item.setTextAlignment(Qt.AlignCenter)
+                marker_state = None
+                if j == COL_MARK_L:
+                    marker_state = lane_marker
+                elif j == COL_MARK_O:
+                    marker_state = object_marker
+                elif j == COL_MARK_P:
+                    marker_state = path_marker
+                if marker_state in STATUS_COLOR:
+                    item.setForeground(STATUS_COLOR[marker_state])
+            else:
+                self._set_status_color(item)
+            table.setItem(row_index, j, item)
+
+        if table is self.table and row_data.get("is_scene") and row_data.get("has_children"):
+            button = self._make_scene_toggle_button(
+                str(row_data.get("rel") or ""),
+                bool(row_data.get("expanded")),
+            )
+            table.setCellWidget(row_index, COL_TOGGLE, button)
+
+    def _sync_child_table_layout(self, child_table: QTableWidget):
+        child_table.setColumnHidden(COL_TOGGLE, True)
+        for col in range(child_table.columnCount()):
+            child_table.setColumnWidth(col, self.table.columnWidth(col))
+        child_table.resizeRowsToContents()
+        height = child_table.frameWidth() * 2
+        if child_table.horizontalHeader().isVisible():
+            height += child_table.horizontalHeader().height()
+        for row in range(child_table.rowCount()):
+            height += child_table.rowHeight(row)
+        if child_table.horizontalScrollBar().isVisible():
+            height += child_table.horizontalScrollBar().height()
+        child_table.setMinimumHeight(height + 4)
+        child_table.setMaximumHeight(height + 4)
+
+    def _on_subscene_select(
+        self,
+        child_table: QTableWidget,
+        child_rows: list[dict],
+        parent_scene_row: int,
+    ):
+        if self._handling_selection_change:
+            return
+        sel = child_table.selectedIndexes()
+        if not sel:
+            return
+        row = sel[0].row()
+        if row < 0 or row >= len(child_rows):
+            return
+        self._handling_selection_change = True
+        try:
+            if self._selected_subscene_table is not None and self._selected_subscene_table is not child_table:
+                self._selected_subscene_table.clearSelection()
+            self._selected_subscene_table = child_table
+            self.table.selectRow(parent_scene_row)
+        finally:
+            self._handling_selection_change = False
+        self._apply_selected_row_data(child_rows[row])
+
+    def _make_subscene_container(
+        self,
+        rel: str,
+        cmp_path: Path | None,
+        subscenes: list[dict],
+        parent_scene_row: int,
+    ) -> tuple[QWidget, QTableWidget, list[dict]]:
+        child_rows: list[dict] = []
+        for idx, sub in enumerate(subscenes):
+            if not isinstance(sub, dict):
+                continue
+            label = str(sub.get("label") or f"subscene {idx}")
+            subscene_index = _to_int_nonneg(sub.get("index"), idx)
+            child_rows.append(
+                {
+                    "rel": rel,
+                    "display_rel": label,
+                    "cmp_path": cmp_path,
+                    "comp": sub,
+                    "is_overall": False,
+                    "is_scene": False,
+                    "is_subscene": True,
+                    "subscene_index": subscene_index,
+                }
+            )
+
+        child_table = StableHScrollTableWidget()
+        child_table.setColumnCount(len(TABLE_HEADERS))
+        child_headers = list(TABLE_HEADERS)
+        child_headers[COL_DIRECTORY] = "Subsequence"
+        child_table.setHorizontalHeaderLabels(child_headers)
+        child_table.setRowCount(len(child_rows))
+        child_table.setSelectionBehavior(QTableWidget.SelectRows)
+        child_table.setSelectionMode(QTableWidget.SingleSelection)
+        child_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        child_table.setItemDelegate(KeepSelectionColorDelegate(child_table))
+        child_table.setStyleSheet(
+            "QTableWidget::item:selected {"
+            " background-color: rgba(90, 150, 255, 90);"
+            "}"
+        )
+        child_table.verticalHeader().setVisible(False)
+        for row_idx, child_row in enumerate(child_rows):
+            self._populate_result_row(child_table, row_idx, child_row)
+        child_table.itemSelectionChanged.connect(
+            lambda table=child_table, rows=child_rows, parent_row=parent_scene_row: self._on_subscene_select(
+                table, rows, parent_row
+            )
+        )
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(24, 6, 0, 6)
+        layout.addWidget(child_table)
+        return container, child_table, child_rows
+
     def _refresh_list(self):
+        prev_row = self._get_selected_row_data()
+        prev_key = _row_key(prev_row) if prev_row else ("overall", None, None)
         rows = _collect_results(self.root, self.paths["test_results"])
         overall_comp = _aggregate_comparison(rows)
         table_rows = [{"rel": OVERALL_LABEL, "comp": overall_comp, "is_overall": True}]
         for rel, cmp_path, comp in rows:
-            table_rows.append({"rel": rel, "cmp_path": cmp_path, "comp": comp, "is_overall": False})
+            subscenes = comp.get("subscenes", []) if isinstance(comp, dict) else []
+            if not isinstance(subscenes, list):
+                subscenes = []
+            has_children = bool(subscenes)
+            expanded = has_children and (rel in self._expanded_scene_rels)
+            table_rows.append(
+                {
+                    "rel": rel,
+                    "display_rel": rel,
+                    "cmp_path": cmp_path,
+                    "comp": comp,
+                    "is_overall": False,
+                    "is_scene": True,
+                    "has_children": has_children,
+                    "expanded": expanded,
+                    "subscenes": subscenes,
+                }
+            )
+            if expanded:
+                table_rows.append(
+                    {
+                        "rel": rel,
+                        "is_container": True,
+                        "is_overall": False,
+                        "is_scene": False,
+                        "cmp_path": cmp_path,
+                        "subscenes": subscenes,
+                    }
+                )
         self._table_rows = table_rows
 
+        self._handling_selection_change = True
+        self._selected_subscene_table = None
+        self.table.clearSpans()
+        self.table.clearContents()
         self.table.setRowCount(len(table_rows))
-        for i, row_data in enumerate(table_rows):
-            rel = row_data.get("rel")
-            comp = row_data.get("comp")
-            cells = _row_from_comp(rel, comp)
-            lane_marker, object_marker, path_marker = _lop_marker_states(comp)
-            for j, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                if j == COL_HALF_DELTA:
-                    item.setTextAlignment(Qt.AlignCenter)
-                    if text == "↑":
-                        item.setForeground(COLOR_GREEN)
-                    elif text == "↓":
-                        item.setForeground(COLOR_RED)
-                elif j == COL_COLLISION:
-                    item.setTextAlignment(Qt.AlignCenter)
-                    if text == "○":
-                        item.setForeground(COLOR_GREEN)
-                    elif text == "×":
-                        item.setForeground(COLOR_RED)
-                elif j in (COL_MARK_L, COL_MARK_O, COL_MARK_P):
-                    item.setTextAlignment(Qt.AlignCenter)
-                    marker_state = None
-                    if j == COL_MARK_L:
-                        marker_state = lane_marker
-                    elif j == COL_MARK_O:
-                        marker_state = object_marker
-                    elif j == COL_MARK_P:
-                        marker_state = path_marker
-                    if marker_state in STATUS_COLOR:
-                        item.setForeground(STATUS_COLOR[marker_state])
-                else:
-                    self._set_status_color(item)
-                self.table.setItem(i, j, item)
-        self.table.resizeColumnsToContents()
-        self._restore_list_viewport()
-        if self.table.rowCount() > 0:
-            self.table.selectRow(0)
-        self._refresh_play_button_enabled()
+        default_row_height = max(1, self.table.verticalHeader().defaultSectionSize())
+        for row_index in range(len(table_rows)):
+            self.table.setRowHeight(row_index, default_row_height)
+        selected_main_row = 0
+        selected_main_row_data = table_rows[0] if table_rows else None
+        pending_child_selection = None
+        child_tables: list[QTableWidget] = []
+        child_containers: list[tuple[int, QWidget, QTableWidget]] = []
 
-    def _on_select(self):
+        for i, row_data in enumerate(table_rows):
+            if row_data.get("is_container"):
+                self.table.setSpan(i, 0, 1, self.table.columnCount())
+                parent_scene_row = max(0, i - 1)
+                container, child_table, child_rows = self._make_subscene_container(
+                    str(row_data.get("rel") or ""),
+                    row_data.get("cmp_path"),
+                    row_data.get("subscenes") or [],
+                    parent_scene_row,
+                )
+                self.table.setCellWidget(i, 0, container)
+                child_tables.append(child_table)
+                child_containers.append((i, container, child_table))
+                self._sync_child_table_layout(child_table)
+                self.table.setRowHeight(i, container.sizeHint().height())
+                for child_row_idx, child_row in enumerate(child_rows):
+                    if _row_key(child_row) == prev_key:
+                        pending_child_selection = (child_table, child_row_idx, child_row, parent_scene_row)
+                        selected_main_row = parent_scene_row
+                        selected_main_row_data = self._table_rows[parent_scene_row]
+                continue
+
+            self._populate_result_row(self.table, i, row_data)
+            if _row_key(row_data) == prev_key:
+                selected_main_row = i
+                selected_main_row_data = row_data
+
+        self.table.resizeColumnsToContents()
+        self.table.resizeRowsToContents()
         self._restore_list_viewport()
-        sel = self.table.selectedIndexes()
-        if not sel:
+        for child_table in child_tables:
+            self._sync_child_table_layout(child_table)
+        for row_index, container, _child_table in child_containers:
+            self.table.setRowHeight(row_index, container.sizeHint().height())
+        self._handling_selection_change = False
+
+        if self.table.rowCount() > 0:
+            self.table.selectRow(selected_main_row)
+        if pending_child_selection is not None:
+            child_table, child_row_idx, child_row_data, parent_scene_row = pending_child_selection
+            self._handling_selection_change = True
+            try:
+                self.table.selectRow(parent_scene_row)
+            finally:
+                self._handling_selection_change = False
+            child_table.selectRow(child_row_idx)
+            self._selected_subscene_table = child_table
+            self._apply_selected_row_data(child_row_data)
+        elif selected_main_row_data is not None:
+            self._apply_selected_row_data(selected_main_row_data)
+        else:
+            self._selected_row_data = None
+            self._refresh_play_button_enabled()
+
+    def _apply_selected_row_data(self, row_data: dict | None):
+        self._selected_row_data = row_data
+        if not row_data:
+            self.current_subscene_index = None
             self._refresh_play_button_enabled()
             return
-        row = sel[0].row()
-        if row < 0 or row >= len(self._table_rows):
-            self._refresh_play_button_enabled()
-            return
-        row_data = self._table_rows[row]
+
         is_overall = bool(row_data.get("is_overall"))
         selected_rel = str(row_data.get("rel") or "")
+        selected_subscene_index = row_data.get("subscene_index") if row_data.get("is_subscene") else None
         self.current_rel = None if is_overall else selected_rel
+        self.current_subscene_index = None if is_overall else selected_subscene_index
         if not is_overall and not self.current_rel:
             self._refresh_play_button_enabled()
             return
-        if self.play_proc and self.play_proc.poll() is None and self._playing_rel is not None and self.current_rel != self._playing_rel:
+        if (
+            self.play_proc
+            and self.play_proc.poll() is None
+            and (
+                self.current_rel != self._playing_rel
+                or self.current_subscene_index != self._playing_subscene_index
+            )
+        ):
             self._end_playback()
         comp = row_data.get("comp")
 
@@ -1227,7 +1473,7 @@ class ViewerAppPyQt(QMainWindow):
             self._set_validation_table_rows(_validation_summary_rows(None))
             self._set_diff_table_no_data()
             if is_overall:
-                total_dirs = len(self._table_rows) - 1 if self._table_rows else 0
+                total_dirs = sum(1 for item in self._table_rows if item.get("is_scene"))
                 self._set_detail_table_rows([
                     ("Directory", OVERALL_LABEL),
                     ("comparison.json", f"loaded 0/{total_dirs}"),
@@ -1287,15 +1533,14 @@ class ViewerAppPyQt(QMainWindow):
                 if comp.get("segfault_baseline") or comp.get("segfault_test")
                 else "No"
             )
-            dt_b = _dt_status_display(comp.get("dt_status_baseline"))
-            dt_t = _dt_status_display(comp.get("dt_status_test"))
-            dt_max_b = comp.get("dt_max_baseline") or "-"
-            dt_max_t = comp.get("dt_max_test") or "-"
-            dt_text = f"B:{dt_b}({dt_max_b}) / T:{dt_t}({dt_max_t})"
+            dt_text = _dt_detail_text(comp)
 
         if is_overall:
             loaded_dirs = _to_int_nonneg(comp.get("_overall_loaded_dirs"), 0)
-            total_dirs = _to_int_nonneg(comp.get("_overall_total_dirs"), max(0, len(self._table_rows) - 1))
+            total_dirs = _to_int_nonneg(
+                comp.get("_overall_total_dirs"),
+                sum(1 for item in self._table_rows if item.get("is_scene")),
+            )
             detail_rows = [
                 ("Directory", OVERALL_LABEL),
                 ("comparison.json", f"loaded {loaded_dirs}/{total_dirs}"),
@@ -1311,8 +1556,11 @@ class ViewerAppPyQt(QMainWindow):
         else:
             baseline_bag = self.baseline_root / self.current_rel / "result_baseline.bag"
             test_bag = self.test_results_root / self.current_rel / "result_test.bag"
+            detail_rows = [("Directory", self.current_rel)]
+            if row_data.get("is_subscene"):
+                detail_rows.append(("Subscene", str(comp.get("label") or f"#{selected_subscene_index}")))
             detail_rows = [
-                ("Directory", self.current_rel),
+                *detail_rows,
                 ("Valid/Total", valid_text),
                 ("Lane IDs", lane_text),
                 ("VSL", vsl_text),
@@ -1327,6 +1575,44 @@ class ViewerAppPyQt(QMainWindow):
         self._set_detail_table_rows(detail_rows)
         self._restore_list_viewport()
         self._refresh_play_button_enabled()
+
+    def _on_select(self):
+        if self._handling_selection_change:
+            return
+        self._restore_list_viewport()
+        sel = self.table.selectedIndexes()
+        if not sel:
+            self._selected_row_data = None
+            self.current_subscene_index = None
+            self._refresh_play_button_enabled()
+            return
+        row = sel[0].row()
+        if row < 0 or row >= len(self._table_rows):
+            self._selected_row_data = None
+            self.current_subscene_index = None
+            self._refresh_play_button_enabled()
+            return
+        row_data = self._table_rows[row]
+        if row_data.get("is_container"):
+            return
+        self._handling_selection_change = True
+        try:
+            if self._selected_subscene_table is not None:
+                self._selected_subscene_table.clearSelection()
+                self._selected_subscene_table = None
+        finally:
+            self._handling_selection_change = False
+        self._apply_selected_row_data(row_data)
+
+    def _toggle_scene_expansion(self, rel: str):
+        if not rel:
+            return
+        if rel in self._expanded_scene_rels:
+            self._expanded_scene_rels.discard(rel)
+        else:
+            self._expanded_scene_rels.add(rel)
+        self._selected_row_data = {"rel": rel, "is_overall": False, "is_scene": True}
+        self._refresh_list()
 
     def _publish_display_mode(self, mode=None):
         try:
@@ -1412,16 +1698,13 @@ class ViewerAppPyQt(QMainWindow):
             self._viewer_launch_start = None
             self.viewer_status.setText("Viewer: Running in a separate window. Use Play to start rosbag playback.")
 
+    def _get_selected_row_data(self):
+        return self._selected_row_data
+
     def _get_selected_rel(self):
         """Currently selected table row's directory (rel), or None."""
-        sel = self.table.selectedIndexes()
-        if not sel:
-            return None
-        row = sel[0].row()
-        if row < 0 or row >= len(self._table_rows):
-            return None
-        row_data = self._table_rows[row]
-        if row_data.get("is_overall"):
+        row_data = self._get_selected_row_data()
+        if not row_data or row_data.get("is_overall"):
             return None
         rel = row_data.get("rel")
         return str(rel) if rel else None
@@ -1433,8 +1716,9 @@ class ViewerAppPyQt(QMainWindow):
         self.btn_play.setEnabled(self._get_selected_rel() is not None)
 
     def _play(self):
+        row_data = self._get_selected_row_data()
         rel = self._get_selected_rel()
-        if not rel:
+        if not rel or not row_data:
             QMessageBox.warning(self, "Play", "Select a non-overall data row first.")
             return
         self.btn_play.setText("Preparing...")
@@ -1442,6 +1726,7 @@ class ViewerAppPyQt(QMainWindow):
         QApplication.processEvents()  # 即座に描画し、準備中は押せないように見せる（連打防止）
         self._stop()
         self.current_rel = rel
+        self.current_subscene_index = row_data.get("subscene_index") if row_data.get("is_subscene") else None
         set_viewer_rosparams(self.settings)
         baseline_bag = self.baseline_root / rel / "result_baseline.bag"
         observed_baseline_bag = self.baseline_root / rel / "observed_baseline.bag"
@@ -1504,14 +1789,28 @@ class ViewerAppPyQt(QMainWindow):
                                 if validation_bag.exists():
                                     play_bags.append(str(validation_bag))
         self._playing_rel = rel
+        self._playing_subscene_index = self.current_subscene_index
         self._publish_display_mode(self.mode_combo.currentIndex())
-        self._start_rosbag_play(play_bags)
+        subscene = row_data.get("comp") if row_data.get("is_subscene") else None
+        start_sec = 0.0
+        duration_sec = None
+        if isinstance(subscene, dict):
+            start_sec = max(0.0, _to_float_or_none(subscene.get("start_offset_sec")) or 0.0)
+            duration_sec = max(0.0, _to_float_or_none(subscene.get("duration_sec")) or 0.0)
+            if duration_sec <= 1e-6:
+                duration_sec = None
+        self._start_rosbag_play(play_bags, start_sec=start_sec, duration_sec=duration_sec)
 
-    def _start_rosbag_play(self, play_bags: list[str]):
+    def _start_rosbag_play(self, play_bags: list[str], start_sec: float = 0.0, duration_sec: float | None = None):
         self._publish_clear_buffers()
+        cmd = ["rosbag", "play"] + play_bags + ["--clock", "--loop"]
+        if start_sec > 1e-6:
+            cmd.extend(["-s", f"{start_sec:.3f}"])
+        if duration_sec is not None and duration_sec > 1e-6:
+            cmd.extend(["-u", f"{duration_sec:.3f}"])
         try:
             self.play_proc = subprocess.Popen(
-                ["rosbag", "play"] + play_bags + ["--clock", "--loop"],
+                cmd,
                 env=os.environ.copy(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
@@ -1561,6 +1860,7 @@ class ViewerAppPyQt(QMainWindow):
 
     def _set_stopped_state(self):
         self._playing_rel = None
+        self._playing_subscene_index = None
         self.btn_play.setText("Play")
         self._refresh_play_button_enabled()
         self.btn_stop.setEnabled(False)

@@ -152,6 +152,56 @@ def _load_side_collision(path: Path, side: str) -> dict:
     return out
 
 
+def _normalize_subscene_meta(node: dict, fallback_index: int) -> dict:
+    if not isinstance(node, dict):
+        node = {}
+    start_offset = float(node.get("start_offset_sec", 0.0) or 0.0)
+    end_offset = float(node.get("end_offset_sec", start_offset) or start_offset)
+    return {
+        "index": int(node.get("index", fallback_index) or fallback_index),
+        "label": str(node.get("label", "")),
+        "start_offset_sec": start_offset,
+        "end_offset_sec": end_offset,
+        "duration_sec": float(node.get("duration_sec", max(0.0, end_offset - start_offset)) or 0.0),
+    }
+
+
+def _load_side_subscenes(path: Path, side: str) -> dict[int, dict]:
+    raw = _load_json_dict(path)
+    if raw is None:
+        return {}
+    raw_subscenes = raw.get("subscenes", [])
+    if not isinstance(raw_subscenes, list):
+        return {}
+    out: dict[int, dict] = {}
+    for idx, node in enumerate(raw_subscenes):
+        if not isinstance(node, dict):
+            continue
+        meta = _normalize_subscene_meta(node, idx)
+        sub = dict(meta)
+        for horizon in VALIDATION_HORIZONS:
+            hnode = node.get(horizon, node.get(horizon.replace("-", "_"), {}))
+            if not isinstance(hnode, dict):
+                hnode = {}
+            sub[horizon] = {}
+            for threshold in VALIDATION_THRESHOLDS:
+                sub[horizon][threshold] = _normalize_threshold_summary(
+                    hnode.get(threshold, {}),
+                    detail_fallback=f"{side}_subscene_{meta['index']}_{horizon}_{threshold}_summary_missing",
+                )
+        collision_raw = node.get("collision", {})
+        if not isinstance(collision_raw, dict):
+            collision_raw = {}
+        sub["collision"] = {}
+        for kind in COLLISION_KINDS:
+            sub["collision"][kind] = _normalize_collision_kind_summary(
+                collision_raw.get(kind, {}),
+                detail_fallback=f"{side}_subscene_{meta['index']}_{kind}_collision_summary_missing",
+            )
+        out[meta["index"]] = sub
+    return out
+
+
 def main() -> int:
     root = get_tester_root()
     settings = load_settings(root)
@@ -172,6 +222,8 @@ def main() -> int:
         merged_path = out_dir / "comparison.json"
         baseline_summary_path = baseline_root / rel / "validation_baseline_summary.json"
         test_summary_path = out_dir / "validation_test_summary.json"
+        baseline_summary_raw = _load_json_dict(baseline_summary_path) or {}
+        test_summary_raw = _load_json_dict(test_summary_path) or {}
 
         comp = _load_json_dict(direct_path)
         if comp is None:
@@ -186,6 +238,17 @@ def main() -> int:
                 "detail": "comparison_direct_missing",
             }
 
+        direct_subscenes = comp.get("subscenes", [])
+        if not isinstance(direct_subscenes, list):
+            direct_subscenes = []
+        scene_timing = comp.get("scene_timing")
+        if not isinstance(scene_timing, dict):
+            scene_timing = baseline_summary_raw.get("scene_timing")
+        if not isinstance(scene_timing, dict):
+            scene_timing = test_summary_raw.get("scene_timing")
+        if isinstance(scene_timing, dict):
+            comp["scene_timing"] = scene_timing
+
         comp["validation"] = {
             "baseline": _load_side_summary(baseline_summary_path, "baseline"),
             "test": _load_side_summary(test_summary_path, "test"),
@@ -194,6 +257,101 @@ def main() -> int:
             "baseline": _load_side_collision(baseline_summary_path, "baseline"),
             "test": _load_side_collision(test_summary_path, "test"),
         }
+
+        baseline_subscene_map = _load_side_subscenes(baseline_summary_path, "baseline")
+        test_subscene_map = _load_side_subscenes(test_summary_path, "test")
+        direct_subscene_map: dict[int, dict] = {}
+        ordered_indices: list[int] = []
+        for idx, node in enumerate(direct_subscenes):
+            if not isinstance(node, dict):
+                continue
+            meta = _normalize_subscene_meta(node, idx)
+            merged_direct = dict(node)
+            merged_direct.update(meta)
+            direct_subscene_map[meta["index"]] = merged_direct
+            ordered_indices.append(meta["index"])
+        for node in ((scene_timing or {}).get("subscenes", []) if isinstance(scene_timing, dict) else []):
+            meta = _normalize_subscene_meta(node, len(ordered_indices))
+            if meta["index"] not in ordered_indices:
+                ordered_indices.append(meta["index"])
+        for idx in baseline_subscene_map:
+            if idx not in ordered_indices:
+                ordered_indices.append(idx)
+        for idx in test_subscene_map:
+            if idx not in ordered_indices:
+                ordered_indices.append(idx)
+
+        comp_subscenes = []
+        for index in ordered_indices:
+            sub = dict(direct_subscene_map.get(index, {}))
+            if not sub:
+                meta_source = baseline_subscene_map.get(index) or test_subscene_map.get(index)
+                if meta_source is not None:
+                    sub.update(_normalize_subscene_meta(meta_source, index))
+                    sub["directory"] = None
+                    sub["lane_ids_ok"] = None
+                    sub["vsl_ok"] = None
+                    sub["object_ids_ok"] = None
+                    sub["path_ok"] = None
+                    sub["traffic_ok"] = None
+                    sub["overall_ok"] = False
+                    sub["diff_by_source"] = {
+                        "lane": {k: False for k in ("along", "opposite", "crossing")},
+                        "vsl": {k: False for k in ("along", "opposite", "crossing")},
+                        "object_ids": {k: False for k in ("along", "opposite", "crossing", "other", "base")},
+                        "path": {k: False for k in ("along", "opposite", "crossing", "other", "base")},
+                    }
+                    sub["diff_counts_by_source"] = {
+                        "lane": {k: 0 for k in ("along", "opposite", "crossing")},
+                        "vsl": {k: 0 for k in ("along", "opposite", "crossing")},
+                        "object_ids": {k: 0 for k in ("along", "opposite", "crossing", "other", "base")},
+                        "path": {k: 0 for k in ("along", "opposite", "crossing", "other", "base")},
+                    }
+            if "directory" not in sub:
+                sub["directory"] = None
+            sub["validation"] = {
+                "baseline": {
+                    horizon: baseline_subscene_map.get(index, {}).get(horizon, _default_side_summary("baseline_subscene_missing")[horizon])
+                    for horizon in VALIDATION_HORIZONS
+                },
+                "test": {
+                    horizon: test_subscene_map.get(index, {}).get(horizon, _default_side_summary("test_subscene_missing")[horizon])
+                    for horizon in VALIDATION_HORIZONS
+                },
+            }
+            # Flatten the side summary structure back to the same schema as scene-level comp["validation"][side].
+            sub["validation"]["baseline"] = {
+                horizon: {
+                    threshold: baseline_subscene_map.get(index, {}).get(horizon, {}).get(
+                        threshold,
+                        _default_threshold_summary(f"baseline_subscene_{index}_{horizon}_{threshold}_missing"),
+                    )
+                    for threshold in VALIDATION_THRESHOLDS
+                }
+                for horizon in VALIDATION_HORIZONS
+            }
+            sub["validation"]["test"] = {
+                horizon: {
+                    threshold: test_subscene_map.get(index, {}).get(horizon, {}).get(
+                        threshold,
+                        _default_threshold_summary(f"test_subscene_{index}_{horizon}_{threshold}_missing"),
+                    )
+                    for threshold in VALIDATION_THRESHOLDS
+                }
+                for horizon in VALIDATION_HORIZONS
+            }
+            sub["collision"] = {
+                "baseline": baseline_subscene_map.get(index, {}).get(
+                    "collision",
+                    _default_collision_side_summary(f"baseline_subscene_{index}_collision_missing"),
+                ),
+                "test": test_subscene_map.get(index, {}).get(
+                    "collision",
+                    _default_collision_side_summary(f"test_subscene_{index}_collision_missing"),
+                ),
+            }
+            comp_subscenes.append(sub)
+        comp["subscenes"] = comp_subscenes
 
         with open(merged_path, "w", encoding="utf-8") as f:
             json.dump(comp, f, indent=2, ensure_ascii=False)
