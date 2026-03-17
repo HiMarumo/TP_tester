@@ -88,7 +88,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    supports_map_name, detail = check_offline_binary_supports_map_name(pkg, node_name)
+    supports_map_name, detail = check_offline_binary_supports_map_name(
+        pkg,
+        node_name,
+        progress_prefix="[test] offline binary check",
+    )
     if not supports_map_name:
         print(
             "[test] 実行バイナリが必須オプション（--map-name / --runtime-file）非対応です。"
@@ -103,9 +107,14 @@ def main() -> int:
         bags = get_bag_files_in_dir(dir_path)
         if not bags:
             continue
-        scene_timing = build_scene_timing(bags)
+        scene_timing = build_scene_timing(
+            bags,
+            progress_prefix=f"[test] {rel} scene-timing",
+        )
         selected_bags, matched_topics = select_bag_files_by_topics(
-            bags, TP_SIM_OFFLINE_INPUT_TOPICS
+            bags,
+            TP_SIM_OFFLINE_INPUT_TOPICS,
+            progress_prefix=f"[test] {rel} input-bag-select",
         )
         if "/target_tracker/tracked_object_set2" not in matched_topics:
             print(
@@ -151,7 +160,10 @@ def main() -> int:
         (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
         dt_summary = build_subscene_dt_summary(
             dt_values=dt_values,
-            clock_timeline_ns=collect_clock_timeline_in_bags(bags),
+            clock_timeline_ns=collect_clock_timeline_in_bags(
+                bags,
+                progress_prefix=f"[test] {rel} dt-summary /clock",
+            ),
             scene_timing=scene_timing,
         )
         (out_dir / "dt_summary.json").write_text(

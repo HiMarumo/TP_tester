@@ -32,6 +32,32 @@ DT_VALUE_RE = re.compile(r"dt\s*=\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 NODE_READY_MARKERS = ("Ready. Waiting for data",)
 
 
+def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> None:
+    if total <= 0:
+        return
+    percent = int((done * 100) / total)
+    last_percent = state.get("last_percent", -1)
+    if percent == last_percent and done < total:
+        return
+    state["last_percent"] = percent
+    width = 30
+    fill = int((done * width) / total)
+    bar = "#" * fill + "-" * (width - fill)
+    line = f"{prefix} [{bar}] {percent}% ({done}/{total})"
+    last_len = int(state.get("last_line_len", 0) or 0)
+    pad = " " * max(0, last_len - len(line))
+    state["last_line_len"] = len(line)
+    print(
+        f"\r{line}{pad}",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    if done >= total:
+        state["last_line_len"] = 0
+        print(file=sys.stderr, flush=True)
+
+
 def run_trajectory_predictor_offline(
     pkg: str,
     node_name: str,
@@ -162,12 +188,16 @@ def check_offline_binary_supports_map_name(
     pkg: str,
     node_name: str,
     timeout_sec: float = 8.0,
+    progress_prefix: str | None = None,
 ) -> tuple[bool, str]:
     """
     Validate that trajectory_predictor_sim_offline supports required offline args.
     Returns (ok, detail_message).
     """
     cmd = ["rosrun", pkg, node_name, "--help"]
+    progress_state = {"last_percent": -1}
+    if progress_prefix:
+        _print_progress_line(progress_prefix, 0, 1, progress_state)
     try:
         proc = subprocess.run(
             cmd,
@@ -177,11 +207,19 @@ def check_offline_binary_supports_map_name(
             env=os.environ,
         )
     except subprocess.TimeoutExpired:
+        if progress_prefix:
+            _print_progress_line(progress_prefix, 1, 1, progress_state)
         return (False, f"{' '.join(cmd)} timed out ({timeout_sec}s)")
     except FileNotFoundError:
+        if progress_prefix:
+            _print_progress_line(progress_prefix, 1, 1, progress_state)
         return (False, f"command not found: {cmd[0]}")
     except Exception as e:
+        if progress_prefix:
+            _print_progress_line(progress_prefix, 1, 1, progress_state)
         return (False, str(e))
+    if progress_prefix:
+        _print_progress_line(progress_prefix, 1, 1, progress_state)
 
     out = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
     required_args = ("--map-name", "--runtime-file")
@@ -435,6 +473,7 @@ def get_bag_files_in_dir(dir_path: Path) -> list[Path]:
 def select_bag_files_by_topics(
     bag_files: list[Path],
     required_topics: list[str],
+    progress_prefix: str | None = None,
 ) -> tuple[list[Path], set[str]]:
     """
     Keep only bag files that contain at least one required topic.
@@ -449,21 +488,27 @@ def select_bag_files_by_topics(
     required = set(required_topics)
     selected: list[Path] = []
     matched_topics: set[str] = set()
+    existing_bags = [bag_path for bag_path in bag_files if bag_path.exists()]
+    progress_state = {"last_percent": -1}
+    if progress_prefix and existing_bags:
+        _print_progress_line(progress_prefix, 0, len(existing_bags), progress_state)
 
-    for bag_path in bag_files:
-        if not bag_path.exists():
-            continue
+    for idx, bag_path in enumerate(existing_bags, start=1):
         try:
             with rosbag.Bag(str(bag_path), "r") as bag:
                 info = bag.get_type_and_topic_info()
                 topics = set((info.topics or {}).keys())
         except Exception:
+            if progress_prefix:
+                _print_progress_line(progress_prefix, idx, len(existing_bags), progress_state)
             continue
 
         hit = topics & required
         if hit:
             selected.append(bag_path)
             matched_topics |= hit
+        if progress_prefix:
+            _print_progress_line(progress_prefix, idx, len(existing_bags), progress_state)
 
     if not selected:
         return (bag_files, set())
@@ -486,26 +531,35 @@ def _format_scene_offset_label(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def get_bag_time_bounds_ns(bag_files: list[Path]) -> tuple[int, int] | None:
+def get_bag_time_bounds_ns(
+    bag_files: list[Path],
+    progress_prefix: str | None = None,
+) -> tuple[int, int] | None:
     """Return (min_start_ns, max_end_ns) across input bag files, or None."""
     if not HAS_ROSBAG or not bag_files:
         return None
 
     start_ns = None
     end_ns = None
-    for bag_path in bag_files:
-        if not bag_path.exists():
-            continue
+    existing_bags = [bag_path for bag_path in bag_files if bag_path.exists()]
+    progress_state = {"last_percent": -1}
+    if progress_prefix and existing_bags:
+        _print_progress_line(progress_prefix, 0, len(existing_bags), progress_state)
+    for idx, bag_path in enumerate(existing_bags, start=1):
         try:
             with rosbag.Bag(str(bag_path), "r") as bag:
                 bag_start_ns = int(float(bag.get_start_time()) * 1e9)
                 bag_end_ns = int(float(bag.get_end_time()) * 1e9)
         except Exception:
+            if progress_prefix:
+                _print_progress_line(progress_prefix, idx, len(existing_bags), progress_state)
             continue
         if start_ns is None or bag_start_ns < start_ns:
             start_ns = bag_start_ns
         if end_ns is None or bag_end_ns > end_ns:
             end_ns = bag_end_ns
+        if progress_prefix:
+            _print_progress_line(progress_prefix, idx, len(existing_bags), progress_state)
 
     if start_ns is None or end_ns is None:
         return None
@@ -539,12 +593,33 @@ def collect_clock_stamps_in_bags(bag_files: list[Path]) -> list[int]:
     return sorted(stamps)
 
 
-def collect_clock_timeline_in_bags(bag_files: list[Path]) -> list[int]:
+def collect_clock_timeline_in_bags(
+    bag_files: list[Path],
+    progress_prefix: str | None = None,
+) -> list[int]:
     """Return sorted /clock bag-time timestamps including duplicates, in nsec."""
     if not HAS_ROSBAG or not bag_files:
         return []
 
     stamps: list[int] = []
+    total = 0
+    if progress_prefix:
+        for bag_path in bag_files:
+            if not bag_path.exists():
+                continue
+            try:
+                with rosbag.Bag(str(bag_path), "r") as bag:
+                    info = bag.get_type_and_topic_info()
+                    topics = info[1] if isinstance(info, tuple) and len(info) >= 2 else getattr(info, "topics", {})
+                    topic_info = topics.get("/clock")
+                    if topic_info is not None:
+                        total += int(getattr(topic_info, "message_count", 0) or 0)
+            except Exception:
+                continue
+    progress_state = {"last_percent": -1}
+    done = 0
+    if progress_prefix and total > 0:
+        _print_progress_line(progress_prefix, 0, total, progress_state)
     for bag_path in bag_files:
         if not bag_path.exists():
             continue
@@ -557,10 +632,13 @@ def collect_clock_timeline_in_bags(bag_files: list[Path]) -> list[int]:
                 for _topic, _msg, bag_t in bag.read_messages(topics=["/clock"]):
                     if hasattr(bag_t, "to_nsec"):
                         stamps.append(int(bag_t.to_nsec()))
-                        continue
-                    sec = getattr(bag_t, "secs", getattr(bag_t, "sec", 0)) or 0
-                    nsec = getattr(bag_t, "nsecs", getattr(bag_t, "nsec", getattr(bag_t, "nanosec", 0))) or 0
-                    stamps.append(int(sec) * 10**9 + int(nsec))
+                    else:
+                        sec = getattr(bag_t, "secs", getattr(bag_t, "sec", 0)) or 0
+                        nsec = getattr(bag_t, "nsecs", getattr(bag_t, "nsec", getattr(bag_t, "nanosec", 0))) or 0
+                        stamps.append(int(sec) * 10**9 + int(nsec))
+                    done += 1
+                    if progress_prefix and total > 0:
+                        _print_progress_line(progress_prefix, done, total, progress_state)
         except Exception:
             continue
     return sorted(stamps)
@@ -571,13 +649,17 @@ def build_scene_timing(
     split_min_duration_sec: float = SCENE_SUBSCENE_SPLIT_MIN_DURATION_SEC,
     window_sec: float = SCENE_SUBSCENE_WINDOW_SEC,
     min_tail_sec: float = SCENE_SUBSCENE_MIN_TAIL_SEC,
+    progress_prefix: str | None = None,
 ) -> dict | None:
     """
     Build scene timing metadata from input bags.
     Long scenes (>= split_min_duration_sec) are split into window_sec subscenes,
     dropping a final tail no longer than min_tail_sec.
     """
-    bounds = get_bag_time_bounds_ns(bag_files)
+    bounds = get_bag_time_bounds_ns(
+        bag_files,
+        progress_prefix=progress_prefix,
+    )
     if bounds is None:
         return None
 

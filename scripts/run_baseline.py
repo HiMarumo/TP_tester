@@ -100,13 +100,18 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
     width = 30
     fill = int((done * width) / total)
     bar = "#" * fill + "-" * (width - fill)
+    line = f"{prefix} [{bar}] {percent}% ({done}/{total})"
+    last_len = int(state.get("last_line_len", 0) or 0)
+    pad = " " * max(0, last_len - len(line))
+    state["last_line_len"] = len(line)
     print(
-        f"\r{prefix} [{bar}] {percent}% ({done}/{total})",
+        f"\r{line}{pad}",
         end="",
         file=sys.stderr,
         flush=True,
     )
     if done >= total:
+        state["last_line_len"] = 0
         print(file=sys.stderr, flush=True)
 
 
@@ -181,11 +186,16 @@ def _extract_ego_state_from_source_msg(msg) -> tuple[tuple[float, float, float, 
     return _extract_ego_state_from_components(logical_pose, controller_state, odometry_input)
 
 
-def _collect_tracked_object_set2_topic_counts(input_bags: list[Path]) -> dict[str, int]:
+def _collect_tracked_object_set2_topic_counts(
+    input_bags: list[Path],
+    progress_prefix: str | None = None,
+) -> dict[str, int]:
     topic_counts: dict[str, int] = defaultdict(int)
-    for bag_path in input_bags:
-        if not bag_path.exists():
-            continue
+    existing_bags = [bag_path for bag_path in input_bags if bag_path.exists()]
+    progress_state = {"last_percent": -1}
+    if progress_prefix and existing_bags:
+        _print_progress_line(progress_prefix, 0, len(existing_bags), progress_state)
+    for idx, bag_path in enumerate(existing_bags, start=1):
         with rosbag.Bag(str(bag_path), "r") as bag:
             info = bag.get_type_and_topic_info()
             topics_info = getattr(info, "topics", {}) or {}
@@ -193,6 +203,8 @@ def _collect_tracked_object_set2_topic_counts(input_bags: list[Path]) -> dict[st
                 msg_type = getattr(tinf, "msg_type", "")
                 if msg_type in ("nrc_msgs/TrackedObjectSet2", "nrc_msgs/TrajectoryPredictorSimInputFrame"):
                     topic_counts[topic] += int(getattr(tinf, "message_count", 0) or 0)
+        if progress_prefix:
+            _print_progress_line(progress_prefix, idx, len(existing_bags), progress_state)
     return dict(topic_counts)
 
 
@@ -345,10 +357,13 @@ def _apply_state_to_traj_obj_object(out_obj, state: tuple[float, float, float, f
 
 
 def _resolve_observed_source_topic(
-    input_bags: list[Path], preferred_topic: str | None = None, topic_counts: dict[str, int] | None = None
+    input_bags: list[Path],
+    preferred_topic: str | None = None,
+    topic_counts: dict[str, int] | None = None,
+    progress_prefix: str | None = None,
 ) -> str:
     if topic_counts is None:
-        topic_counts = _collect_tracked_object_set2_topic_counts(input_bags)
+        topic_counts = _collect_tracked_object_set2_topic_counts(input_bags, progress_prefix=progress_prefix)
 
     if preferred_topic:
         if topic_counts.get(preferred_topic, 0) > 0:
@@ -363,13 +378,33 @@ def _resolve_observed_source_topic(
     raise RuntimeError("no nrc_msgs/TrackedObjectSet2 topic found in input bags")
 
 
-def _collect_observed_source_records(input_bags: list[Path], source_topic: str) -> list[dict]:
+def _collect_observed_source_records(
+    input_bags: list[Path],
+    source_topic: str,
+    progress_prefix: str | None = None,
+) -> list[dict]:
     aux_topics = [
         OBSERVED_EGO_LOGICAL_POSE_TOPIC,
         OBSERVED_EGO_CONTROLLER_STATE_TOPIC,
         OBSERVED_EGO_ODOMETRY_INPUT_TOPIC,
     ]
     aux_records: dict[str, list[tuple[int, object]]] = {topic: [] for topic in aux_topics}
+    total_aux = 0
+    total_source = 0
+    if progress_prefix:
+        for bag_path in input_bags:
+            if not bag_path.exists():
+                continue
+            with rosbag.Bag(str(bag_path), "r") as bag:
+                info = bag.get_type_and_topic_info()
+                topics_info = getattr(info, "topics", {}) or {}
+                for topic in aux_topics:
+                    total_aux += int(getattr(topics_info.get(topic), "message_count", 0) or 0)
+                total_source += int(getattr(topics_info.get(source_topic), "message_count", 0) or 0)
+    aux_progress_state = {"last_percent": -1}
+    aux_done = 0
+    if progress_prefix and total_aux > 0:
+        _print_progress_line(f"{progress_prefix} aux-scan", 0, total_aux, aux_progress_state)
 
     for bag_path in input_bags:
         if not bag_path.exists():
@@ -377,6 +412,14 @@ def _collect_observed_source_records(input_bags: list[Path], source_topic: str) 
         with rosbag.Bag(str(bag_path), "r") as bag:
             for topic, msg, t in bag.read_messages(topics=aux_topics):
                 aux_records[topic].append((_msg_stamp_nsec(msg, t), msg))
+                aux_done += 1
+                if progress_prefix and total_aux > 0:
+                    _print_progress_line(
+                        f"{progress_prefix} aux-scan",
+                        aux_done,
+                        total_aux,
+                        aux_progress_state,
+                    )
 
     aux_index: dict[str, tuple[list[int], list[object]]] = {}
     for topic, items in aux_records.items():
@@ -393,6 +436,10 @@ def _collect_observed_source_records(input_bags: list[Path], source_topic: str) 
         return msgs[idx]
 
     records = []
+    source_progress_state = {"last_percent": -1}
+    source_done = 0
+    if progress_prefix and total_source > 0:
+        _print_progress_line(f"{progress_prefix} source-scan", 0, total_source, source_progress_state)
     for bag_path in input_bags:
         if not bag_path.exists():
             continue
@@ -428,6 +475,14 @@ def _collect_observed_source_records(input_bags: list[Path], source_topic: str) 
                         "ego_internal_id": ego_internal_id,
                     }
                 )
+                source_done += 1
+                if progress_prefix and total_source > 0:
+                    _print_progress_line(
+                        f"{progress_prefix} source-scan",
+                        source_done,
+                        total_source,
+                        source_progress_state,
+                    )
     records.sort(key=lambda r: (r["stamp_ns"], r["bag_t_ns"]))
     return records
 
@@ -456,7 +511,9 @@ def _resolve_existing_topic(topics_info: dict, candidates: list[str]) -> str | N
 
 
 def _collect_group_ids_by_stamp_from_result(
-    result_bag: Path, result_ns: str
+    result_bag: Path,
+    result_ns: str,
+    progress_prefix: str | None = None,
 ) -> dict[str, dict[int, set[int]]]:
     group_suffix = {
         "along": WM_TOPIC_SUFFIXES[1],
@@ -473,6 +530,11 @@ def _collect_group_ids_by_stamp_from_result(
             topic = _resolve_existing_topic(topics_info, [f"{result_ns}{suffix}", suffix])
             if topic:
                 resolved_topics[group] = topic
+        total = sum(int(getattr(topics_info.get(topic), "message_count", 0) or 0) for topic in resolved_topics.values())
+        progress_state = {"last_percent": -1}
+        done = 0
+        if progress_prefix and total > 0:
+            _print_progress_line(progress_prefix, 0, total, progress_state)
 
         for group, topic in resolved_topics.items():
             for _, msg, t in bag.read_messages(topics=[topic]):
@@ -483,6 +545,9 @@ def _collect_group_ids_by_stamp_from_result(
                     if oid >= 0:
                         if _has_predicted_path(obj):
                             id_set.add(oid)
+                done += 1
+                if progress_prefix and total > 0:
+                    _print_progress_line(progress_prefix, done, total, progress_state)
     return group_ids
 
 
@@ -503,8 +568,17 @@ def _build_observed_bag_from_input(
     if not result_bag.exists():
         raise RuntimeError(f"result bag not found: {result_bag}")
 
-    source_topic = _resolve_observed_source_topic(input_bags, preferred_source_topic)
-    records = _collect_observed_source_records(input_bags, source_topic)
+    progress_prefix = f"[observed] {observed_bag.name}"
+    source_topic = _resolve_observed_source_topic(
+        input_bags,
+        preferred_source_topic,
+        progress_prefix=f"{progress_prefix} source-topic",
+    )
+    records = _collect_observed_source_records(
+        input_bags,
+        source_topic,
+        progress_prefix=progress_prefix,
+    )
     if not records:
         raise RuntimeError(f"no messages found on observed source topic: {source_topic}")
 
@@ -512,7 +586,11 @@ def _build_observed_bag_from_input(
     horizon_steps = int(round(OBSERVED_HORIZON_SEC / OBSERVED_STEP_SEC))
     tolerance_ns = int(round(OBSERVED_SAMPLE_TOLERANCE_SEC * 1.0e9))
     stamps = [r["stamp_ns"] for r in records]
-    group_ids_by_stamp = _collect_group_ids_by_stamp_from_result(result_bag, result_ns)
+    group_ids_by_stamp = _collect_group_ids_by_stamp_from_result(
+        result_bag,
+        result_ns,
+        progress_prefix=f"{progress_prefix} result-groups",
+    )
 
     observed_base_records: list[tuple] = []
     observed_build_progress_state = {"last_percent": -1}
@@ -819,7 +897,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    supports_map_name, detail = check_offline_binary_supports_map_name(pkg, node_name)
+    supports_map_name, detail = check_offline_binary_supports_map_name(
+        pkg,
+        node_name,
+        progress_prefix="[baseline] offline binary check",
+    )
     if not supports_map_name:
         print(
             "[baseline] 実行バイナリが必須オプション（--map-name / --runtime-file）非対応です。"
@@ -834,10 +916,15 @@ def main() -> int:
         bags = get_bag_files_in_dir(dir_path)
         if not bags:
             continue
-        scene_timing = build_scene_timing(bags)
+        scene_timing = build_scene_timing(
+            bags,
+            progress_prefix=f"[baseline] {rel} scene-timing",
+        )
 
         selected_bags, matched_topics = select_bag_files_by_topics(
-            bags, TP_SIM_OFFLINE_INPUT_TOPICS
+            bags,
+            TP_SIM_OFFLINE_INPUT_TOPICS,
+            progress_prefix=f"[baseline] {rel} input-bag-select",
         )
         if "/target_tracker/tracked_object_set2" not in matched_topics:
             print(
@@ -885,7 +972,10 @@ def main() -> int:
         (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
         dt_summary = build_subscene_dt_summary(
             dt_values=dt_values,
-            clock_timeline_ns=collect_clock_timeline_in_bags(bags),
+            clock_timeline_ns=collect_clock_timeline_in_bags(
+                bags,
+                progress_prefix=f"[baseline] {rel} dt-summary /clock",
+            ),
             scene_timing=scene_timing,
         )
         (out_dir / "dt_summary.json").write_text(
