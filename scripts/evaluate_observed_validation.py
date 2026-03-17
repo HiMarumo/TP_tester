@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 import math
 import sys
@@ -16,6 +17,11 @@ from common import (
     VALIDATION_TEST_NS,
     find_subscene_index,
     is_stamp_in_evaluation_range,
+)
+from native_eval import (
+    NATIVE_EVAL_AVAILABLE,
+    native_collision_results_from_cache,
+    native_validation_match_from_cache,
 )
 
 try:
@@ -114,6 +120,7 @@ COLLISION_KINDS = ("hard", "soft")
 COLLISION_GROUPED_STATUSES = ("pred_collision", "pred_safe", "ego_pred_collision", "ego_pred_safe")
 COLLISION_BASE_STATUSES = ("ego_observed_collision", "ego_observed_safe")
 COLLISION_ALL_STATUSES = COLLISION_GROUPED_STATUSES + COLLISION_BASE_STATUSES
+EVAL_STAMP_CHUNK_SIZE = 300
 COLLISION_KIND_MULTIPLIERS = {
     "hard": {
         "size_scale": 1.0,
@@ -145,9 +152,9 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
     fill = int((done * width) / total)
     bar = "#" * fill + "-" * (width - fill)
     line = f"{prefix} [{bar}] {percent}% ({done}/{total})"
-    last_len = int(state.get("last_line_len", 0) or 0)
+    last_len = int(getattr(_print_progress_line, "_last_line_len", 0) or 0)
     pad = " " * max(0, last_len - len(line))
-    state["last_line_len"] = len(line)
+    setattr(_print_progress_line, "_last_line_len", len(line))
     print(
         f"\r{line}{pad}",
         end="",
@@ -155,7 +162,7 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
         flush=True,
     )
     if done >= total:
-        state["last_line_len"] = 0
+        setattr(_print_progress_line, "_last_line_len", 0)
         print(file=sys.stderr, flush=True)
 
 
@@ -749,6 +756,17 @@ def _trajectory_within_threshold(
 ) -> tuple[bool, float]:
     observed_cache = _build_path_cache(observed_path)
     predicted_cache = _build_path_cache(predicted_path)
+    native_result = native_validation_match_from_cache(
+        observed_cache,
+        predicted_cache,
+        horizon=horizon,
+        threshold=threshold,
+        horizon_max_t=horizon_max_t,
+        classification=classification,
+        max_t=max_t,
+    )
+    if native_result is not None:
+        return native_result
     errors = _trajectory_error_sequence(observed_cache, predicted_cache, max_t=max_t)
     return _evaluate_error_sequence(
         errors,
@@ -846,7 +864,7 @@ def _obj_dimensions_of(obj) -> tuple[float, float]:
     return (max(0.1, length), max(0.1, width))
 
 
-def _build_scene_eval_cache(
+def _build_scene_message_cache(
     result_bag: Path,
     observed_bag: Path,
     result_ns: str,
@@ -873,6 +891,24 @@ def _build_scene_eval_cache(
 
     group_templates = {g: _first_template(g) for g in VALIDATION_GROUPS}
     base_template = _first_template("base")
+
+    return {
+        "result_by_group": result_by_group,
+        "observed_by_group": observed_by_group,
+        "result_base_stamps": result_base_stamps,
+        "observed_base_stamps": observed_base_stamps,
+        "eval_stamp_set": eval_stamp_set,
+        "master_stamps": master_stamps,
+        "group_templates": group_templates,
+        "base_template": base_template,
+    }
+
+
+def _build_scene_stamp_contexts(message_cache: dict, master_stamps: list[int]) -> dict[int, dict]:
+    result_by_group = message_cache["result_by_group"]
+    observed_by_group = message_cache["observed_by_group"]
+    group_templates = message_cache["group_templates"]
+    base_template = message_cache["base_template"]
 
     stamp_contexts: dict[int, dict] = {}
     for stamp in master_stamps:
@@ -968,18 +1004,66 @@ def _build_scene_eval_cache(
             "ego_observed_entry": ego_observed_entry,
             "ego_pred_objs_by_group": ego_pred_objs_by_group,
         }
+    return stamp_contexts
 
+
+def _build_scene_eval_chunk_cache(message_cache: dict, master_stamps: list[int]) -> dict:
+    master_stamps = list(master_stamps)
+    stamp_contexts = _build_scene_stamp_contexts(message_cache, master_stamps)
+    active_stamps = set(stamp_contexts.keys())
     return {
-        "result_by_group": result_by_group,
-        "observed_by_group": observed_by_group,
-        "result_base_stamps": result_base_stamps,
-        "observed_base_stamps": observed_base_stamps,
-        "eval_stamp_set": eval_stamp_set,
-        "master_stamps": master_stamps,
-        "group_templates": group_templates,
-        "base_template": base_template,
+        "result_by_group": message_cache["result_by_group"],
+        "observed_by_group": message_cache["observed_by_group"],
+        "result_base_stamps": message_cache["result_base_stamps"],
+        "observed_base_stamps": message_cache["observed_base_stamps"],
+        "eval_stamp_set": set(message_cache["eval_stamp_set"]) & active_stamps,
+        "master_stamps": [stamp for stamp in master_stamps if stamp in active_stamps],
+        "group_templates": message_cache["group_templates"],
+        "base_template": message_cache["base_template"],
         "stamp_contexts": stamp_contexts,
     }
+
+
+def _scene_ref_time_for_stamp(message_cache: dict, stamp: int):
+    result_base = message_cache.get("result_by_group", {}).get("base", {})
+    observed_base = message_cache.get("observed_by_group", {}).get("base", {})
+    rec = result_base.get(stamp) or observed_base.get(stamp)
+    if rec is None:
+        return None
+    return rec[0]
+
+
+def _filter_scene_master_stamps_for_range(message_cache: dict, scene_timing: dict | None) -> list[int]:
+    filtered = []
+    for stamp in message_cache.get("master_stamps", []):
+        ref_t = _scene_ref_time_for_stamp(message_cache, stamp)
+        if ref_t is None:
+            continue
+        if is_stamp_in_evaluation_range(_to_nsec(ref_t), scene_timing):
+            filtered.append(stamp)
+    return filtered
+
+
+def _iter_stamp_chunks(master_stamps: list[int], chunk_size: int = EVAL_STAMP_CHUNK_SIZE):
+    if chunk_size <= 0:
+        chunk_size = EVAL_STAMP_CHUNK_SIZE
+    for idx in range(0, len(master_stamps), chunk_size):
+        yield master_stamps[idx : idx + chunk_size]
+
+
+def _build_scene_eval_cache(
+    result_bag: Path,
+    observed_bag: Path,
+    result_ns: str,
+    observed_ns: str,
+) -> dict:
+    message_cache = _build_scene_message_cache(
+        result_bag=result_bag,
+        observed_bag=observed_bag,
+        result_ns=result_ns,
+        observed_ns=observed_ns,
+    )
+    return _build_scene_eval_chunk_cache(message_cache, message_cache.get("master_stamps", []))
 
 
 def _sorted_collision_points(path_msg, max_t: float | None = None) -> list[dict]:
@@ -1387,6 +1471,14 @@ def _path_collision_results(
     ego_cache: dict | None,
     ego_dims: tuple[float, float],
 ) -> dict[str, bool]:
+    native_result = native_collision_results_from_cache(
+        pred_cache,
+        pred_dims,
+        ego_cache,
+        ego_dims,
+    )
+    if native_result is not None:
+        return native_result
     out = {kind: False for kind in COLLISION_KINDS}
     if not pred_cache or not ego_cache:
         return out
@@ -1593,13 +1685,6 @@ def _ensure_context_validation_plan_cache(context: dict) -> dict[tuple[str, str]
                 metric_cache = pred_path_cache.setdefault("validation_metric_cache", {})
                 for horizon in VALIDATION_HORIZONS:
                     group_max_t = group_max_t_by_horizon[horizon]
-                    error_key = (id(obs_path_cache), round(float(group_max_t), 6))
-                    if error_key not in error_cache:
-                        error_cache[error_key] = _trajectory_error_sequence(
-                            obs_path_cache,
-                            pred_path_cache,
-                            max_t=group_max_t,
-                        )
                     for threshold in VALIDATION_THRESHOLDS:
                         metric = (horizon, threshold)
                         metric_key = (
@@ -1610,13 +1695,32 @@ def _ensure_context_validation_plan_cache(context: dict) -> dict[tuple[str, str]
                             int(classification),
                         )
                         if metric_key not in metric_cache:
-                            metric_cache[metric_key] = _evaluate_error_sequence(
-                                error_cache[error_key],
+                            native_metric = native_validation_match_from_cache(
+                                obs_path_cache,
+                                pred_path_cache,
                                 horizon=horizon,
                                 threshold=threshold,
                                 horizon_max_t=group_max_t,
                                 classification=classification,
+                                max_t=group_max_t,
                             )
+                            if native_metric is not None:
+                                metric_cache[metric_key] = native_metric
+                            else:
+                                error_key = (id(obs_path_cache), round(float(group_max_t), 6))
+                                if error_key not in error_cache:
+                                    error_cache[error_key] = _trajectory_error_sequence(
+                                        obs_path_cache,
+                                        pred_path_cache,
+                                        max_t=group_max_t,
+                                    )
+                                metric_cache[metric_key] = _evaluate_error_sequence(
+                                    error_cache[error_key],
+                                    horizon=horizon,
+                                    threshold=threshold,
+                                    horizon_max_t=group_max_t,
+                                    classification=classification,
+                                )
                         matched, cost = metric_cache[metric_key]
                         best = best_by_metric[metric]
                         if matched and (best is None or cost < best[1]):
@@ -1749,11 +1853,13 @@ def _build_collision_for_side(
     observed_ns: str,
     scene_timing: dict | None = None,
     scene_cache: dict | None = None,
+    out_bag=None,
+    chunk_label: str = "",
 ) -> tuple[dict, list[dict]]:
     summary = _default_collision_summary("ok")
     subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
     bag_path = out_dir / f"collision_judgement_{side}.bag"
-    out_bag = None
+    manage_out_bag = False
     write_state = {"last_percent": -1}
     write_total = 0
     written = 0
@@ -1793,9 +1899,13 @@ def _build_collision_for_side(
         ]
 
         progress_state = {"last_percent": -1}
+        collision_prefix = f"[collision] {rel} {side}"
+        if chunk_label:
+            collision_prefix += f" {chunk_label}"
+        collision_write_prefix = f"{collision_prefix} write"
         if master_stamps:
             _print_progress_line(
-                f"[collision] {rel} {side}",
+                collision_prefix,
                 0,
                 len(master_stamps),
                 progress_state,
@@ -1806,10 +1916,12 @@ def _build_collision_for_side(
                 + len(COLLISION_BASE_STATUSES)
             )
         )
-        out_bag = rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024)
+        if out_bag is None:
+            out_bag = rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024)
+            manage_out_bag = True
         if write_total > 0:
             _print_progress_line(
-                f"[collision] {rel} {side} write",
+                collision_write_prefix,
                 0,
                 write_total,
                 write_state,
@@ -1819,7 +1931,7 @@ def _build_collision_for_side(
                 context = stamp_contexts.get(stamp)
                 if context is None:
                     _print_progress_line(
-                        f"[collision] {rel} {side}",
+                        collision_prefix,
                         idx,
                         len(master_stamps),
                         progress_state,
@@ -1932,7 +2044,7 @@ def _build_collision_for_side(
                                 written += 1
                                 if write_total > 0:
                                     _print_progress_line(
-                                        f"[collision] {rel} {side} write",
+                                        collision_write_prefix,
                                         written,
                                         write_total,
                                         write_state,
@@ -1961,30 +2073,30 @@ def _build_collision_for_side(
                             written += 1
                             if write_total > 0:
                                 _print_progress_line(
-                                    f"[collision] {rel} {side} write",
+                                    collision_write_prefix,
                                     written,
                                     write_total,
                                     write_state,
                                 )
 
                 _print_progress_line(
-                    f"[collision] {rel} {side}",
+                    collision_prefix,
                     idx,
                     len(master_stamps),
                     progress_state,
                 )
         finally:
-            if out_bag is not None:
+            if manage_out_bag and out_bag is not None:
                 out_bag.close()
 
     for kind in COLLISION_KINDS:
         summary[kind]["has_collision"] = bool(summary[kind]["collision_paths"] > 0)
         for sub in subscene_summaries:
             sub["collision"][kind]["has_collision"] = bool(sub["collision"][kind]["collision_paths"] > 0)
-    if out_bag is None and HAS_ROSBAG:
+    if manage_out_bag and out_bag is None and HAS_ROSBAG:
         with rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024):
             pass
-    elif not bag_path.exists():
+    elif manage_out_bag and not bag_path.exists():
         bag_path.write_bytes(b"")
 
     return summary, subscene_summaries
@@ -2005,6 +2117,7 @@ def _build_validation_for_side_threshold(
     scene_timing: dict | None = None,
     scene_cache: dict | None = None,
     out_bag=None,
+    chunk_label: str = "",
 ) -> tuple[dict, list[dict]]:
     summary = _default_threshold_summary("ok")
     log_key = _validation_log_key(side, horizon, threshold)
@@ -2042,9 +2155,13 @@ def _build_validation_for_side_threshold(
         ]
 
         progress_state = {"last_percent": -1}
+        validation_prefix = f"[validation] {rel} {log_key}"
+        if chunk_label:
+            validation_prefix += f" {chunk_label}"
+        validation_write_prefix = f"{validation_prefix} write"
         if master_stamps:
             _print_progress_line(
-                f"[validation] {rel} {log_key}",
+                validation_prefix,
                 0,
                 len(master_stamps),
                 progress_state,
@@ -2054,7 +2171,7 @@ def _build_validation_for_side_threshold(
         written = 0
         if out_bag is not None and write_total > 0:
             _print_progress_line(
-                f"[validation] {rel} {log_key} write",
+                validation_write_prefix,
                 0,
                 write_total,
                 write_state,
@@ -2064,7 +2181,7 @@ def _build_validation_for_side_threshold(
             context = stamp_contexts.get(stamp)
             if context is None:
                 _print_progress_line(
-                    f"[validation] {rel} {log_key}",
+                    validation_prefix,
                     idx,
                     len(master_stamps),
                     progress_state,
@@ -2113,14 +2230,14 @@ def _build_validation_for_side_threshold(
                         written += 1
                         if write_total > 0:
                             _print_progress_line(
-                                f"[validation] {rel} {log_key} write",
+                                validation_write_prefix,
                                 written,
                                 write_total,
                                 write_state,
                             )
 
             _print_progress_line(
-                f"[validation] {rel} {log_key}",
+                validation_prefix,
                 idx,
                 len(master_stamps),
                 progress_state,
@@ -2155,72 +2272,170 @@ def evaluate_validation_for_side(
         "scene_timing": scene_timing,
         "subscenes": _build_subscene_side_summaries(scene_timing, "not_evaluated"),
     }
-    scene_cache = None
-    if HAS_ROSBAG and result_bag.exists() and observed_bag.exists():
-        scene_cache = _build_scene_eval_cache(
-            result_bag=result_bag,
-            observed_bag=observed_bag,
-            result_ns=result_ns,
-            observed_ns=observed_ns,
-        )
+    for horizon in VALIDATION_HORIZONS:
+        summary[horizon] = {
+            threshold: _default_threshold_summary("ok")
+            for threshold in VALIDATION_THRESHOLDS
+        }
+    summary["collision"] = _default_collision_summary("ok")
     validation_bag_path = out_dir / f"validation_{side}.bag"
-    validation_bag = None
-    try:
-        if HAS_ROSBAG:
-            validation_bag = rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024)
+    collision_bag_path = out_dir / f"collision_judgement_{side}.bag"
+    for stale_path in (validation_bag_path, collision_bag_path):
+        if stale_path.exists():
+            stale_path.unlink()
+    if not HAS_ROSBAG:
+        detail = "rosbag not available"
         for horizon in VALIDATION_HORIZONS:
-            summary[horizon] = {}
-            window_cfg = VALIDATION_HORIZON_WINDOWS.get(horizon, VALIDATION_HORIZON_WINDOWS["half-time-relaxed"])
-            max_t = float(window_cfg.get("max_t", 5.0))
-            other_max_t = float(window_cfg.get("other_max_t", max_t))
             for threshold in VALIDATION_THRESHOLDS:
-                side_summary, subscene_threshold_summaries = _build_validation_for_side_threshold(
+                summary[horizon][threshold]["detail"] = detail
+        summary["collision"] = _default_collision_summary(detail)
+        if not validation_bag_path.exists():
+            validation_bag_path.write_bytes(b"")
+        if not collision_bag_path.exists():
+            collision_bag_path.write_bytes(b"")
+        return summary
+    if not result_bag.exists():
+        detail = f"result bag missing: {result_bag}"
+        for horizon in VALIDATION_HORIZONS:
+            for threshold in VALIDATION_THRESHOLDS:
+                summary[horizon][threshold]["detail"] = detail
+        summary["collision"] = _default_collision_summary(detail)
+        with rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024):
+            pass
+        with rosbag.Bag(str(collision_bag_path), "w", chunk_threshold=64 * 1024):
+            pass
+        return summary
+    if not observed_bag.exists():
+        detail = f"observed bag missing: {observed_bag}"
+        for horizon in VALIDATION_HORIZONS:
+            for threshold in VALIDATION_THRESHOLDS:
+                summary[horizon][threshold]["detail"] = detail
+        summary["collision"] = _default_collision_summary(detail)
+        with rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024):
+            pass
+        with rosbag.Bag(str(collision_bag_path), "w", chunk_threshold=64 * 1024):
+            pass
+        return summary
+
+    message_cache = _build_scene_message_cache(
+        result_bag=result_bag,
+        observed_bag=observed_bag,
+        result_ns=result_ns,
+        observed_ns=observed_ns,
+    )
+    filtered_master_stamps = _filter_scene_master_stamps_for_range(message_cache, scene_timing)
+
+    validation_bag = rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024)
+    collision_bag = rosbag.Bag(str(collision_bag_path), "w", chunk_threshold=64 * 1024)
+    try:
+        chunk_total = max(1, (len(filtered_master_stamps) + EVAL_STAMP_CHUNK_SIZE - 1) // EVAL_STAMP_CHUNK_SIZE)
+        for chunk_idx, chunk_stamps in enumerate(_iter_stamp_chunks(filtered_master_stamps), start=1):
+            chunk_cache = _build_scene_eval_chunk_cache(message_cache, chunk_stamps)
+            chunk_label = f"chunk {chunk_idx}/{chunk_total}"
+            try:
+                for horizon in VALIDATION_HORIZONS:
+                    window_cfg = VALIDATION_HORIZON_WINDOWS.get(horizon, VALIDATION_HORIZON_WINDOWS["half-time-relaxed"])
+                    max_t = float(window_cfg.get("max_t", 5.0))
+                    other_max_t = float(window_cfg.get("other_max_t", max_t))
+                    for threshold in VALIDATION_THRESHOLDS:
+                        chunk_summary, chunk_subscene_threshold_summaries = _build_validation_for_side_threshold(
+                            rel=rel,
+                            out_dir=out_dir,
+                            side=side,
+                            horizon=horizon,
+                            threshold=threshold,
+                            max_t=max_t,
+                            other_max_t=other_max_t,
+                            result_bag=result_bag,
+                            observed_bag=observed_bag,
+                            result_ns=result_ns,
+                            observed_ns=observed_ns,
+                            scene_timing=scene_timing,
+                            scene_cache=chunk_cache,
+                            out_bag=validation_bag,
+                            chunk_label=chunk_label,
+                        )
+                        dst_summary = summary[horizon][threshold]
+                        dst_summary["ok"] += int(chunk_summary.get("ok", 0))
+                        dst_summary["total"] += int(chunk_summary.get("total", 0))
+                        if dst_summary.get("detail") == "ok" and chunk_summary.get("detail") not in (None, "ok"):
+                            dst_summary["detail"] = chunk_summary.get("detail")
+                        for idx, sub in enumerate(chunk_subscene_threshold_summaries):
+                            if idx < len(summary["subscenes"]):
+                                dst = summary["subscenes"][idx][horizon][threshold]
+                                src = sub[horizon][threshold]
+                                dst["ok"] += int(src.get("ok", 0))
+                                dst["total"] += int(src.get("total", 0))
+                                if dst.get("detail") == "not_evaluated" and src.get("detail") not in (None, "ok", "not_evaluated"):
+                                    dst["detail"] = src.get("detail")
+
+                chunk_collision_summary, chunk_collision_subscenes = _build_collision_for_side(
                     rel=rel,
                     out_dir=out_dir,
                     side=side,
-                    horizon=horizon,
-                    threshold=threshold,
-                    max_t=max_t,
-                    other_max_t=other_max_t,
                     result_bag=result_bag,
                     observed_bag=observed_bag,
                     result_ns=result_ns,
                     observed_ns=observed_ns,
                     scene_timing=scene_timing,
-                    scene_cache=scene_cache,
-                    out_bag=validation_bag,
+                    scene_cache=chunk_cache,
+                    out_bag=collision_bag,
+                    chunk_label=chunk_label,
                 )
-                summary[horizon][threshold] = side_summary
-                for idx, sub in enumerate(subscene_threshold_summaries):
+                for kind in COLLISION_KINDS:
+                    dst = summary["collision"][kind]
+                    src = chunk_collision_summary.get(kind, {})
+                    dst["collision_paths"] += int(src.get("collision_paths", 0))
+                    dst["checked_paths"] += int(src.get("checked_paths", 0))
+                    dst["has_collision"] = bool(dst["has_collision"] or src.get("has_collision", False))
+                    if dst.get("detail") == "ok" and src.get("detail") not in (None, "ok"):
+                        dst["detail"] = src.get("detail")
+                for idx, sub in enumerate(chunk_collision_subscenes):
                     if idx < len(summary["subscenes"]):
-                        summary["subscenes"][idx][horizon][threshold] = sub[horizon][threshold]
-                log_key = _validation_log_key(side, horizon, threshold)
-                print(
-                    f"[validation] {rel} {log_key}: "
-                    f"{side_summary['rate']:.1f}% ({side_summary['ok']}/{side_summary['total']})"
-                )
+                        for kind in COLLISION_KINDS:
+                            dst = summary["subscenes"][idx]["collision"][kind]
+                            src = sub["collision"][kind]
+                            dst["collision_paths"] += int(src.get("collision_paths", 0))
+                            dst["checked_paths"] += int(src.get("checked_paths", 0))
+                            dst["has_collision"] = bool(dst["has_collision"] or src.get("has_collision", False))
+                            if dst.get("detail") == "not_evaluated" and src.get("detail") not in (None, "ok", "not_evaluated"):
+                                dst["detail"] = src.get("detail")
+            finally:
+                del chunk_cache
+                gc.collect()
     finally:
-        if validation_bag is not None:
-            validation_bag.close()
-    if not HAS_ROSBAG and not validation_bag_path.exists():
-        validation_bag_path.write_bytes(b"")
-    collision_summary, collision_subscenes = _build_collision_for_side(
-        rel=rel,
-        out_dir=out_dir,
-        side=side,
-        result_bag=result_bag,
-        observed_bag=observed_bag,
-        result_ns=result_ns,
-        observed_ns=observed_ns,
-        scene_timing=scene_timing,
-        scene_cache=scene_cache,
-    )
-    summary["collision"] = collision_summary
-    for idx, sub in enumerate(collision_subscenes):
-        if idx < len(summary["subscenes"]):
-            summary["subscenes"][idx]["collision"] = sub["collision"]
+        validation_bag.close()
+        collision_bag.close()
+
+    for horizon in VALIDATION_HORIZONS:
+        for threshold in VALIDATION_THRESHOLDS:
+            node = summary[horizon][threshold]
+            if node["total"] > 0:
+                node["rate"] = (100.0 * float(node["ok"])) / float(node["total"])
+            else:
+                node["rate"] = 0.0
+            log_key = _validation_log_key(side, horizon, threshold)
+            print(
+                f"[validation] {rel} {log_key}: "
+                f"{node['rate']:.1f}% ({node['ok']}/{node['total']})"
+            )
+    for sub in summary["subscenes"]:
+        for horizon in VALIDATION_HORIZONS:
+            for threshold in VALIDATION_THRESHOLDS:
+                node = sub[horizon][threshold]
+                if node["total"] > 0:
+                    node["rate"] = (100.0 * float(node["ok"])) / float(node["total"])
+                else:
+                    node["rate"] = 0.0
+                if node.get("detail") == "not_evaluated":
+                    node["detail"] = "ok"
+        for kind in COLLISION_KINDS:
+            sub["collision"][kind]["has_collision"] = bool(sub["collision"][kind]["collision_paths"] > 0)
+            if sub["collision"][kind].get("detail") == "not_evaluated":
+                sub["collision"][kind]["detail"] = "ok"
     for kind in COLLISION_KINDS:
-        node = collision_summary.get(kind, {})
+        node = summary["collision"].get(kind, {})
+        node["has_collision"] = bool(node.get("collision_paths", 0) > 0)
         state = "Collision" if bool(node.get("has_collision")) else "Safe"
         print(
             f"[collision] {rel} {side}-{kind}: {state} "

@@ -44,9 +44,9 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
     fill = int((done * width) / total)
     bar = "#" * fill + "-" * (width - fill)
     line = f"{prefix} [{bar}] {percent}% ({done}/{total})"
-    last_len = int(state.get("last_line_len", 0) or 0)
+    last_len = int(getattr(_print_progress_line, "_last_line_len", 0) or 0)
     pad = " " * max(0, last_len - len(line))
-    state["last_line_len"] = len(line)
+    setattr(_print_progress_line, "_last_line_len", len(line))
     print(
         f"\r{line}{pad}",
         end="",
@@ -54,7 +54,7 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
         flush=True,
     )
     if done >= total:
-        state["last_line_len"] = 0
+        setattr(_print_progress_line, "_last_line_len", 0)
         print(file=sys.stderr, flush=True)
 
 
@@ -642,6 +642,58 @@ def collect_clock_timeline_in_bags(
         except Exception:
             continue
     return sorted(stamps)
+
+
+def collect_topic_timeline_in_bags(
+    bag_files: list[Path],
+    topic_name: str,
+    progress_prefix: str | None = None,
+) -> list[int]:
+    """Return bag-time timestamps for a specific topic including duplicates, in read order."""
+    if not HAS_ROSBAG or not bag_files or not topic_name:
+        return []
+
+    stamps: list[int] = []
+    total = 0
+    if progress_prefix:
+        for bag_path in bag_files:
+            if not bag_path.exists():
+                continue
+            try:
+                with rosbag.Bag(str(bag_path), "r") as bag:
+                    info = bag.get_type_and_topic_info()
+                    topics = info[1] if isinstance(info, tuple) and len(info) >= 2 else getattr(info, "topics", {})
+                    topic_info = topics.get(topic_name)
+                    if topic_info is not None:
+                        total += int(getattr(topic_info, "message_count", 0) or 0)
+            except Exception:
+                continue
+    progress_state = {"last_percent": -1}
+    done = 0
+    if progress_prefix and total > 0:
+        _print_progress_line(progress_prefix, 0, total, progress_state)
+    for bag_path in bag_files:
+        if not bag_path.exists():
+            continue
+        try:
+            with rosbag.Bag(str(bag_path), "r") as bag:
+                info = bag.get_type_and_topic_info()
+                topics = info[1] if isinstance(info, tuple) and len(info) >= 2 else getattr(info, "topics", {})
+                if topic_name not in topics:
+                    continue
+                for _topic, _msg, bag_t in bag.read_messages(topics=[topic_name]):
+                    if hasattr(bag_t, "to_nsec"):
+                        stamps.append(int(bag_t.to_nsec()))
+                    else:
+                        sec = getattr(bag_t, "secs", getattr(bag_t, "sec", 0)) or 0
+                        nsec = getattr(bag_t, "nsecs", getattr(bag_t, "nsec", getattr(bag_t, "nanosec", 0))) or 0
+                        stamps.append(int(sec) * 10**9 + int(nsec))
+                    done += 1
+                    if progress_prefix and total > 0:
+                        _print_progress_line(progress_prefix, done, total, progress_state)
+        except Exception:
+            continue
+    return stamps
 
 
 def build_scene_timing(

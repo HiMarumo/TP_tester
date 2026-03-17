@@ -28,3 +28,4 @@ fi
 
 export TP_TESTER_ROOT="$TP_ROOT"
 python3 scripts/run_baseline.py
+exec ./evaluation_docker.sh --side baseline --skip-compare

@@ -1254,8 +1254,8 @@ class ViewerAppPyQt(QMainWindow):
             height += child_table.rowHeight(row)
         if child_table.horizontalScrollBar().isVisible():
             height += child_table.horizontalScrollBar().height()
-        child_table.setMinimumHeight(height + 4)
-        child_table.setMaximumHeight(height + 4)
+        child_table.setMinimumHeight(height)
+        child_table.setMaximumHeight(height)
 
     def _on_subscene_select(
         self,
@@ -1333,7 +1333,8 @@ class ViewerAppPyQt(QMainWindow):
 
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(24, 6, 0, 6)
+        layout.setContentsMargins(24, 2, 0, 0)
+        layout.setSpacing(0)
         layout.addWidget(child_table)
         return container, child_table, child_rows
 

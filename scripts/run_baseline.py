@@ -17,6 +17,7 @@ from common import (
     check_offline_binary_supports_map_name,
     VALIDATION_BASELINE_NS,
     collect_clock_timeline_in_bags,
+    collect_topic_timeline_in_bags,
     discover_bag_directories,
     get_bag_files_in_dir,
     get_commit_info_for_run,
@@ -26,7 +27,6 @@ from common import (
     run_trajectory_predictor_offline,
     select_bag_files_by_topics,
 )
-from evaluate_observed_validation import evaluate_validation_for_side
 
 try:
     import rosbag
@@ -101,9 +101,9 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
     fill = int((done * width) / total)
     bar = "#" * fill + "-" * (width - fill)
     line = f"{prefix} [{bar}] {percent}% ({done}/{total})"
-    last_len = int(state.get("last_line_len", 0) or 0)
+    last_len = int(getattr(_print_progress_line, "_last_line_len", 0) or 0)
     pad = " " * max(0, last_len - len(line))
-    state["last_line_len"] = len(line)
+    setattr(_print_progress_line, "_last_line_len", len(line))
     print(
         f"\r{line}{pad}",
         end="",
@@ -111,7 +111,7 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
         flush=True,
     )
     if done >= total:
-        state["last_line_len"] = 0
+        setattr(_print_progress_line, "_last_line_len", 0)
         print(file=sys.stderr, flush=True)
 
 
@@ -970,12 +970,19 @@ def main() -> int:
         else:
             (out_dir / "dt_status").write_text("valid")
         (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
-        dt_summary = build_subscene_dt_summary(
-            dt_values=dt_values,
-            clock_timeline_ns=collect_clock_timeline_in_bags(
+        dt_timeline_ns = collect_topic_timeline_in_bags(
+            selected_bags,
+            "/target_tracker/tracked_object_set2",
+            progress_prefix=f"[baseline] {rel} dt-summary /target_tracker/tracked_object_set2",
+        )
+        if len(dt_timeline_ns) != len(dt_values):
+            dt_timeline_ns = collect_clock_timeline_in_bags(
                 bags,
                 progress_prefix=f"[baseline] {rel} dt-summary /clock",
-            ),
+            )
+        dt_summary = build_subscene_dt_summary(
+            dt_values=dt_values,
+            clock_timeline_ns=dt_timeline_ns,
             scene_timing=scene_timing,
         )
         (out_dir / "dt_summary.json").write_text(
@@ -1014,26 +1021,6 @@ def main() -> int:
             print(f"[baseline] {rel}: observed trajectories saved to {observed_bag} (source: {used_topic})")
         except Exception as e:
             print(f"[baseline] {rel}: observed_baseline.bag 作成に失敗: {e}", file=sys.stderr)
-            return 1
-
-        validation_summary_path = out_dir / "validation_baseline_summary.json"
-        try:
-            validation_summary = evaluate_validation_for_side(
-                rel=rel,
-                out_dir=out_dir,
-                side="baseline",
-                result_bag=out_bag,
-                observed_bag=observed_bag,
-                result_ns=VALIDATION_BASELINE_NS,
-                observed_ns=VALIDATION_OBSERVED_BASELINE_NS,
-                scene_timing=scene_timing,
-            )
-            validation_summary_path.write_text(
-                json.dumps(validation_summary, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception as e:
-            print(f"[baseline] {rel}: baseline observed評価に失敗: {e}", file=sys.stderr)
             return 1
 
     print("[baseline] Done.")

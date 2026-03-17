@@ -152,13 +152,74 @@ def _load_side_collision(path: Path, side: str) -> dict:
     return out
 
 
+def _default_dt_summary(detail: str) -> dict:
+    return {
+        "dt_status": "valid",
+        "dt_max": "-",
+        "sample_count": 0,
+        "detail": detail,
+    }
+
+
+def _normalize_dt_summary(node: dict | None, detail_fallback: str) -> dict:
+    if not isinstance(node, dict):
+        return _default_dt_summary(detail_fallback)
+    status = str(node.get("dt_status") or "valid")
+    dt_max = node.get("dt_max", "-")
+    try:
+        sample_count = max(0, int(node.get("sample_count", 0) or 0))
+    except Exception:
+        sample_count = 0
+    return {
+        "dt_status": status,
+        "dt_max": dt_max,
+        "sample_count": sample_count,
+        "detail": str(node.get("detail") or detail_fallback),
+    }
+
+
+def _load_dt_summary(path: Path, side: str) -> dict:
+    return _normalize_dt_summary(
+        _load_json_dict(path),
+        detail_fallback=f"{side}_dt_summary_missing",
+    )
+
+
+def _load_dt_subscenes(path: Path, side: str) -> dict[int, dict]:
+    raw = _load_json_dict(path)
+    if raw is None:
+        return {}
+    raw_subscenes = raw.get("subscenes", [])
+    if not isinstance(raw_subscenes, list):
+        return {}
+    out: dict[int, dict] = {}
+    for idx, node in enumerate(raw_subscenes):
+        if not isinstance(node, dict):
+            continue
+        meta = _normalize_subscene_meta(node, idx)
+        sub = dict(meta)
+        sub.update(
+            _normalize_dt_summary(
+                node,
+                detail_fallback=f"{side}_subscene_{meta['index']}_dt_summary_missing",
+            )
+        )
+        out[meta["index"]] = sub
+    return out
+
+
 def _normalize_subscene_meta(node: dict, fallback_index: int) -> dict:
     if not isinstance(node, dict):
         node = {}
     start_offset = float(node.get("start_offset_sec", 0.0) or 0.0)
     end_offset = float(node.get("end_offset_sec", start_offset) or start_offset)
+    raw_index = node.get("index", fallback_index)
+    try:
+        index = int(fallback_index if raw_index is None else raw_index)
+    except Exception:
+        index = int(fallback_index)
     return {
-        "index": int(node.get("index", fallback_index) or fallback_index),
+        "index": index,
         "label": str(node.get("label", "")),
         "start_offset_sec": start_offset,
         "end_offset_sec": end_offset,
@@ -222,6 +283,8 @@ def main() -> int:
         merged_path = out_dir / "comparison.json"
         baseline_summary_path = baseline_root / rel / "validation_baseline_summary.json"
         test_summary_path = out_dir / "validation_test_summary.json"
+        baseline_dt_summary_path = baseline_root / rel / "dt_summary.json"
+        test_dt_summary_path = out_dir / "dt_summary.json"
         baseline_summary_raw = _load_json_dict(baseline_summary_path) or {}
         test_summary_raw = _load_json_dict(test_summary_path) or {}
 
@@ -257,9 +320,17 @@ def main() -> int:
             "baseline": _load_side_collision(baseline_summary_path, "baseline"),
             "test": _load_side_collision(test_summary_path, "test"),
         }
+        baseline_dt = _load_dt_summary(baseline_dt_summary_path, "baseline")
+        test_dt = _load_dt_summary(test_dt_summary_path, "test")
+        comp["dt_status_baseline"] = baseline_dt["dt_status"]
+        comp["dt_max_baseline"] = baseline_dt["dt_max"]
+        comp["dt_status_test"] = test_dt["dt_status"]
+        comp["dt_max_test"] = test_dt["dt_max"]
 
         baseline_subscene_map = _load_side_subscenes(baseline_summary_path, "baseline")
         test_subscene_map = _load_side_subscenes(test_summary_path, "test")
+        baseline_dt_subscene_map = _load_dt_subscenes(baseline_dt_summary_path, "baseline")
+        test_dt_subscene_map = _load_dt_subscenes(test_dt_summary_path, "test")
         direct_subscene_map: dict[int, dict] = {}
         ordered_indices: list[int] = []
         for idx, node in enumerate(direct_subscenes):
@@ -278,6 +349,12 @@ def main() -> int:
             if idx not in ordered_indices:
                 ordered_indices.append(idx)
         for idx in test_subscene_map:
+            if idx not in ordered_indices:
+                ordered_indices.append(idx)
+        for idx in baseline_dt_subscene_map:
+            if idx not in ordered_indices:
+                ordered_indices.append(idx)
+        for idx in test_dt_subscene_map:
             if idx not in ordered_indices:
                 ordered_indices.append(idx)
 
@@ -350,6 +427,12 @@ def main() -> int:
                     _default_collision_side_summary(f"test_subscene_{index}_collision_missing"),
                 ),
             }
+            baseline_dt_sub = baseline_dt_subscene_map.get(index, _default_dt_summary(f"baseline_subscene_{index}_dt_missing"))
+            test_dt_sub = test_dt_subscene_map.get(index, _default_dt_summary(f"test_subscene_{index}_dt_missing"))
+            sub["dt_status_baseline"] = baseline_dt_sub.get("dt_status", "valid")
+            sub["dt_max_baseline"] = baseline_dt_sub.get("dt_max", "-")
+            sub["dt_status_test"] = test_dt_sub.get("dt_status", "valid")
+            sub["dt_max_test"] = test_dt_sub.get("dt_max", "-")
             comp_subscenes.append(sub)
         comp["subscenes"] = comp_subscenes
 

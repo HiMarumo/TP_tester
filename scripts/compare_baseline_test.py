@@ -137,9 +137,9 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
     fill = int((done * width) / total)
     bar = "#" * fill + "-" * (width - fill)
     line = f"{prefix} [{bar}] {percent}% ({done}/{total})"
-    last_len = int(state.get("last_line_len", 0) or 0)
+    last_len = int(getattr(_print_progress_line, "_last_line_len", 0) or 0)
     pad = " " * max(0, last_len - len(line))
-    state["last_line_len"] = len(line)
+    setattr(_print_progress_line, "_last_line_len", len(line))
     print(
         f"\r{line}{pad}",
         end="",
@@ -147,7 +147,7 @@ def _print_progress_line(prefix: str, done: int, total: int, state: dict) -> Non
         flush=True,
     )
     if done >= total:
-        state["last_line_len"] = 0
+        setattr(_print_progress_line, "_last_line_len", 0)
         print(file=sys.stderr, flush=True)
 
 

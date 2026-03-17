@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from common import (
     build_subscene_dt_summary,
     check_offline_binary_supports_map_name,
     collect_clock_timeline_in_bags,
+    collect_topic_timeline_in_bags,
     discover_bag_directories,
     get_bag_files_in_dir,
     get_commit_info_for_run,
@@ -27,7 +27,6 @@ from run_baseline import (
     _build_observed_bag_from_input,
     TP_SIM_OFFLINE_INPUT_TOPICS,
 )
-from evaluate_observed_validation import evaluate_validation_for_side
 
 
 VALIDATION_OBSERVED_TEST_NS = "/validation/observed_test"
@@ -158,12 +157,19 @@ def main() -> int:
         else:
             (out_dir / "dt_status").write_text("valid")
         (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
-        dt_summary = build_subscene_dt_summary(
-            dt_values=dt_values,
-            clock_timeline_ns=collect_clock_timeline_in_bags(
+        dt_timeline_ns = collect_topic_timeline_in_bags(
+            selected_bags,
+            "/target_tracker/tracked_object_set2",
+            progress_prefix=f"[test] {rel} dt-summary /target_tracker/tracked_object_set2",
+        )
+        if len(dt_timeline_ns) != len(dt_values):
+            dt_timeline_ns = collect_clock_timeline_in_bags(
                 bags,
                 progress_prefix=f"[test] {rel} dt-summary /clock",
-            ),
+            )
+        dt_summary = build_subscene_dt_summary(
+            dt_values=dt_values,
+            clock_timeline_ns=dt_timeline_ns,
             scene_timing=scene_timing,
         )
         (out_dir / "dt_summary.json").write_text(
@@ -198,45 +204,6 @@ def main() -> int:
         except Exception as e:
             print(f"[test] {rel}: observed_test.bag 作成に失敗: {e}", file=sys.stderr)
             return 1
-
-        validation_summary_path = out_dir / "validation_test_summary.json"
-        try:
-            validation_summary = evaluate_validation_for_side(
-                rel=rel,
-                out_dir=out_dir,
-                side="test",
-                result_bag=out_bag,
-                observed_bag=observed_bag,
-                result_ns=VALIDATION_TEST_NS,
-                observed_ns=VALIDATION_OBSERVED_TEST_NS,
-                scene_timing=scene_timing,
-            )
-            validation_summary_path.write_text(
-                json.dumps(validation_summary, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception as e:
-            print(f"[test] {rel}: test observed評価に失敗: {e}", file=sys.stderr)
-            return 1
-
-    script_dir = root / "scripts"
-    compare_script = script_dir / "compare_baseline_test.py"
-    aggregate_script = script_dir / "aggregate_comparison_results.py"
-    if compare_script.exists():
-        print("[test] Running comparison...")
-        env = os.environ.copy()
-        env["TP_TESTER_ROOT"] = str(root)
-        subprocess.run([sys.executable, str(compare_script)], cwd=root, env=env, check=False)
-    else:
-        print("[test] Comparison script not found, skipping.", file=sys.stderr)
-
-    if aggregate_script.exists():
-        print("[test] Aggregating comparison/evaluation JSON...")
-        env = os.environ.copy()
-        env["TP_TESTER_ROOT"] = str(root)
-        subprocess.run([sys.executable, str(aggregate_script)], cwd=root, env=env, check=True)
-    else:
-        print("[test] Aggregation script not found, skipping.", file=sys.stderr)
 
     print("[test] Done.")
     return 0
