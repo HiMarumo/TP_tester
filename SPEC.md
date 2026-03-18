@@ -207,7 +207,7 @@
 - `result_baseline.bag` を sceneごとに生成。
 - `dt_status` (`valid|warning|invalid`) / `dt_max` / `segfault` を付帯生成。
 - その後に `observed_baseline.bag` を同sceneで生成（5.2）。
-- さらに `evaluate_observed_validation.py`（baseline side）を実行し、`validation_baseline_summary.json`・`validation_baseline.bag`・`collision_judgement_baseline.bag` を生成（11）。
+- `validation_baseline_summary.json`・`validation_baseline.bag`・`collision_judgement_baseline.bag` は、baseline 作成直後ではなく **test 実行時の評価** でまとめて生成する（5.3.3）。`run_evaluation.py --side all` で baseline/test 両方を評価するため、baseline だけを先に評価する必要はなく、二重に評価しない。
 
 ## 5.2 observed_baseline.bag / observed_test.bag 作成（baseline/testと別アルゴリズム）
 対象:
@@ -322,7 +322,7 @@
 ### 5.3.3 test の出力と比較
 - sceneごとに `result_test.bag`, `dt_status`, `dt_max`, `segfault` を生成。
 - 各sceneで `result_test.bag` 作成成功後に `observed_test.bag` を生成（5.2）。
-- 各sceneで `evaluate_observed_validation.py`（test side）を実行し、`validation_test_summary.json`・`validation_test.bag`・`collision_judgement_test.bag` を生成。
+- **評価**は `run_evaluation.py` で行う。`--side all` で baseline と test の両方を評価し、各 scene で `validation_baseline_summary.json`・`validation_test_summary.json` および対応する validation/collision bag を生成する（baseline 側は baseline_results 配下、test 側は test_results 配下）。同一の評価処理を二重に回さない。
 - 全scene後に `compare_baseline_test.py` を実行し、`comparison_direct.json` と `common/diff_*.bag` を生成。
 - その後 `aggregate_comparison_results.py` を実行し、`comparison_direct.json` と baseline/test の validation/collision summary を集約して `comparison.json` を生成。
 - 補足:

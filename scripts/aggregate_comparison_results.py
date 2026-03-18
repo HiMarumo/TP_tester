@@ -152,6 +152,53 @@ def _load_side_collision(path: Path, side: str) -> dict:
     return out
 
 
+def _aggregate_validation_common(raw_summary: dict, common_ids: set[int]) -> dict:
+    """Aggregate per_object_validation for common_ids only. Returns same structure as _load_side_summary."""
+    out = _default_side_summary("ok")
+    pov = raw_summary.get("per_object_validation") or {}
+    if not isinstance(pov, dict):
+        return out
+    for oid in common_ids:
+        node_by_h = pov.get(str(oid), {})
+        if not isinstance(node_by_h, dict):
+            continue
+        for horizon in VALIDATION_HORIZONS:
+            node_by_t = node_by_h.get(horizon, {})
+            if not isinstance(node_by_t, dict):
+                continue
+            for threshold in VALIDATION_THRESHOLDS:
+                node = node_by_t.get(threshold, {})
+                out[horizon][threshold]["ok"] += int(node.get("ok", 0) or 0)
+                out[horizon][threshold]["total"] += int(node.get("total", 0) or 0)
+    for horizon in VALIDATION_HORIZONS:
+        for threshold in VALIDATION_THRESHOLDS:
+            n = out[horizon][threshold]
+            if n["total"] > 0:
+                n["rate"] = (100.0 * float(n["ok"])) / float(n["total"])
+            else:
+                n["rate"] = 0.0
+    return out
+
+
+def _aggregate_collision_common(raw_summary: dict, common_ids: set[int]) -> dict:
+    """Aggregate per_object_collision for common_ids only. Returns same structure as _load_side_collision."""
+    out = _default_collision_side_summary("ok")
+    poc = raw_summary.get("per_object_collision") or {}
+    if not isinstance(poc, dict):
+        return out
+    for oid in common_ids:
+        kind_d = poc.get(str(oid), {})
+        if not isinstance(kind_d, dict):
+            continue
+        for kind in COLLISION_KINDS:
+            node = kind_d.get(kind, {})
+            out[kind]["collision_paths"] += int(node.get("collision_paths", 0) or 0)
+            out[kind]["checked_paths"] += int(node.get("checked_paths", 0) or 0)
+    for kind in COLLISION_KINDS:
+        out[kind]["has_collision"] = out[kind]["collision_paths"] > 0
+    return out
+
+
 def _default_dt_summary(detail: str) -> dict:
     return {
         "dt_status": "valid",
@@ -320,6 +367,23 @@ def main() -> int:
             "baseline": _load_side_collision(baseline_summary_path, "baseline"),
             "test": _load_side_collision(test_summary_path, "test"),
         }
+        # Common-object aggregates: only objects evaluated in both baseline and test
+        def _oid_set(lst):
+            s = set()
+            for x in lst or []:
+                try:
+                    s.add(int(x))
+                except (TypeError, ValueError):
+                    pass
+            return s
+        baseline_oids = _oid_set(baseline_summary_raw.get("evaluated_object_ids"))
+        test_oids = _oid_set(test_summary_raw.get("evaluated_object_ids"))
+        common_ids = baseline_oids & test_oids
+        comp["validation"]["baseline_common"] = _aggregate_validation_common(baseline_summary_raw, common_ids)
+        comp["validation"]["test_common"] = _aggregate_validation_common(test_summary_raw, common_ids)
+        comp["collision"]["baseline_common"] = _aggregate_collision_common(baseline_summary_raw, common_ids)
+        comp["collision"]["test_common"] = _aggregate_collision_common(test_summary_raw, common_ids)
+        comp["common_object_ids"] = sorted(common_ids)
         baseline_dt = _load_dt_summary(baseline_dt_summary_path, "baseline")
         test_dt = _load_dt_summary(test_dt_summary_path, "test")
         comp["dt_status_baseline"] = baseline_dt["dt_status"]

@@ -429,13 +429,21 @@ def _half_time_relaxed_rate(side_validation: dict | None) -> float | None:
 
 
 def _half_delta_mark(comp: dict | None) -> str:
+    """Comparison mark (↑/↓) based on half-time-relaxed approximate rate. Prefer common-object rates when present."""
     if not isinstance(comp, dict):
         return "-"
     validation = comp.get("validation", {})
     if not isinstance(validation, dict):
         return "-"
-    baseline_rate = _half_time_relaxed_rate(validation.get("baseline"))
-    test_rate = _half_time_relaxed_rate(validation.get("test"))
+    # Prefer common-object aggregate for the mark (objects evaluated in both baseline and test)
+    baseline_common = validation.get("baseline_common")
+    test_common = validation.get("test_common")
+    if isinstance(baseline_common, dict) and isinstance(test_common, dict):
+        baseline_rate = _half_time_relaxed_rate(baseline_common)
+        test_rate = _half_time_relaxed_rate(test_common)
+    else:
+        baseline_rate = _half_time_relaxed_rate(validation.get("baseline"))
+        test_rate = _half_time_relaxed_rate(validation.get("test"))
     if baseline_rate is None or test_rate is None:
         return "-"
     if abs(test_rate - baseline_rate) <= 1e-9:
@@ -527,10 +535,39 @@ def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QCo
     validation = comp.get("validation", {}) if isinstance(comp, dict) else {}
     baseline = validation.get("baseline", {}) if isinstance(validation, dict) else {}
     test = validation.get("test", {}) if isinstance(validation, dict) else {}
+    baseline_common = validation.get("baseline_common", {}) if isinstance(validation, dict) else {}
+    test_common = validation.get("test_common", {}) if isinstance(validation, dict) else {}
     collision = comp.get("collision", {}) if isinstance(comp, dict) else {}
     collision_baseline = collision.get("baseline", {}) if isinstance(collision, dict) else {}
     collision_test = collision.get("test", {}) if isinstance(collision, dict) else {}
+    collision_baseline_common = collision.get("baseline_common", {}) if isinstance(collision, dict) else {}
+    collision_test_common = collision.get("test_common", {}) if isinstance(collision, dict) else {}
     rows: list[tuple[str, str, str, QColor | None, QColor | None]] = []
+    # Common-object rows first when available (baseline_common/test_common from aggregate)
+    has_common = isinstance(baseline_common, dict) and isinstance(test_common, dict)
+    if has_common:
+        for kind in COLLISION_KINDS:
+            b_text, b_color = _collision_state_stats(_collision_kind_node(collision_baseline_common, kind))
+            t_text, t_color = _collision_state_stats(_collision_kind_node(collision_test_common, kind))
+            rows.append((f"{kind}-collision (common)", b_text, t_text, b_color, t_color))
+        for horizon, threshold in VALIDATION_SUMMARY_ROWS:
+            b_node = _validation_metric_node(baseline_common, horizon, threshold)
+            t_node = _validation_metric_node(test_common, horizon, threshold)
+            b_text, b_rate = _validation_rate_stats(b_node)
+            t_text, t_rate = _validation_rate_stats(t_node)
+            b_color = None
+            t_color = None
+            if b_rate is not None and t_rate is not None and abs(b_rate - t_rate) > 1e-9:
+                if b_rate > t_rate:
+                    b_color = COLOR_GREEN
+                    t_color = COLOR_RED
+                else:
+                    b_color = COLOR_RED
+                    t_color = COLOR_GREEN
+            th_label = "approximate" if threshold == "approximate" else "strict"
+            label = f"half-time-relaxed {th_label} (common)" if horizon == "half-time-relaxed" else f"time-relaxed {th_label} (common)"
+            rows.append((label, b_text, t_text, b_color, t_color))
+    # All-object rows
     for kind in COLLISION_KINDS:
         b_text, b_color = _collision_state_stats(_collision_kind_node(collision_baseline, kind))
         t_text, t_color = _collision_state_stats(_collision_kind_node(collision_test, kind))

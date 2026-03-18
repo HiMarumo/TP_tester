@@ -1786,11 +1786,18 @@ def _ensure_context_validation_plan_cache(context: dict) -> dict[tuple[str, str]
                         continue
                     for pidx, _ in enumerate(pred_entry.get("path_caches", [])):
                         status_pred_indices["fail"][group][oid].append(pidx)
+        per_object: dict[int, dict] = {}
+        for oid in sorted(observed_ids):
+            if oid in excluded_short_observed_ids:
+                continue
+            candidates = candidates_by_metric[metric].get(oid, [])
+            per_object[int(oid)] = {"ok": 1 if candidates else 0, "total": 1}
         plan_cache[metric] = {
             "status_pred_indices": status_pred_indices,
             "status_observed_oids": status_observed_oids,
             "total": total,
             "ok": ok,
+            "per_object": per_object,
         }
 
     context["validation_plan_cache"] = plan_cache
@@ -1855,9 +1862,11 @@ def _build_collision_for_side(
     scene_cache: dict | None = None,
     out_bag=None,
     chunk_label: str = "",
-) -> tuple[dict, list[dict]]:
+) -> tuple[dict, list[dict], dict[int, dict[str, dict]]]:
+    """Returns (summary, subscene_summaries, per_object_collision) where per_object_collision[oid][kind] = {collision_paths, checked_paths}."""
     summary = _default_collision_summary("ok")
     subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
+    per_object_collision: dict[int, dict[str, dict]] = {}  # oid -> kind -> {collision_paths, checked_paths}
     bag_path = out_dir / f"collision_judgement_{side}.bag"
     manage_out_bag = False
     write_state = {"last_percent": -1}
@@ -1869,16 +1878,19 @@ def _build_collision_for_side(
             summary[kind]["detail"] = "rosbag not available"
             for sub in subscene_summaries:
                 sub["collision"][kind]["detail"] = summary[kind]["detail"]
-    elif not result_bag.exists():
+        return summary, subscene_summaries, per_object_collision
+    if not result_bag.exists():
         for kind in COLLISION_KINDS:
             summary[kind]["detail"] = f"result bag missing: {result_bag}"
             for sub in subscene_summaries:
                 sub["collision"][kind]["detail"] = summary[kind]["detail"]
-    elif not observed_bag.exists():
+        return summary, subscene_summaries, per_object_collision
+    if not observed_bag.exists():
         for kind in COLLISION_KINDS:
             summary[kind]["detail"] = f"observed bag missing: {observed_bag}"
             for sub in subscene_summaries:
                 sub["collision"][kind]["detail"] = summary[kind]["detail"]
+        return summary, subscene_summaries, per_object_collision
     else:
         cache = scene_cache or _build_scene_eval_cache(
             result_bag=result_bag,
@@ -2008,6 +2020,18 @@ def _build_collision_for_side(
                             sub_summary["collision"][kind]["has_collision"] = bool(
                                 sub_summary["collision"][kind]["has_collision"] or stamp_has_collision[kind]
                             )
+                        # Per-object collision for common-object aggregation
+                        for group in VALIDATION_GROUPS:
+                            for oid in set(pred_collision_indices[kind][group].keys()) | set(pred_safe_indices[kind][group].keys()):
+                                if _is_ego_id(oid) or _is_vsl_id(oid):
+                                    continue
+                                c = len(pred_collision_indices[kind][group].get(oid, []))
+                                s = len(pred_safe_indices[kind][group].get(oid, []))
+                                oid_int = int(oid)
+                                if oid_int not in per_object_collision:
+                                    per_object_collision[oid_int] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                                per_object_collision[oid_int][kind]["collision_paths"] += c
+                                per_object_collision[oid_int][kind]["checked_paths"] += c + s
 
                     for group in VALIDATION_GROUPS:
                         for status in COLLISION_GROUPED_STATUSES:
@@ -2099,7 +2123,7 @@ def _build_collision_for_side(
     elif manage_out_bag and not bag_path.exists():
         bag_path.write_bytes(b"")
 
-    return summary, subscene_summaries
+    return summary, subscene_summaries, per_object_collision
 
 
 def _build_validation_for_side_threshold(
@@ -2118,8 +2142,10 @@ def _build_validation_for_side_threshold(
     scene_cache: dict | None = None,
     out_bag=None,
     chunk_label: str = "",
-) -> tuple[dict, list[dict]]:
+) -> tuple[dict, list[dict], dict[int, dict]]:
+    """Returns (summary, subscene_summaries, per_object) where per_object[oid] = {ok, total} for this horizon/threshold."""
     summary = _default_threshold_summary("ok")
+    per_object: dict[int, dict] = {}
     log_key = _validation_log_key(side, horizon, threshold)
     subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
 
@@ -2127,14 +2153,17 @@ def _build_validation_for_side_threshold(
         summary["detail"] = "rosbag not available"
         for sub in subscene_summaries:
             sub[horizon][threshold]["detail"] = summary["detail"]
-    elif not result_bag.exists():
+        return summary, subscene_summaries, per_object
+    if not result_bag.exists():
         summary["detail"] = f"result bag missing: {result_bag}"
         for sub in subscene_summaries:
             sub[horizon][threshold]["detail"] = summary["detail"]
-    elif not observed_bag.exists():
+        return summary, subscene_summaries, per_object
+    if not observed_bag.exists():
         summary["detail"] = f"observed bag missing: {observed_bag}"
         for sub in subscene_summaries:
             sub[horizon][threshold]["detail"] = summary["detail"]
+        return summary, subscene_summaries, per_object
     else:
         cache = scene_cache or _build_scene_eval_cache(
             result_bag=result_bag,
@@ -2194,6 +2223,12 @@ def _build_validation_for_side_threshold(
                 if metric_plan is not None:
                     summary["total"] += int(metric_plan.get("total", 0))
                     summary["ok"] += int(metric_plan.get("ok", 0))
+                    for oid, po in (metric_plan.get("per_object") or {}).items():
+                        oid_int = int(oid)
+                        if oid_int not in per_object:
+                            per_object[oid_int] = {"ok": 0, "total": 0}
+                        per_object[oid_int]["ok"] += int(po.get("ok", 0))
+                        per_object[oid_int]["total"] += int(po.get("total", 0))
                     sub_summary = _subscene_summary_for_stamp(_to_nsec(ref_t), scene_timing, subscene_summaries)
                     if sub_summary is not None:
                         sub_summary[horizon][threshold]["total"] += int(metric_plan.get("total", 0))
@@ -2255,7 +2290,7 @@ def _build_validation_for_side_threshold(
         else:
             sub_summary["rate"] = 0.0
 
-    return summary, subscene_summaries
+    return summary, subscene_summaries, per_object
 
 
 def evaluate_validation_for_side(
@@ -2278,17 +2313,24 @@ def evaluate_validation_for_side(
             for threshold in VALIDATION_THRESHOLDS
         }
     summary["collision"] = _default_collision_summary("ok")
+    per_object_validation: dict[int, dict[str, dict[str, dict]]] = {}
     validation_bag_path = out_dir / f"validation_{side}.bag"
     collision_bag_path = out_dir / f"collision_judgement_{side}.bag"
     for stale_path in (validation_bag_path, collision_bag_path):
         if stale_path.exists():
             stale_path.unlink()
+    def _set_empty_common_fields():
+        summary["evaluated_object_ids"] = []
+        summary["per_object_validation"] = {}
+        summary["per_object_collision"] = {}
+
     if not HAS_ROSBAG:
         detail = "rosbag not available"
         for horizon in VALIDATION_HORIZONS:
             for threshold in VALIDATION_THRESHOLDS:
                 summary[horizon][threshold]["detail"] = detail
         summary["collision"] = _default_collision_summary(detail)
+        _set_empty_common_fields()
         if not validation_bag_path.exists():
             validation_bag_path.write_bytes(b"")
         if not collision_bag_path.exists():
@@ -2300,6 +2342,7 @@ def evaluate_validation_for_side(
             for threshold in VALIDATION_THRESHOLDS:
                 summary[horizon][threshold]["detail"] = detail
         summary["collision"] = _default_collision_summary(detail)
+        _set_empty_common_fields()
         with rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024):
             pass
         with rosbag.Bag(str(collision_bag_path), "w", chunk_threshold=64 * 1024):
@@ -2311,6 +2354,7 @@ def evaluate_validation_for_side(
             for threshold in VALIDATION_THRESHOLDS:
                 summary[horizon][threshold]["detail"] = detail
         summary["collision"] = _default_collision_summary(detail)
+        _set_empty_common_fields()
         with rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024):
             pass
         with rosbag.Bag(str(collision_bag_path), "w", chunk_threshold=64 * 1024):
@@ -2327,6 +2371,9 @@ def evaluate_validation_for_side(
 
     validation_bag = rosbag.Bag(str(validation_bag_path), "w", chunk_threshold=64 * 1024)
     collision_bag = rosbag.Bag(str(collision_bag_path), "w", chunk_threshold=64 * 1024)
+    # per_object_validation[oid][horizon][threshold] = {ok, total} for common-object aggregation
+    per_object_validation: dict[int, dict[str, dict[str, dict]]] = {}
+    per_object_collision: dict[int, dict[str, dict]] = {}  # oid -> kind -> {collision_paths, checked_paths}
     try:
         chunk_total = max(1, (len(filtered_master_stamps) + EVAL_STAMP_CHUNK_SIZE - 1) // EVAL_STAMP_CHUNK_SIZE)
         for chunk_idx, chunk_stamps in enumerate(_iter_stamp_chunks(filtered_master_stamps), start=1):
@@ -2338,7 +2385,7 @@ def evaluate_validation_for_side(
                     max_t = float(window_cfg.get("max_t", 5.0))
                     other_max_t = float(window_cfg.get("other_max_t", max_t))
                     for threshold in VALIDATION_THRESHOLDS:
-                        chunk_summary, chunk_subscene_threshold_summaries = _build_validation_for_side_threshold(
+                        chunk_summary, chunk_subscene_threshold_summaries, chunk_per_object = _build_validation_for_side_threshold(
                             rel=rel,
                             out_dir=out_dir,
                             side=side,
@@ -2360,6 +2407,14 @@ def evaluate_validation_for_side(
                         dst_summary["total"] += int(chunk_summary.get("total", 0))
                         if dst_summary.get("detail") == "ok" and chunk_summary.get("detail") not in (None, "ok"):
                             dst_summary["detail"] = chunk_summary.get("detail")
+                        for oid, po in (chunk_per_object or {}).items():
+                            if oid not in per_object_validation:
+                                per_object_validation[oid] = {
+                                    h: {t: {"ok": 0, "total": 0} for t in VALIDATION_THRESHOLDS}
+                                    for h in VALIDATION_HORIZONS
+                                }
+                            per_object_validation[oid][horizon][threshold]["ok"] += int(po.get("ok", 0))
+                            per_object_validation[oid][horizon][threshold]["total"] += int(po.get("total", 0))
                         for idx, sub in enumerate(chunk_subscene_threshold_summaries):
                             if idx < len(summary["subscenes"]):
                                 dst = summary["subscenes"][idx][horizon][threshold]
@@ -2369,7 +2424,7 @@ def evaluate_validation_for_side(
                                 if dst.get("detail") == "not_evaluated" and src.get("detail") not in (None, "ok", "not_evaluated"):
                                     dst["detail"] = src.get("detail")
 
-                chunk_collision_summary, chunk_collision_subscenes = _build_collision_for_side(
+                chunk_collision_summary, chunk_collision_subscenes, chunk_per_object_collision = _build_collision_for_side(
                     rel=rel,
                     out_dir=out_dir,
                     side=side,
@@ -2382,6 +2437,12 @@ def evaluate_validation_for_side(
                     out_bag=collision_bag,
                     chunk_label=chunk_label,
                 )
+                for oid, kind_d in (chunk_per_object_collision or {}).items():
+                    if oid not in per_object_collision:
+                        per_object_collision[oid] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                    for kind in COLLISION_KINDS:
+                        per_object_collision[oid][kind]["collision_paths"] += int(kind_d.get(kind, {}).get("collision_paths", 0))
+                        per_object_collision[oid][kind]["checked_paths"] += int(kind_d.get(kind, {}).get("checked_paths", 0))
                 for kind in COLLISION_KINDS:
                     dst = summary["collision"][kind]
                     src = chunk_collision_summary.get(kind, {})
@@ -2441,6 +2502,21 @@ def evaluate_validation_for_side(
             f"[collision] {rel} {side}-{kind}: {state} "
             f"({int(node.get('collision_paths', 0))}/{int(node.get('checked_paths', 0))})"
         )
+    # For common-object aggregation: serializable per-object validation/collision and evaluated object IDs
+    evaluated_object_ids = sorted(per_object_validation.keys())
+    summary["evaluated_object_ids"] = evaluated_object_ids
+    # JSON: oid as string key; inner structure horizon -> threshold -> {ok, total}
+    summary["per_object_validation"] = {
+        str(oid): {
+            h: {t: per_object_validation[oid][h][t] for t in VALIDATION_THRESHOLDS}
+            for h in VALIDATION_HORIZONS
+        }
+        for oid in evaluated_object_ids
+    }
+    summary["per_object_collision"] = {
+        str(oid): {kind: per_object_collision[oid][kind] for kind in COLLISION_KINDS}
+        for oid in sorted(per_object_collision.keys())
+    }
     return summary
 
 
