@@ -123,7 +123,13 @@ def main() -> int:
         action="store_false",
         help="Skip baseline/test comparison and aggregation.",
     )
-    parser.set_defaults(compare=True)
+    parser.add_argument(
+        "--compare-only",
+        dest="compare_only",
+        action="store_true",
+        help="Skip evaluation (observed validation). Run only compare and aggregation. Use when evaluation already finished and only comparison is needed (e.g. after OOM at compare).",
+    )
+    parser.set_defaults(compare=True, compare_only=False)
     args = parser.parse_args()
 
     root = get_tester_root()
@@ -132,30 +138,31 @@ def main() -> int:
     baseline_root = root / paths["baseline_results"]
     test_root = root / paths["test_results"]
 
-    sides = ("baseline", "test") if args.side == "all" else (args.side,)
-    for side in sides:
-        if side == "baseline":
-            rc = _evaluate_side(
-                side="baseline",
-                results_root=baseline_root,
-                result_bag_name="result_baseline.bag",
-                observed_bag_name="observed_baseline.bag",
-                result_ns=VALIDATION_BASELINE_NS,
-                observed_ns=VALIDATION_OBSERVED_BASELINE_NS,
-            )
-        else:
-            rc = _evaluate_side(
-                side="test",
-                results_root=test_root,
-                result_bag_name="result_test.bag",
-                observed_bag_name="observed_test.bag",
-                result_ns=VALIDATION_TEST_NS,
-                observed_ns=VALIDATION_OBSERVED_TEST_NS,
-            )
-        if rc != 0:
-            return rc
+    if not args.compare_only:
+        sides = ("baseline", "test") if args.side == "all" else (args.side,)
+        for side in sides:
+            if side == "baseline":
+                rc = _evaluate_side(
+                    side="baseline",
+                    results_root=baseline_root,
+                    result_bag_name="result_baseline.bag",
+                    observed_bag_name="observed_baseline.bag",
+                    result_ns=VALIDATION_BASELINE_NS,
+                    observed_ns=VALIDATION_OBSERVED_BASELINE_NS,
+                )
+            else:
+                rc = _evaluate_side(
+                    side="test",
+                    results_root=test_root,
+                    result_bag_name="result_test.bag",
+                    observed_bag_name="observed_test.bag",
+                    result_ns=VALIDATION_TEST_NS,
+                    observed_ns=VALIDATION_OBSERVED_TEST_NS,
+                )
+            if rc != 0:
+                return rc
 
-    if args.compare:
+    if args.compare or args.compare_only:
         if _run_script(root, "compare_baseline_test.py", "comparison") != 0:
             return 1
         if _run_script(root, "aggregate_comparison_results.py", "aggregation") != 0:

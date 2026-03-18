@@ -11,12 +11,16 @@ are paired. Verifies:
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import math
 import os
 import sys
 from collections import Counter
 from pathlib import Path
+
+# Chunk size for compare (stamp count per chunk). Reduces memory by building features per chunk.
+COMPARE_STAMP_CHUNK_SIZE = 300
 
 from common import (
     build_scene_timing,
@@ -175,35 +179,122 @@ def _lane_curves_sets_equal(msg1, msg2) -> bool:
     return _lane_curves_as_set(msg1) == _lane_curves_as_set(msg2)
 
 
-def _collect_lane_messages(bag_path: Path, topics: list[str]) -> dict:
-    """topic -> list of (t, msg)."""
+def _collect_stamps_from_topic(bag_path: Path, topic: str) -> set:
+    """Read only the ref topic and return set of stamps (nsec). Lightweight for common_stamps."""
+    out = set()
+    if not HAS_ROSBAG or not bag_path.exists():
+        return out
+    try:
+        with rosbag.Bag(str(bag_path), "r") as bag:
+            for _t, msg, t in bag.read_messages(topics=[topic]):
+                out.add(_msg_stamp(msg, t))
+    except Exception:
+        pass
+    return out
+
+
+def _collect_ref_topic_by_stamp(bag_path: Path, ref_topic: str, progress_callback=None) -> dict:
+    """Read only ref topic; return {stamp_nsec: (t, msg)}. progress_callback() をメッセージごとに呼ぶ。"""
+    out = {}
+    if not HAS_ROSBAG or not bag_path.exists():
+        return out
+    try:
+        with rosbag.Bag(str(bag_path), "r") as bag:
+            for _topic, msg, t in bag.read_messages(topics=[ref_topic]):
+                if progress_callback:
+                    progress_callback()
+                out[_msg_stamp(msg, t)] = (t, msg)
+    except Exception:
+        pass
+    return out
+
+
+def _get_bag_message_count(bag_path: Path, topics: list[str]) -> int:
+    """Return total message count for the given topics in the bag (for progress bar)."""
+    if not HAS_ROSBAG or not bag_path.exists():
+        return 0
+    try:
+        with rosbag.Bag(str(bag_path), "r") as bag:
+            info = bag.get_type_and_topic_info()
+            if isinstance(info, tuple) and len(info) >= 2:
+                topic_infos = info[1]
+            else:
+                topic_infos = getattr(info, "topics", {})
+            total = 0
+            for t in topics:
+                meta = topic_infos.get(t) if hasattr(topic_infos, "get") else None
+                if meta is not None:
+                    total += int(getattr(meta, "message_count", 0))
+            return total
+    except Exception:
+        return 0
+
+
+def _collect_lane_messages(bag_path: Path, topics: list[str], progress_callback=None) -> dict:
+    """topic -> list of (t, msg). progress_callback() called per message if set."""
     out = {t: [] for t in topics}
     if not HAS_ROSBAG or not bag_path.exists():
         return out
     with rosbag.Bag(str(bag_path), "r") as bag:
         for topic, msg, t in bag.read_messages(topics=topics):
             out[topic].append((t, msg))
+            if progress_callback:
+                progress_callback()
     return out
 
 
-def _collect_wm_messages(bag_path: Path, topics: list[str]) -> dict:
+def _collect_wm_messages(bag_path: Path, topics: list[str], progress_callback=None) -> dict:
     out = {t: [] for t in topics}
     if not HAS_ROSBAG or not bag_path.exists():
         return out
     with rosbag.Bag(str(bag_path), "r") as bag:
         for topic, msg, t in bag.read_messages(topics=topics):
             out[topic].append((t, msg))
+            if progress_callback:
+                progress_callback()
     return out
 
 
-def _collect_traffic_messages(bag_path: Path, topic: str) -> list:
+def _collect_traffic_messages(bag_path: Path, topic: str, progress_callback=None) -> list:
     out = []
     if not HAS_ROSBAG or not bag_path.exists():
         return out
     with rosbag.Bag(str(bag_path), "r") as bag:
         for _topic, msg, t in bag.read_messages(topics=[topic]):
             out.append((t, msg))
+            if progress_callback:
+                progress_callback()
     return out
+
+
+def _collect_all_compare_messages_for_stamps(
+    bag_path: Path,
+    lane_topics: list[str],
+    wm_topics: list[str],
+    traffic_topic: str,
+    stamp_set: set,
+    progress_callback=None,
+) -> tuple[dict, dict, list]:
+    """1回の bag 走査で lane / wm / traffic をまとめて取得（stamp_set に含まれるものだけ保持）。チャンクあたり bag 走査を 1 回に抑える。progress_callback() は読み取りメッセージごとに呼ぶ（進捗用）。"""
+    lane_out = {t: [] for t in lane_topics}
+    wm_out = {t: [] for t in wm_topics}
+    traffic_out = []
+    if not HAS_ROSBAG or not bag_path.exists() or not stamp_set:
+        return lane_out, wm_out, traffic_out
+    all_topics = list(lane_topics) + list(wm_topics) + [traffic_topic]
+    with rosbag.Bag(str(bag_path), "r") as bag:
+        for topic, msg, t in bag.read_messages(topics=all_topics):
+            if progress_callback:
+                progress_callback()
+            if _msg_stamp(msg, t) not in stamp_set:
+                continue
+            if topic in lane_out:
+                lane_out[topic].append((t, msg))
+            elif topic in wm_out:
+                wm_out[topic].append((t, msg))
+            elif topic == traffic_topic:
+                traffic_out.append((t, msg))
+    return lane_out, wm_out, traffic_out
 
 
 def _to_nsec(ts) -> int:
@@ -393,6 +484,44 @@ def _object_trajectory_counters_by_id(msg) -> dict:
     return out
 
 
+def _wm_features_single_pass(msg):
+    """1 回の msg.objects 走査で WM 比較用の全 feature を構築（高速化）。"""
+    object_ids_with_path = set()
+    object_ids_all = set()
+    objects_by_id = {}
+    path_entries_by_id = {}
+    trajectory_counters_by_id = {}
+    vsl_pose_counter = Counter()
+    for obj in getattr(msg, "objects", []) or []:
+        o = getattr(obj, "object", None)
+        if o is None:
+            continue
+        oid = int(getattr(o, "object_id", -1))
+        object_ids_all.add(oid)
+        objects_by_id[oid] = obj
+        sig_vsl = _vsl_pose_signature_from_obj(obj)
+        if sig_vsl is not None:
+            vsl_pose_counter[sig_vsl] += 1
+        entries = []
+        for path_msg in getattr(obj, "trajectory_set", []) or []:
+            if not (getattr(path_msg, "trajectory", []) or []):
+                continue
+            path_sig = _trajectory_path_signature(path_msg)
+            entries.append((path_msg, path_sig))
+        if entries:
+            path_entries_by_id[oid] = entries
+            object_ids_with_path.add(oid)
+            trajectory_counters_by_id[oid] = Counter(es[1] for es in entries)
+    return {
+        "object_ids_with_path": object_ids_with_path,
+        "object_ids_all": object_ids_all,
+        "objects_by_id": objects_by_id,
+        "path_entries_by_id": path_entries_by_id,
+        "trajectory_counters_by_id": trajectory_counters_by_id,
+        "vsl_pose_counter": vsl_pose_counter,
+    }
+
+
 def _traffic_state_signature(msg) -> list:
     """List of (stoplineid, state) for comparison, sorted by stoplineid for stable comparison."""
     sig = []
@@ -429,23 +558,33 @@ def _count_clock_in_bags(
     return total if total > 0 else None
 
 
-def _build_compare_scene_cache(baseline_bag: Path, test_bag: Path) -> dict:
-    def _bag_has_namespaced(bag_path: Path, ns: str) -> bool:
-        if not HAS_ROSBAG:
-            return False
-        try:
-            with rosbag.Bag(str(bag_path), "r") as bag:
-                info = bag.get_type_and_topic_info()
-                if isinstance(info, tuple) and len(info) >= 2:
-                    topic_infos = info[1]
-                    topics = topic_infos.keys() if hasattr(topic_infos, "keys") else topic_infos
-                else:
-                    topics = getattr(info, "topics", {})
-                    topics = topics.keys() if hasattr(topics, "keys") else topics
-                return any(topic.startswith(ns) for topic in topics)
-        except Exception:
-            return False
+def _iter_stamp_chunks(stamps: list[int], chunk_size: int = COMPARE_STAMP_CHUNK_SIZE):
+    """Yield stamp list in chunks to limit memory (features built per chunk)."""
+    if chunk_size <= 0:
+        chunk_size = COMPARE_STAMP_CHUNK_SIZE
+    for idx in range(0, len(stamps), chunk_size):
+        yield stamps[idx : idx + chunk_size]
 
+
+def _bag_has_namespaced(bag_path: Path, ns: str) -> bool:
+    if not HAS_ROSBAG:
+        return False
+    try:
+        with rosbag.Bag(str(bag_path), "r") as bag:
+            info = bag.get_type_and_topic_info()
+            if isinstance(info, tuple) and len(info) >= 2:
+                topic_infos = info[1]
+                topics = topic_infos.keys() if hasattr(topic_infos, "keys") else topic_infos
+            else:
+                topics = getattr(info, "topics", {})
+                topics = topics.keys() if hasattr(topics, "keys") else topics
+            return any(topic.startswith(ns) for topic in topics)
+    except Exception:
+        return False
+
+
+def _get_compare_topic_lists(baseline_bag: Path, test_bag: Path) -> dict:
+    """Return topic name lists only (no message load). For stamp-only flow."""
     baseline_use_ns = _bag_has_namespaced(baseline_bag, VALIDATION_BASELINE_NS)
     test_use_ns = _bag_has_namespaced(test_bag, VALIDATION_TEST_NS)
     baseline_lane = [f"{VALIDATION_BASELINE_NS}{t}" for t in LANE_TOPICS] if baseline_use_ns else list(LANE_TOPICS)
@@ -454,13 +593,80 @@ def _build_compare_scene_cache(baseline_bag: Path, test_bag: Path) -> dict:
     test_lane = [f"{VALIDATION_TEST_NS}{t}" for t in LANE_TOPICS] if test_use_ns else list(LANE_TOPICS)
     test_wm = [f"{VALIDATION_TEST_NS}{t}" for t in WM_TOPICS] if test_use_ns else list(WM_TOPICS)
     test_traffic = f"{VALIDATION_TEST_NS}{TRAFFIC_TOPIC}" if test_use_ns else TRAFFIC_TOPIC
+    return {
+        "baseline_lane_topics": baseline_lane,
+        "baseline_wm_topics": baseline_wm,
+        "baseline_traffic_topic": baseline_traffic,
+        "test_lane_topics": test_lane,
+        "test_wm_topics": test_wm,
+        "test_traffic_topic": test_traffic,
+    }
 
-    bl_lane = _collect_lane_messages(baseline_bag, baseline_lane)
-    te_lane = _collect_lane_messages(test_bag, test_lane)
-    bl_wm = _collect_wm_messages(baseline_bag, baseline_wm)
-    te_wm = _collect_wm_messages(test_bag, test_wm)
-    bl_traffic = _collect_traffic_messages(baseline_bag, baseline_traffic)
-    te_traffic = _collect_traffic_messages(test_bag, test_traffic)
+
+def _get_compare_ref_and_topic_lists(
+    baseline_bag: Path,
+    test_bag: Path,
+    progress_prefix: str | None = None,
+) -> tuple[dict, dict, dict]:
+    """Lightweight: read only ref topic from each bag. Returns (bl_ref_by, te_ref_by, topic_lists). progress_prefix で進捗バー表示。"""
+    topic_lists = _get_compare_topic_lists(baseline_bag, test_bag)
+    ref_b = topic_lists["baseline_wm_topics"][0]
+    ref_t = topic_lists["test_wm_topics"][0]
+    load_tick = None
+    if progress_prefix:
+        load_total = _get_bag_message_count(baseline_bag, [ref_b]) + _get_bag_message_count(test_bag, [ref_t])
+        load_done = [0]
+        load_state = {"last_percent": -1}
+        if load_total > 0:
+            _print_progress_line(progress_prefix, 0, load_total, load_state)
+
+            def load_tick():
+                load_done[0] += 1
+                _print_progress_line(progress_prefix, load_done[0], load_total, load_state)
+
+    bl_ref_by = _collect_ref_topic_by_stamp(baseline_bag, ref_b, progress_callback=load_tick)
+    te_ref_by = _collect_ref_topic_by_stamp(test_bag, ref_t, progress_callback=load_tick)
+    return bl_ref_by, te_ref_by, topic_lists
+
+
+def _build_compare_raw_cache_for_stamps(
+    baseline_bag: Path,
+    test_bag: Path,
+    stamp_list: list[int],
+    topic_lists: dict,
+    progress_prefix: str | None = None,
+) -> dict:
+    """Build raw cache (by_stamp) only for the given stamps. 各 bag を 1 回だけ走査してチャンク分だけ保持。progress_prefix を渡すと読み込み中に進捗バーを表示。"""
+    stamp_set = set(stamp_list)
+    if not stamp_set:
+        return {**topic_lists, "bl_wm_by": {}, "te_wm_by": {}, "bl_lane_by": {}, "te_lane_by": {}, "bl_traffic_by": {}, "te_traffic_by": {}}
+    baseline_lane = topic_lists["baseline_lane_topics"]
+    baseline_wm = topic_lists["baseline_wm_topics"]
+    baseline_traffic = topic_lists["baseline_traffic_topic"]
+    test_lane = topic_lists["test_lane_topics"]
+    test_wm = topic_lists["test_wm_topics"]
+    test_traffic = topic_lists["test_traffic_topic"]
+
+    load_tick = None
+    if progress_prefix:
+        baseline_topics = list(baseline_lane) + list(baseline_wm) + [baseline_traffic]
+        test_topics = list(test_lane) + list(test_wm) + [test_traffic]
+        load_total = _get_bag_message_count(baseline_bag, baseline_topics) + _get_bag_message_count(test_bag, test_topics)
+        load_done = [0]
+        load_state = {"last_percent": -1}
+        if load_total > 0:
+            def load_tick():
+                load_done[0] += 1
+                _print_progress_line(progress_prefix, load_done[0], load_total, load_state)
+
+    bl_lane, bl_wm, bl_traffic = _collect_all_compare_messages_for_stamps(
+        baseline_bag, baseline_lane, baseline_wm, baseline_traffic, stamp_set,
+        progress_callback=load_tick,
+    )
+    te_lane, te_wm, te_traffic = _collect_all_compare_messages_for_stamps(
+        test_bag, test_lane, test_wm, test_traffic, stamp_set,
+        progress_callback=load_tick,
+    )
 
     bl_wm_by = {topic: _list_by_stamp(bl_wm.get(topic, [])) for topic in baseline_wm}
     te_wm_by = {topic: _list_by_stamp(te_wm.get(topic, [])) for topic in test_wm}
@@ -468,52 +674,6 @@ def _build_compare_scene_cache(baseline_bag: Path, test_bag: Path) -> dict:
     te_lane_by = {topic: _list_by_stamp(te_lane.get(topic, [])) for topic in test_lane}
     bl_traffic_by = _list_by_stamp(bl_traffic)
     te_traffic_by = _list_by_stamp(te_traffic)
-
-    wm_features = {"baseline": {}, "test": {}}
-    for side_name, topics, by_topic in (
-        ("baseline", baseline_wm, bl_wm_by),
-        ("test", test_wm, te_wm_by),
-    ):
-        for topic in topics:
-            source = _wm_source_from_topic(topic)
-            topic_map = {}
-            for stamp, (t, msg) in by_topic.get(topic, {}).items():
-                topic_map[stamp] = {
-                    "t": t,
-                    "msg": msg,
-                    "source": source,
-                    "object_ids_with_path": _object_ids_with_path(msg),
-                    "object_ids_all": _object_ids_all(msg),
-                    "objects_by_id": _objects_by_id(msg),
-                    "path_entries_by_id": _object_path_entries_by_id(msg),
-                    "trajectory_counters_by_id": _object_trajectory_counters_by_id(msg),
-                    "vsl_pose_counter": _vsl_pose_counter(msg),
-                }
-            wm_features[side_name][topic] = topic_map
-
-    lane_features = {"baseline": {}, "test": {}}
-    for side_name, topics, by_topic in (
-        ("baseline", baseline_lane, bl_lane_by),
-        ("test", test_lane, te_lane_by),
-    ):
-        for topic in topics:
-            topic_map = {}
-            for stamp, (t, msg) in by_topic.get(topic, {}).items():
-                topic_map[stamp] = {
-                    "t": t,
-                    "msg": msg,
-                    "curves": _lane_curves_as_set(msg),
-                }
-            lane_features[side_name][topic] = topic_map
-
-    traffic_features = {"baseline": {}, "test": {}}
-    for side_name, by_stamp in (("baseline", bl_traffic_by), ("test", te_traffic_by)):
-        for stamp, (t, msg) in by_stamp.items():
-            traffic_features[side_name][stamp] = {
-                "t": t,
-                "msg": msg,
-                "signature": _traffic_state_signature(msg),
-            }
 
     return {
         "baseline_lane_topics": baseline_lane,
@@ -528,10 +688,164 @@ def _build_compare_scene_cache(baseline_bag: Path, test_bag: Path) -> dict:
         "te_lane_by": te_lane_by,
         "bl_traffic_by": bl_traffic_by,
         "te_traffic_by": te_traffic_by,
+    }
+
+
+def _build_compare_scene_raw_cache(
+    baseline_bag: Path,
+    test_bag: Path,
+    progress_prefix: str | None = None,
+) -> dict:
+    """Build compare cache with by_stamp data only (no wm_features/lane_features/traffic_features). Used for chunked processing."""
+    baseline_use_ns = _bag_has_namespaced(baseline_bag, VALIDATION_BASELINE_NS)
+    test_use_ns = _bag_has_namespaced(test_bag, VALIDATION_TEST_NS)
+    baseline_lane = [f"{VALIDATION_BASELINE_NS}{t}" for t in LANE_TOPICS] if baseline_use_ns else list(LANE_TOPICS)
+    baseline_wm = [f"{VALIDATION_BASELINE_NS}{t}" for t in WM_TOPICS] if baseline_use_ns else list(WM_TOPICS)
+    baseline_traffic = f"{VALIDATION_BASELINE_NS}{TRAFFIC_TOPIC}" if baseline_use_ns else TRAFFIC_TOPIC
+    test_lane = [f"{VALIDATION_TEST_NS}{t}" for t in LANE_TOPICS] if test_use_ns else list(LANE_TOPICS)
+    test_wm = [f"{VALIDATION_TEST_NS}{t}" for t in WM_TOPICS] if test_use_ns else list(WM_TOPICS)
+    test_traffic = f"{VALIDATION_TEST_NS}{TRAFFIC_TOPIC}" if test_use_ns else TRAFFIC_TOPIC
+
+    load_total = 0
+    load_done = [0]
+    load_state = {"last_percent": -1}
+
+    if progress_prefix:
+        load_total = (
+            _get_bag_message_count(baseline_bag, baseline_lane)
+            + _get_bag_message_count(baseline_bag, baseline_wm)
+            + _get_bag_message_count(baseline_bag, [baseline_traffic])
+            + _get_bag_message_count(test_bag, test_lane)
+            + _get_bag_message_count(test_bag, test_wm)
+            + _get_bag_message_count(test_bag, [test_traffic])
+        )
+        if load_total <= 0:
+            print(f"{progress_prefix}...", file=sys.stderr, flush=True)
+
+    def _tick_load():
+        if progress_prefix and load_total > 0:
+            load_done[0] += 1
+            _print_progress_line(progress_prefix, load_done[0], load_total, load_state)
+
+    bl_lane = _collect_lane_messages(baseline_bag, baseline_lane, progress_callback=_tick_load if progress_prefix else None)
+    te_lane = _collect_lane_messages(test_bag, test_lane, progress_callback=_tick_load if progress_prefix else None)
+    bl_wm = _collect_wm_messages(baseline_bag, baseline_wm, progress_callback=_tick_load if progress_prefix else None)
+    te_wm = _collect_wm_messages(test_bag, test_wm, progress_callback=_tick_load if progress_prefix else None)
+    bl_traffic = _collect_traffic_messages(baseline_bag, baseline_traffic, progress_callback=_tick_load if progress_prefix else None)
+    te_traffic = _collect_traffic_messages(test_bag, test_traffic, progress_callback=_tick_load if progress_prefix else None)
+
+    bl_wm_by = {topic: _list_by_stamp(bl_wm.get(topic, [])) for topic in baseline_wm}
+    te_wm_by = {topic: _list_by_stamp(te_wm.get(topic, [])) for topic in test_wm}
+    bl_lane_by = {topic: _list_by_stamp(bl_lane.get(topic, [])) for topic in baseline_lane}
+    te_lane_by = {topic: _list_by_stamp(te_lane.get(topic, [])) for topic in test_lane}
+    bl_traffic_by = _list_by_stamp(bl_traffic)
+    te_traffic_by = _list_by_stamp(te_traffic)
+
+    return {
+        "baseline_lane_topics": baseline_lane,
+        "baseline_wm_topics": baseline_wm,
+        "baseline_traffic_topic": baseline_traffic,
+        "test_lane_topics": test_lane,
+        "test_wm_topics": test_wm,
+        "test_traffic_topic": test_traffic,
+        "bl_wm_by": bl_wm_by,
+        "te_wm_by": te_wm_by,
+        "bl_lane_by": bl_lane_by,
+        "te_lane_by": te_lane_by,
+        "bl_traffic_by": bl_traffic_by,
+        "te_traffic_by": te_traffic_by,
+    }
+
+
+def _build_compare_chunk_cache(raw_cache: dict, chunk_stamps: list[int], progress_callback=None) -> dict:
+    """Build wm_features, lane_features, traffic_features only for chunk_stamps. progress_callback() で進捗を通知可能。"""
+    baseline_wm = raw_cache["baseline_wm_topics"]
+    test_wm = raw_cache["test_wm_topics"]
+    baseline_lane = raw_cache["baseline_lane_topics"]
+    test_lane = raw_cache["test_lane_topics"]
+    bl_wm_by = raw_cache["bl_wm_by"]
+    te_wm_by = raw_cache["te_wm_by"]
+    bl_lane_by = raw_cache["bl_lane_by"]
+    te_lane_by = raw_cache["te_lane_by"]
+    bl_traffic_by = raw_cache["bl_traffic_by"]
+    te_traffic_by = raw_cache["te_traffic_by"]
+    chunk_set = set(chunk_stamps)
+
+    wm_features = {"baseline": {}, "test": {}}
+    for side_name, topics, by_topic in (
+        ("baseline", baseline_wm, bl_wm_by),
+        ("test", test_wm, te_wm_by),
+    ):
+        for topic in topics:
+            source = _wm_source_from_topic(topic)
+            topic_map = {}
+            for stamp, (t, msg) in by_topic.get(topic, {}).items():
+                if stamp not in chunk_set:
+                    continue
+                feats = _wm_features_single_pass(msg)
+                topic_map[stamp] = {
+                    "t": t,
+                    "msg": msg,
+                    "source": source,
+                    **feats,
+                }
+                if progress_callback:
+                    progress_callback()
+            wm_features[side_name][topic] = topic_map
+
+    lane_features = {"baseline": {}, "test": {}}
+    for side_name, topics, by_topic in (
+        ("baseline", baseline_lane, bl_lane_by),
+        ("test", test_lane, te_lane_by),
+    ):
+        for topic in topics:
+            topic_map = {}
+            for stamp, (t, msg) in by_topic.get(topic, {}).items():
+                if stamp not in chunk_set:
+                    continue
+                topic_map[stamp] = {
+                    "t": t,
+                    "msg": msg,
+                    "curves": _lane_curves_as_set(msg),
+                }
+                if progress_callback:
+                    progress_callback()
+            lane_features[side_name][topic] = topic_map
+
+    traffic_features = {"baseline": {}, "test": {}}
+    for stamp in chunk_stamps:
+        if stamp in bl_traffic_by:
+            t, msg = bl_traffic_by[stamp]
+            traffic_features["baseline"][stamp] = {
+                "t": t,
+                "msg": msg,
+                "signature": _traffic_state_signature(msg),
+            }
+        if stamp in te_traffic_by:
+            t, msg = te_traffic_by[stamp]
+            traffic_features["test"][stamp] = {
+                "t": t,
+                "msg": msg,
+                "signature": _traffic_state_signature(msg),
+            }
+        if progress_callback:
+            progress_callback()
+
+    return {
+        **raw_cache,
         "wm_features": wm_features,
         "lane_features": lane_features,
         "traffic_features": traffic_features,
     }
+
+
+def _build_compare_scene_cache(baseline_bag: Path, test_bag: Path) -> dict:
+    """Build full compare cache (raw + features for all common stamps). For backward compatibility when full cache is needed."""
+    raw = _build_compare_scene_raw_cache(baseline_bag, test_bag)
+    ref_b = raw["bl_wm_by"].get(raw["baseline_wm_topics"][0], {})
+    ref_t = raw["te_wm_by"].get(raw["test_wm_topics"][0], {})
+    common_stamps = sorted(set(ref_b.keys()) & set(ref_t.keys()))
+    return _build_compare_chunk_cache(raw, common_stamps)
 
 
 def _empty_compare_diff_plan(cache: dict, common_stamps_sorted: list[int]) -> dict:
@@ -571,19 +885,31 @@ def _build_diff_plan_from_cache(cache: dict) -> dict:
     for topic_b, topic_t in zip(baseline_lane, test_lane):
         bl_by = lane_features["baseline"].get(topic_b, {})
         te_by = lane_features["test"].get(topic_t, {})
+        dp_lc = diff_plan["lane_common"][topic_b]
+        dp_lb = diff_plan["lane_diff_b"][topic_b]
+        dp_lt = diff_plan["lane_diff_t"][topic_t]
         for stamp in common_stamps_sorted:
             if stamp not in bl_by or stamp not in te_by:
                 continue
             bl_curves = bl_by[stamp]["curves"]
             te_curves = te_by[stamp]["curves"]
-            diff_plan["lane_common"][topic_b][stamp] = bl_curves & te_curves
-            diff_plan["lane_diff_b"][topic_b][stamp] = bl_curves - te_curves
-            diff_plan["lane_diff_t"][topic_t][stamp] = te_curves - bl_curves
+            dp_lc[stamp] = bl_curves & te_curves
+            dp_lb[stamp] = bl_curves - te_curves
+            dp_lt[stamp] = te_curves - bl_curves
 
     for topic_b, topic_t in zip(baseline_wm, test_wm):
         source = _wm_source_from_topic(topic_b) or _wm_source_from_topic(topic_t)
         bl_by = wm_features["baseline"].get(topic_b, {})
         te_by = wm_features["test"].get(topic_t, {})
+        dp_co = diff_plan["wm_common_obj"][topic_b]
+        dp_ctk = diff_plan["wm_common_traj_keep"][topic_b]
+        dp_cvk = diff_plan["wm_common_vsl_keep"][topic_b]
+        dp_db = diff_plan["wm_diff_b"][topic_b]
+        dp_dt = diff_plan["wm_diff_t"][topic_t]
+        dp_dbtk = diff_plan["wm_diff_b_traj_keep"][topic_b]
+        dp_dttk = diff_plan["wm_diff_t_traj_keep"][topic_t]
+        dp_dbvk = diff_plan["wm_diff_b_vsl_keep"][topic_b]
+        dp_dtvk = diff_plan["wm_diff_t_vsl_keep"][topic_t]
         for stamp in common_stamps_sorted:
             if stamp not in bl_by or stamp not in te_by:
                 continue
@@ -596,15 +922,15 @@ def _build_diff_plan_from_cache(cache: dict) -> dict:
                 ids_b = feat_b["object_ids_with_path"]
                 ids_t = feat_t["object_ids_with_path"]
             common_ids = ids_b & ids_t
-            diff_plan["wm_common_obj"][topic_b][stamp] = set()
-            diff_plan["wm_common_traj_keep"][topic_b][stamp] = {}
-            diff_plan["wm_common_vsl_keep"][topic_b][stamp] = Counter()
-            diff_plan["wm_diff_b"][topic_b][stamp] = ids_b - ids_t
-            diff_plan["wm_diff_t"][topic_t][stamp] = ids_t - ids_b
-            diff_plan["wm_diff_b_traj_keep"][topic_b][stamp] = {}
-            diff_plan["wm_diff_t_traj_keep"][topic_t][stamp] = {}
-            diff_plan["wm_diff_b_vsl_keep"][topic_b][stamp] = Counter()
-            diff_plan["wm_diff_t_vsl_keep"][topic_t][stamp] = Counter()
+            dp_co[stamp] = set()
+            dp_ctk[stamp] = {}
+            dp_cvk[stamp] = Counter()
+            dp_db[stamp] = ids_b - ids_t
+            dp_dt[stamp] = ids_t - ids_b
+            dp_dbtk[stamp] = {}
+            dp_dttk[stamp] = {}
+            dp_dbvk[stamp] = Counter()
+            dp_dtvk[stamp] = Counter()
 
             b_map = feat_b["objects_by_id"]
             t_map = feat_t["objects_by_id"]
@@ -614,27 +940,27 @@ def _build_diff_plan_from_cache(cache: dict) -> dict:
                 b_counter = feat_b["trajectory_counters_by_id"].get(oid, Counter())
                 t_counter = feat_t["trajectory_counters_by_id"].get(oid, Counter())
                 if not b_counter and not t_counter:
-                    diff_plan["wm_common_obj"][topic_b][stamp].add(oid)
+                    dp_co[stamp].add(oid)
                     continue
                 common_counter = b_counter & t_counter
                 b_only_counter = b_counter - t_counter
                 t_only_counter = t_counter - b_counter
                 if b_only_counter or t_only_counter:
                     if b_only_counter:
-                        diff_plan["wm_diff_b_traj_keep"][topic_b][stamp][oid] = b_only_counter
+                        dp_dbtk[stamp][oid] = b_only_counter
                     if t_only_counter:
-                        diff_plan["wm_diff_t_traj_keep"][topic_t][stamp][oid] = t_only_counter
+                        dp_dttk[stamp][oid] = t_only_counter
                     if common_counter:
-                        diff_plan["wm_common_traj_keep"][topic_b][stamp][oid] = common_counter
+                        dp_ctk[stamp][oid] = common_counter
                 else:
-                    diff_plan["wm_common_obj"][topic_b][stamp].add(oid)
+                    dp_co[stamp].add(oid)
 
             if source in VSL_SOURCES:
                 b_vsl_counter = feat_b["vsl_pose_counter"]
                 t_vsl_counter = feat_t["vsl_pose_counter"]
-                diff_plan["wm_common_vsl_keep"][topic_b][stamp] = b_vsl_counter & t_vsl_counter
-                diff_plan["wm_diff_b_vsl_keep"][topic_b][stamp] = b_vsl_counter - t_vsl_counter
-                diff_plan["wm_diff_t_vsl_keep"][topic_t][stamp] = t_vsl_counter - b_vsl_counter
+                dp_cvk[stamp] = b_vsl_counter & t_vsl_counter
+                dp_dbvk[stamp] = b_vsl_counter - t_vsl_counter
+                dp_dtvk[stamp] = t_vsl_counter - b_vsl_counter
 
     return diff_plan
 
@@ -739,7 +1065,10 @@ def compare_one(
 ) -> dict:
     """Run all four checks for one directory. Returns result dict."""
     result = _empty_direct_compare_result(rel)
-    scene_timing = build_scene_timing(input_bags or [])
+    scene_timing = build_scene_timing(
+        input_bags or [],
+        progress_prefix=f"[compare] {rel} scene timing" if input_bags else None,
+    )
     result["scene_timing"] = scene_timing
     result["subscenes"] = [
         _make_subscene_compare_entry(sub)
@@ -775,35 +1104,61 @@ def compare_one(
         result["lane_ids_detail"] = f"test bag missing: {test_bag}"
         return result
 
-    cache = scene_cache or _build_compare_scene_cache(baseline_bag, test_bag)
-    baseline_lane = cache["baseline_lane_topics"]
-    baseline_wm = cache["baseline_wm_topics"]
-    baseline_traffic = cache["baseline_traffic_topic"]
-    test_lane = cache["test_lane_topics"]
-    test_wm = cache["test_wm_topics"]
-    test_traffic = cache["test_traffic_topic"]
-    bl_wm_by = cache["bl_wm_by"]
-    te_wm_by = cache["te_wm_by"]
-    bl_lane_by = cache["bl_lane_by"]
-    te_lane_by = cache["te_lane_by"]
-    bl_traffic_by = cache["bl_traffic_by"]
-    te_traffic_by = cache["te_traffic_by"]
-    wm_features = cache["wm_features"]
-    lane_features = cache["lane_features"]
-    traffic_features = cache["traffic_features"]
+    use_full_cache = scene_cache is not None and "wm_features" in scene_cache
+    use_stamp_chunked_read = scene_cache is None
 
-    ref_topic_b = baseline_wm[0]
-    ref_topic_t = test_wm[0]
-    bl_ref_by = bl_wm_by[ref_topic_b]
-    te_ref_by = te_wm_by[ref_topic_t]
-    bl_ref_stamps = {
-        stamp for stamp, bag_ref in bl_ref_by.items()
-        if is_stamp_in_evaluation_range(_to_nsec(bag_ref[0]), scene_timing)
-    }
-    te_ref_stamps = {
-        stamp for stamp, bag_ref in te_ref_by.items()
-        if is_stamp_in_evaluation_range(_to_nsec(bag_ref[0]), scene_timing)
-    }
+    if use_stamp_chunked_read:
+        # スタンプ単位チャンク読み: 全 bag をメモリに載せない。ref トピックのみ読んで common_stamps を取得し、チャンクごとに bag からそのスタンプ分だけ読む。
+        bl_ref_by, te_ref_by, topic_lists = _get_compare_ref_and_topic_lists(
+            baseline_bag, test_bag, progress_prefix=f"[compare] {rel} ref topics"
+        )
+        baseline_lane = topic_lists["baseline_lane_topics"]
+        baseline_wm = topic_lists["baseline_wm_topics"]
+        baseline_traffic = topic_lists["baseline_traffic_topic"]
+        test_lane = topic_lists["test_lane_topics"]
+        test_wm = topic_lists["test_wm_topics"]
+        test_traffic = topic_lists["test_traffic_topic"]
+        bl_ref_stamps = {
+            stamp for stamp in bl_ref_by
+            if is_stamp_in_evaluation_range(_to_nsec(bl_ref_by[stamp][0]), scene_timing)
+        }
+        te_ref_stamps = {
+            stamp for stamp in te_ref_by
+            if is_stamp_in_evaluation_range(_to_nsec(te_ref_by[stamp][0]), scene_timing)
+        }
+        cache = None
+        raw_cache = None
+    else:
+        cache = scene_cache if use_full_cache else scene_cache
+        raw_cache = None if use_full_cache else scene_cache
+        baseline_lane = cache["baseline_lane_topics"]
+        baseline_wm = cache["baseline_wm_topics"]
+        baseline_traffic = cache["baseline_traffic_topic"]
+        test_lane = cache["test_lane_topics"]
+        test_wm = cache["test_wm_topics"]
+        test_traffic = cache["test_traffic_topic"]
+        bl_wm_by = cache["bl_wm_by"]
+        te_wm_by = cache["te_wm_by"]
+        ref_topic_b = baseline_wm[0]
+        ref_topic_t = test_wm[0]
+        bl_ref_by = bl_wm_by[ref_topic_b]
+        te_ref_by = te_wm_by[ref_topic_t]
+        bl_ref_stamps = {
+            stamp for stamp, bag_ref in bl_ref_by.items()
+            if is_stamp_in_evaluation_range(_to_nsec(bag_ref[0]), scene_timing)
+        }
+        te_ref_stamps = {
+            stamp for stamp, bag_ref in te_ref_by.items()
+            if is_stamp_in_evaluation_range(_to_nsec(bag_ref[0]), scene_timing)
+        }
+
+    if not use_stamp_chunked_read:
+        bl_wm_by = cache["bl_wm_by"]
+        te_wm_by = cache["te_wm_by"]
+        bl_lane_by = cache["bl_lane_by"]
+        te_lane_by = cache["te_lane_by"]
+        bl_traffic_by = cache["bl_traffic_by"]
+        te_traffic_by = cache["te_traffic_by"]
     common_ref_stamps = bl_ref_stamps & te_ref_stamps
     only_baseline_stamps = sorted(bl_ref_stamps - te_ref_stamps)
     only_test_stamps = sorted(te_ref_stamps - bl_ref_stamps)
@@ -814,8 +1169,12 @@ def compare_one(
     result["record_stamps_only_test_count"] = len(only_test_stamps)
     result["record_stamps_only_baseline"] = only_baseline_stamps[:100]
     result["record_stamps_only_test"] = only_test_stamps[:100]
-    result["record_baseline_topic_counts"] = {t: len(bl_wm_by.get(t, {})) for t in baseline_wm}
-    result["record_test_topic_counts"] = {t: len(te_wm_by.get(t, {})) for t in test_wm}
+    if use_stamp_chunked_read:
+        result["record_baseline_topic_counts"] = {t: 0 for t in baseline_wm}
+        result["record_test_topic_counts"] = {t: 0 for t in test_wm}
+    else:
+        result["record_baseline_topic_counts"] = {t: len(bl_wm_by.get(t, {})) for t in baseline_wm}
+        result["record_test_topic_counts"] = {t: len(te_wm_by.get(t, {})) for t in test_wm}
     # 全体 = publish 発火回数（記録メッセージ数）。入力 /clock が取れない場合は ref トピックのメッセージ数を使う
     total_from_input = _count_clock_in_bags(input_bags, scene_timing=scene_timing) if input_bags else None
     msg_count_ref = max(len(bl_ref_stamps), len(te_ref_stamps))
@@ -846,27 +1205,41 @@ def compare_one(
 
     # 比較は「共通スタンプ」のみ。lane/WM/traffic ともこのスタンプ集合で揃える（別トピックの stamp で別フレームを比較しない）
     common_sorted = sorted(common_ref_stamps)
-    diff_plan = _empty_compare_diff_plan(cache, common_sorted)
+    diff_plan = _empty_compare_diff_plan(topic_lists if use_stamp_chunked_read else cache, common_sorted)
     lane_steps_total = len(common_sorted) * len(baseline_lane)
     wm_steps_total = len(common_sorted) * len(baseline_wm)
     traffic_steps_total = len(common_sorted)
     compare_steps_total = lane_steps_total + wm_steps_total + traffic_steps_total
     compare_steps_done = 0
     compare_progress_state = {"last_percent": -1}
+    stamps_chunks = [common_sorted] if use_full_cache else list(_iter_stamp_chunks(common_sorted))
+    n_chunks = len(stamps_chunks)
+    chunk_progress = {"done": 0, "total": 0, "idx": 0, "n": n_chunks}
+    chunk_progress_state = {"last_percent": -1}
 
     def _tick_compare_progress() -> None:
         nonlocal compare_steps_done
         if compare_steps_total <= 0:
             return
         compare_steps_done += 1
-        _print_progress_line(
-            f"[compare] {rel} progress",
-            compare_steps_done,
-            compare_steps_total,
-            compare_progress_state,
-        )
+        if n_chunks > 1 and chunk_progress["total"] > 0:
+            chunk_progress["done"] += 1
+            overall_pct = int((compare_steps_done * 100) / compare_steps_total)
+            _print_progress_line(
+                f"[compare] {rel} chunk {chunk_progress['idx']}/{chunk_progress['n']} (overall {overall_pct}%)",
+                chunk_progress["done"],
+                chunk_progress["total"],
+                chunk_progress_state,
+            )
+        else:
+            _print_progress_line(
+                f"[compare] {rel} progress",
+                compare_steps_done,
+                compare_steps_total,
+                compare_progress_state,
+            )
 
-    if compare_steps_total > 0:
+    if compare_steps_total > 0 and n_chunks <= 1:
         _print_progress_line(
             f"[compare] {rel} progress",
             0,
@@ -874,37 +1247,7 @@ def compare_one(
             compare_progress_state,
         )
 
-    # ① Lane IDs: 共通スタンプのときだけ両方にあれば比較
     lane_ok = True
-    for topic_b, topic_t in zip(baseline_lane, test_lane):
-        source = _lane_source_from_topic(topic_b) or _lane_source_from_topic(topic_t)
-        bl_by = lane_features["baseline"].get(topic_b, {})
-        te_by = lane_features["test"].get(topic_t, {})
-        for stamp in common_sorted:
-            if stamp not in bl_by or stamp not in te_by:
-                _tick_compare_progress()
-                continue
-            bl_curves = bl_by[stamp]["curves"]
-            te_curves = te_by[stamp]["curves"]
-            diff_plan["lane_common"][topic_b][stamp] = bl_curves & te_curves
-            diff_plan["lane_diff_b"][topic_b][stamp] = bl_curves - te_curves
-            diff_plan["lane_diff_t"][topic_t][stamp] = te_curves - bl_curves
-            if bl_curves != te_curves:
-                result["lane_ids_detail"] += f"{topic_b} at stamp {stamp} curve set differs. "
-                lane_ok = False
-                if source in LANE_SOURCES:
-                    result["diff_by_source"]["lane"][source] = True
-                    result["diff_counts_by_source"]["lane"][source] += 1
-                    sub = _subscene_entry_for_stamp(stamp)
-                    if sub is not None:
-                        sub["lane_ids_ok"] = False
-                        sub["diff_by_source"]["lane"][source] = True
-                        sub["diff_counts_by_source"]["lane"][source] += 1
-            _tick_compare_progress()
-    result["lane_ids_ok"] = lane_ok
-    if not result["lane_ids_detail"]:
-        result["lane_ids_detail"] = "Unchanged"
-
     obj_ids_union_b = {k: set() for k in OBJECT_PATH_SOURCES}
     obj_ids_union_t = {k: set() for k in OBJECT_PATH_SOURCES}
     subscene_obj_ids_union_b = [{k: set() for k in OBJECT_PATH_SOURCES} for _ in result["subscenes"]]
@@ -913,111 +1256,211 @@ def compare_one(
     path_ok = True
     traffic_ok = True
 
-    # ② ③ ④ WM: 共通スタンプのときだけ比較
-    for topic_b, topic_t in zip(baseline_wm, test_wm):
-        source = _wm_source_from_topic(topic_b) or _wm_source_from_topic(topic_t)
-        bl_by = wm_features["baseline"].get(topic_b, {})
-        te_by = wm_features["test"].get(topic_t, {})
-        for stamp in common_sorted:
-            if stamp not in bl_by or stamp not in te_by:
-                _tick_compare_progress()
-                continue
-            feat_b = bl_by[stamp]
-            feat_t = te_by[stamp]
-            ids_b = feat_b["object_ids_with_path"]
-            ids_t = feat_t["object_ids_with_path"]
-            ids_all_b = feat_b["object_ids_all"]
-            ids_all_t = feat_t["object_ids_all"]
-            if source == "base":
-                diff_ids_b = ids_all_b
-                diff_ids_t = ids_all_t
-            else:
-                diff_ids_b = ids_b
-                diff_ids_t = ids_t
-            common_ids = diff_ids_b & diff_ids_t
-            diff_plan["wm_common_obj"][topic_b][stamp] = set()
-            diff_plan["wm_common_traj_keep"][topic_b][stamp] = {}
-            diff_plan["wm_common_vsl_keep"][topic_b][stamp] = Counter()
-            diff_plan["wm_diff_b"][topic_b][stamp] = diff_ids_b - diff_ids_t
-            diff_plan["wm_diff_t"][topic_t][stamp] = diff_ids_t - diff_ids_b
-            diff_plan["wm_diff_b_traj_keep"][topic_b][stamp] = {}
-            diff_plan["wm_diff_t_traj_keep"][topic_t][stamp] = {}
-            diff_plan["wm_diff_b_vsl_keep"][topic_b][stamp] = Counter()
-            diff_plan["wm_diff_t_vsl_keep"][topic_t][stamp] = Counter()
-            if source in OBJECT_PATH_SOURCES:
-                obj_ids_union_b[source] |= ids_b
-                obj_ids_union_t[source] |= ids_t
-                sub_idx = find_subscene_index(stamp, scene_timing)
-                if sub_idx is not None and 0 <= sub_idx < len(result["subscenes"]):
-                    subscene_obj_ids_union_b[sub_idx][source] |= ids_b
-                    subscene_obj_ids_union_t[sub_idx][source] |= ids_t
-                if ids_b != ids_t:
-                    result["diff_by_source"]["object_ids"][source] = True
-                    result["diff_counts_by_source"]["object_ids"][source] += 1
-                    result["object_ids_detail"] += (
-                        f"{topic_b} object ID set differs (stamp={stamp}). "
-                    )
-                    sub = _subscene_entry_for_stamp(stamp)
-                    if sub is not None:
-                        sub["object_ids_ok"] = False
-                        sub["diff_by_source"]["object_ids"][source] = True
-                        sub["diff_counts_by_source"]["object_ids"][source] += 1
-            vb = feat_b["vsl_pose_counter"]
-            vt = feat_t["vsl_pose_counter"]
-            if source in VSL_SOURCES:
-                if vb != vt:
-                    result["vsl_detail"] += f"{topic_b} VSL pose set differs (stamp={stamp}). "
-                    vsl_ok = False
-                    result["diff_by_source"]["vsl"][source] = True
-                    result["diff_counts_by_source"]["vsl"][source] += 1
-                    sub = _subscene_entry_for_stamp(stamp)
-                    if sub is not None:
-                        sub["vsl_ok"] = False
-                        sub["diff_by_source"]["vsl"][source] = True
-                        sub["diff_counts_by_source"]["vsl"][source] += 1
-                diff_plan["wm_common_vsl_keep"][topic_b][stamp] = vb & vt
-                diff_plan["wm_diff_b_vsl_keep"][topic_b][stamp] = vb - vt
-                diff_plan["wm_diff_t_vsl_keep"][topic_t][stamp] = vt - vb
-            tb = feat_b["trajectory_counters_by_id"]
-            tt = feat_t["trajectory_counters_by_id"]
-            for oid in common_ids:
-                if oid not in feat_b["objects_by_id"] or oid not in feat_t["objects_by_id"]:
-                    continue
-                b_counter = tb.get(oid, Counter())
-                t_counter = tt.get(oid, Counter())
-                if not b_counter and not t_counter:
-                    diff_plan["wm_common_obj"][topic_b][stamp].add(oid)
-                    continue
-                common_counter = b_counter & t_counter
-                b_only_counter = b_counter - t_counter
-                t_only_counter = t_counter - b_counter
-                if b_only_counter or t_only_counter:
-                    if b_only_counter:
-                        diff_plan["wm_diff_b_traj_keep"][topic_b][stamp][oid] = b_only_counter
-                    if t_only_counter:
-                        diff_plan["wm_diff_t_traj_keep"][topic_t][stamp][oid] = t_only_counter
-                    if common_counter:
-                        diff_plan["wm_common_traj_keep"][topic_b][stamp][oid] = common_counter
-                else:
-                    diff_plan["wm_common_obj"][topic_b][stamp].add(oid)
-            if source in PATH_COMPARE_SOURCES:
-                for oid in set(tb) | set(tt):
-                    # object ごとに path 集合（順不同）を比較。
-                    # 各 path 内の点順序は signature に保持されるため順序一致必須。
-                    if tb.get(oid, Counter()) != tt.get(oid, Counter()):
-                        result["path_and_traffic_detail"] += (
-                            f"{topic_b} object {oid} path set differs (stamp={stamp}). "
+    for chunk_idx, stamps_chunk in enumerate(stamps_chunks, start=1):
+        if n_chunks > 1:
+            chunk_steps = len(stamps_chunk) * (len(baseline_lane) + len(baseline_wm) + 1)
+            chunk_progress["idx"] = chunk_idx
+            chunk_progress["total"] = chunk_steps
+            chunk_progress["done"] = 0
+            chunk_progress_state["last_percent"] = -1
+        if use_full_cache:
+            feat_cache = cache
+            chunk_raw = None
+        elif use_stamp_chunked_read:
+            load_prefix = f"[compare] {rel} chunk {chunk_idx}/{n_chunks} loading" if n_chunks > 1 else None
+            chunk_raw = _build_compare_raw_cache_for_stamps(
+                baseline_bag, test_bag, stamps_chunk, topic_lists, progress_prefix=load_prefix
+            )
+            build_tick = None
+            if n_chunks > 1:
+                build_total = len(stamps_chunk) * (
+                    len(baseline_wm) + len(test_wm) + len(baseline_lane) + len(test_lane) + 1
+                )
+                build_done = [0]
+                build_state = {"last_percent": -1}
+                if build_total > 0:
+                    def build_tick():
+                        build_done[0] += 1
+                        _print_progress_line(
+                            f"[compare] {rel} chunk {chunk_idx}/{n_chunks} building",
+                            build_done[0],
+                            build_total,
+                            build_state,
                         )
-                        path_ok = False
-                        result["diff_by_source"]["path"][source] = True
-                        result["diff_counts_by_source"]["path"][source] += 1
+            feat_cache = _build_compare_chunk_cache(chunk_raw, stamps_chunk, progress_callback=build_tick)
+        else:
+            chunk_raw = None
+            feat_cache = _build_compare_chunk_cache(raw_cache, stamps_chunk)
+        lane_features = feat_cache["lane_features"]
+        wm_features = feat_cache["wm_features"]
+        traffic_features = feat_cache["traffic_features"]
+
+        # ① Lane IDs: 共通スタンプのときだけ両方にあれば比較
+        for topic_b, topic_t in zip(baseline_lane, test_lane):
+            source = _lane_source_from_topic(topic_b) or _lane_source_from_topic(topic_t)
+            bl_by = lane_features["baseline"].get(topic_b, {})
+            te_by = lane_features["test"].get(topic_t, {})
+            dp_lc = diff_plan["lane_common"][topic_b]
+            dp_lb = diff_plan["lane_diff_b"][topic_b]
+            dp_lt = diff_plan["lane_diff_t"][topic_t]
+            for stamp in stamps_chunk:
+                if stamp not in bl_by or stamp not in te_by:
+                    _tick_compare_progress()
+                    continue
+                bl_curves = bl_by[stamp]["curves"]
+                te_curves = te_by[stamp]["curves"]
+                dp_lc[stamp] = bl_curves & te_curves
+                dp_lb[stamp] = bl_curves - te_curves
+                dp_lt[stamp] = te_curves - bl_curves
+                if bl_curves != te_curves:
+                    result["lane_ids_detail"] += f"{topic_b} at stamp {stamp} curve set differs. "
+                    lane_ok = False
+                    if source in LANE_SOURCES:
+                        result["diff_by_source"]["lane"][source] = True
+                        result["diff_counts_by_source"]["lane"][source] += 1
                         sub = _subscene_entry_for_stamp(stamp)
                         if sub is not None:
-                            sub["path_ok"] = False
-                            sub["diff_by_source"]["path"][source] = True
-                            sub["diff_counts_by_source"]["path"][source] += 1
+                            sub["lane_ids_ok"] = False
+                            sub["diff_by_source"]["lane"][source] = True
+                            sub["diff_counts_by_source"]["lane"][source] += 1
+                _tick_compare_progress()
+
+        # ② ③ ④ WM: 共通スタンプのときだけ比較
+        for topic_b, topic_t in zip(baseline_wm, test_wm):
+            source = _wm_source_from_topic(topic_b) or _wm_source_from_topic(topic_t)
+            bl_by = wm_features["baseline"].get(topic_b, {})
+            te_by = wm_features["test"].get(topic_t, {})
+            dp_co = diff_plan["wm_common_obj"][topic_b]
+            dp_ctk = diff_plan["wm_common_traj_keep"][topic_b]
+            dp_cvk = diff_plan["wm_common_vsl_keep"][topic_b]
+            dp_db = diff_plan["wm_diff_b"][topic_b]
+            dp_dt = diff_plan["wm_diff_t"][topic_t]
+            dp_dbtk = diff_plan["wm_diff_b_traj_keep"][topic_b]
+            dp_dttk = diff_plan["wm_diff_t_traj_keep"][topic_t]
+            dp_dbvk = diff_plan["wm_diff_b_vsl_keep"][topic_b]
+            dp_dtvk = diff_plan["wm_diff_t_vsl_keep"][topic_t]
+            for stamp in stamps_chunk:
+                if stamp not in bl_by or stamp not in te_by:
+                    _tick_compare_progress()
+                    continue
+                feat_b = bl_by[stamp]
+                feat_t = te_by[stamp]
+                ids_b = feat_b["object_ids_with_path"]
+                ids_t = feat_t["object_ids_with_path"]
+                ids_all_b = feat_b["object_ids_all"]
+                ids_all_t = feat_t["object_ids_all"]
+                if source == "base":
+                    diff_ids_b = ids_all_b
+                    diff_ids_t = ids_all_t
+                else:
+                    diff_ids_b = ids_b
+                    diff_ids_t = ids_t
+                common_ids = diff_ids_b & diff_ids_t
+                dp_co[stamp] = set()
+                dp_ctk[stamp] = {}
+                dp_cvk[stamp] = Counter()
+                dp_db[stamp] = diff_ids_b - diff_ids_t
+                dp_dt[stamp] = diff_ids_t - diff_ids_b
+                dp_dbtk[stamp] = {}
+                dp_dttk[stamp] = {}
+                dp_dbvk[stamp] = Counter()
+                dp_dtvk[stamp] = Counter()
+                if source in OBJECT_PATH_SOURCES:
+                    obj_ids_union_b[source] |= ids_b
+                    obj_ids_union_t[source] |= ids_t
+                    sub_idx = find_subscene_index(stamp, scene_timing)
+                    if sub_idx is not None and 0 <= sub_idx < len(result["subscenes"]):
+                        subscene_obj_ids_union_b[sub_idx][source] |= ids_b
+                        subscene_obj_ids_union_t[sub_idx][source] |= ids_t
+                    if ids_b != ids_t:
+                        result["diff_by_source"]["object_ids"][source] = True
+                        result["diff_counts_by_source"]["object_ids"][source] += 1
+                        result["object_ids_detail"] += (
+                            f"{topic_b} object ID set differs (stamp={stamp}). "
+                        )
+                        sub = _subscene_entry_for_stamp(stamp)
+                        if sub is not None:
+                            sub["object_ids_ok"] = False
+                            sub["diff_by_source"]["object_ids"][source] = True
+                            sub["diff_counts_by_source"]["object_ids"][source] += 1
+                vb = feat_b["vsl_pose_counter"]
+                vt = feat_t["vsl_pose_counter"]
+                if source in VSL_SOURCES:
+                    if vb != vt:
+                        result["vsl_detail"] += f"{topic_b} VSL pose set differs (stamp={stamp}). "
+                        vsl_ok = False
+                        result["diff_by_source"]["vsl"][source] = True
+                        result["diff_counts_by_source"]["vsl"][source] += 1
+                        sub = _subscene_entry_for_stamp(stamp)
+                        if sub is not None:
+                            sub["vsl_ok"] = False
+                            sub["diff_by_source"]["vsl"][source] = True
+                            sub["diff_counts_by_source"]["vsl"][source] += 1
+                    dp_cvk[stamp] = vb & vt
+                    dp_dbvk[stamp] = vb - vt
+                    dp_dtvk[stamp] = vt - vb
+                tb = feat_b["trajectory_counters_by_id"]
+                tt = feat_t["trajectory_counters_by_id"]
+                for oid in common_ids:
+                    if oid not in feat_b["objects_by_id"] or oid not in feat_t["objects_by_id"]:
+                        continue
+                    b_counter = tb.get(oid, Counter())
+                    t_counter = tt.get(oid, Counter())
+                    if not b_counter and not t_counter:
+                        dp_co[stamp].add(oid)
+                        continue
+                    common_counter = b_counter & t_counter
+                    b_only_counter = b_counter - t_counter
+                    t_only_counter = t_counter - b_counter
+                    if b_only_counter or t_only_counter:
+                        if b_only_counter:
+                            dp_dbtk[stamp][oid] = b_only_counter
+                        if t_only_counter:
+                            dp_dttk[stamp][oid] = t_only_counter
+                        if common_counter:
+                            dp_ctk[stamp][oid] = common_counter
+                    else:
+                        dp_co[stamp].add(oid)
+                if source in PATH_COMPARE_SOURCES:
+                    for oid in set(tb) | set(tt):
+                        # object ごとに path 集合（順不同）を比較。
+                        # 各 path 内の点順序は signature に保持されるため順序一致必須。
+                        if tb.get(oid, Counter()) != tt.get(oid, Counter()):
+                            result["path_and_traffic_detail"] += (
+                                f"{topic_b} object {oid} path set differs (stamp={stamp}). "
+                            )
+                            path_ok = False
+                            result["diff_by_source"]["path"][source] = True
+                            result["diff_counts_by_source"]["path"][source] += 1
+                            sub = _subscene_entry_for_stamp(stamp)
+                            if sub is not None:
+                                sub["path_ok"] = False
+                                sub["diff_by_source"]["path"][source] = True
+                                sub["diff_counts_by_source"]["path"][source] += 1
+                _tick_compare_progress()
+
+        # Traffic light: 共通スタンプのときだけ両方にあれば比較
+        for stamp in stamps_chunk:
+            if stamp not in traffic_features["baseline"] or stamp not in traffic_features["test"]:
+                _tick_compare_progress()
+                continue
+            if traffic_features["baseline"][stamp]["signature"] != traffic_features["test"][stamp]["signature"]:
+                result["path_and_traffic_detail"] += f"traffic_light_state at stamp {stamp} differs. "
+                traffic_ok = False
+                sub = _subscene_entry_for_stamp(stamp)
+                if sub is not None:
+                    sub["traffic_ok"] = False
             _tick_compare_progress()
 
+        if not use_full_cache:
+            if use_stamp_chunked_read and chunk_raw is not None:
+                del chunk_raw
+            del feat_cache
+            gc.collect()
+
+    result["lane_ids_ok"] = lane_ok
+    if not result["lane_ids_detail"]:
+        result["lane_ids_detail"] = "Unchanged"
     result["object_ids_ok"] = not any(result["diff_by_source"]["object_ids"].values())
     for source in OBJECT_PATH_SOURCES:
         if obj_ids_union_b[source] != obj_ids_union_t[source]:
@@ -1043,18 +1486,6 @@ def compare_one(
     if not result["object_ids_detail"]:
         result["object_ids_detail"] = "Unchanged"
 
-    # Traffic light: 共通スタンプのときだけ両方にあれば比較
-    for stamp in common_sorted:
-        if stamp not in traffic_features["baseline"] or stamp not in traffic_features["test"]:
-            _tick_compare_progress()
-            continue
-        if traffic_features["baseline"][stamp]["signature"] != traffic_features["test"][stamp]["signature"]:
-            result["path_and_traffic_detail"] += f"traffic_light_state at stamp {stamp} differs. "
-            traffic_ok = False
-            sub = _subscene_entry_for_stamp(stamp)
-            if sub is not None:
-                sub["traffic_ok"] = False
-        _tick_compare_progress()
     result["path_ok"] = path_ok
     result["traffic_ok"] = traffic_ok
     result["path_and_traffic_ok"] = path_ok and traffic_ok
@@ -1072,7 +1503,12 @@ def compare_one(
         if not sub.get("path_and_traffic_detail"):
             sub["path_and_traffic_detail"] = "Unchanged"
         _finalize_compare_summary(sub)
-    cache["diff_plan"] = diff_plan
+    if use_stamp_chunked_read:
+        result["_diff_plan"] = diff_plan
+        result["_topic_lists"] = topic_lists
+        result["_common_stamps_sorted"] = common_sorted
+    else:
+        cache["diff_plan"] = diff_plan
     return result
 
 
@@ -1081,8 +1517,11 @@ def _write_diff_bags(
     test_bag: Path,
     out_dir: Path,
     scene_cache: dict | None = None,
+    diff_plan: dict | None = None,
+    topic_lists: dict | None = None,
+    common_stamps_sorted: list | None = None,
 ) -> None:
-    """Write diff_baseline.bag (baseline-only content) and diff_test.bag (test-only content) to out_dir."""
+    """Write compare.bag (common / diff_baseline / diff_test をトピック分離で 1 ファイルにまとめたもの) を out_dir に作成。"""
     if not HAS_ROSBAG:
         print("[compare] diff bags: rosbag が import できません。diff_*.bag は作成されません。"
               " ROS の devel/setup.bash を source してから compare を実行してください。", file=sys.stderr)
@@ -1101,7 +1540,15 @@ def _write_diff_bags(
         return
 
     try:
-        _write_diff_bags_impl(baseline_bag, test_bag, out_dir, scene_cache=scene_cache)
+        _write_diff_bags_impl(
+            baseline_bag,
+            test_bag,
+            out_dir,
+            scene_cache=scene_cache,
+            diff_plan=diff_plan,
+            topic_lists=topic_lists,
+            common_stamps_sorted=common_stamps_sorted,
+        )
     except Exception as e:
         import traceback
         print(f"[compare] diff bags 作成失敗: {e}", file=sys.stderr)
@@ -1109,10 +1556,8 @@ def _write_diff_bags(
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    diff_baseline_path = out_dir / "diff_baseline.bag"
-    diff_test_path = out_dir / "diff_test.bag"
-    common_path = out_dir / "common.bag"
-    print(f"[compare] diff bags: {diff_baseline_path.name}, {diff_test_path.name}, {common_path.name} を作成しました", file=sys.stderr)
+    compare_path = out_dir / "compare.bag"
+    print(f"[compare] compare bag: {compare_path.name} を作成しました", file=sys.stderr)
 
 
 def _write_diff_bags_impl(
@@ -1120,6 +1565,9 @@ def _write_diff_bags_impl(
     test_bag: Path,
     out_dir: Path,
     scene_cache: dict | None = None,
+    diff_plan: dict | None = None,
+    topic_lists: dict | None = None,
+    common_stamps_sorted: list | None = None,
 ) -> None:
     def _open_out_bag(path: Path):
         # Keep chunks small to avoid occasional rosbag chunk header overflow on close.
@@ -1348,47 +1796,89 @@ def _write_diff_bags_impl(
                 diff_progress_state,
             )
 
-    def _tick_diff_progress(step_count: int = 1) -> None:
-        nonlocal diff_progress_done
-        if diff_progress_total <= 0:
-            return
-        diff_progress_done += step_count
-        _print_progress_line(
-            f"[compare] {out_dir.name} diff-bags progress",
-            diff_progress_done,
-            diff_progress_total,
-            diff_progress_state,
-        )
+    use_stamp_chunked_write = (
+        scene_cache is None
+        and diff_plan is not None
+        and topic_lists is not None
+        and common_stamps_sorted is not None
+    )
+    if use_stamp_chunked_write:
+        baseline_wm = topic_lists["baseline_wm_topics"]
+        test_wm = topic_lists["test_wm_topics"]
+        baseline_lane = topic_lists["baseline_lane_topics"]
+        test_lane = topic_lists["test_lane_topics"]
+        baseline_traffic = topic_lists["baseline_traffic_topic"]
+        test_traffic = topic_lists["test_traffic_topic"]
+        common_stamps_sorted = list(common_stamps_sorted)
+        use_raw_chunks = True
+        stamps_chunks = list(_iter_stamp_chunks(common_stamps_sorted))
+        cache = None
+    else:
+        cache = scene_cache or _build_compare_scene_cache(baseline_bag, test_bag)
+        baseline_wm = cache["baseline_wm_topics"]
+        test_wm = cache["test_wm_topics"]
+        baseline_lane = cache["baseline_lane_topics"]
+        test_lane = cache["test_lane_topics"]
+        baseline_traffic = cache["baseline_traffic_topic"]
+        test_traffic = cache["test_traffic_topic"]
+        bl_wm_by = cache["bl_wm_by"]
+        te_wm_by = cache["te_wm_by"]
+        bl_lane_by = cache["bl_lane_by"]
+        te_lane_by = cache["te_lane_by"]
+        bl_traffic_by = cache["bl_traffic_by"]
+        te_traffic_by = cache["te_traffic_by"]
+        diff_plan = cache.get("diff_plan")
+        if diff_plan is None:
+            diff_plan = _build_diff_plan_from_cache(cache)
+            cache["diff_plan"] = diff_plan
+        common_stamps_sorted = list(diff_plan.get("common_stamps_sorted", []))
+        use_raw_chunks = "wm_features" not in cache
+        stamps_chunks = list(_iter_stamp_chunks(common_stamps_sorted)) if use_raw_chunks else [common_stamps_sorted]
 
-    cache = scene_cache or _build_compare_scene_cache(baseline_bag, test_bag)
-    baseline_wm = cache["baseline_wm_topics"]
-    test_wm = cache["test_wm_topics"]
-    baseline_lane = cache["baseline_lane_topics"]
-    test_lane = cache["test_lane_topics"]
-    baseline_traffic = cache["baseline_traffic_topic"]
-    test_traffic = cache["test_traffic_topic"]
-    bl_wm_by = cache["bl_wm_by"]
-    te_wm_by = cache["te_wm_by"]
-    bl_lane_by = cache["bl_lane_by"]
-    te_lane_by = cache["te_lane_by"]
-    bl_traffic_by = cache["bl_traffic_by"]
-    te_traffic_by = cache["te_traffic_by"]
-    wm_features = cache["wm_features"]
-    diff_plan = cache.get("diff_plan")
-    if diff_plan is None:
-        diff_plan = _build_diff_plan_from_cache(cache)
-        cache["diff_plan"] = diff_plan
-    common_stamps_sorted = list(diff_plan.get("common_stamps_sorted", []))
-    bl_ref_by = bl_wm_by.get(baseline_wm[0], {})
-    te_ref_by = te_wm_by.get(test_wm[0], {})
+    bl_ref_by = None
+    te_ref_by = None
+    if not use_stamp_chunked_write:
+        bl_ref_by = bl_wm_by.get(baseline_wm[0], {})
+        te_ref_by = te_wm_by.get(test_wm[0], {})
+
+    if use_stamp_chunked_write:
+        bl_wm_by = te_wm_by = bl_lane_by = te_lane_by = None
+        bl_traffic_by = te_traffic_by = None
 
     common_n = len(common_stamps_sorted)
-    clock_write_steps = (3 * common_n) if HAS_CLOCK_MSG else 0
+    # 1 つの compare.bag にまとめるため clock は 1 回だけ
+    clock_write_steps = common_n if HAS_CLOCK_MSG else 0
     traffic_write_steps = 3 * common_n
     wm_write_steps = 3 * len(baseline_wm) * common_n
     lane_write_steps = 3 * len(baseline_lane) * common_n
     diff_progress_total_steps = clock_write_steps + traffic_write_steps + wm_write_steps + lane_write_steps
     _init_diff_progress(diff_progress_total_steps)
+
+    n_diff_chunks = len(stamps_chunks) if use_stamp_chunked_write else 0
+    diff_chunk_progress = {"done": 0, "total": 0, "idx": 0, "n": n_diff_chunks}
+    diff_chunk_progress_state = {"last_percent": -1}
+
+    def _tick_diff_progress(step_count: int = 1) -> None:
+        nonlocal diff_progress_done
+        if diff_progress_total <= 0:
+            return
+        diff_progress_done += step_count
+        if n_diff_chunks > 0 and diff_chunk_progress["total"] > 0:
+            diff_chunk_progress["done"] += step_count
+            overall_pct = int((diff_progress_done * 100) / diff_progress_total) if diff_progress_total > 0 else 0
+            _print_progress_line(
+                f"[compare] {out_dir.name} diff-bags chunk {diff_chunk_progress['idx']}/{diff_chunk_progress['n']} (overall {overall_pct}%)",
+                diff_chunk_progress["done"],
+                diff_chunk_progress["total"],
+                diff_chunk_progress_state,
+            )
+        else:
+            _print_progress_line(
+                f"[compare] {out_dir.name} diff-bags progress",
+                diff_progress_done,
+                diff_progress_total,
+                diff_progress_state,
+            )
 
     def _write_clock_at_stamps(out_bag, stamps):
         if not HAS_CLOCK_MSG or not stamps:
@@ -1411,19 +1901,21 @@ def _write_diff_bags_impl(
     lane_diff_b = diff_plan["lane_diff_b"]
     lane_diff_t = diff_plan["lane_diff_t"]
 
-    bl_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_wm_by.get(topic, {})) for topic in baseline_wm})
-    te_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_wm_by.get(topic, {})) for topic in test_wm})
-    bl_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_lane_by.get(topic, {})) for topic in baseline_lane})
-    te_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_lane_by.get(topic, {})) for topic in test_lane})
-    bl_traffic_template = _first_msg_from_by_stamp(bl_traffic_by)
-    te_traffic_template = _first_msg_from_by_stamp(te_traffic_by)
+    if use_stamp_chunked_write:
+        bl_wm_templates = te_wm_templates = bl_lane_templates = te_lane_templates = None
+        bl_traffic_template = te_traffic_template = None
+    else:
+        bl_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_wm_by.get(topic, {})) for topic in baseline_wm})
+        te_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_wm_by.get(topic, {})) for topic in test_wm})
+        bl_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_lane_by.get(topic, {})) for topic in baseline_lane})
+        te_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_lane_by.get(topic, {})) for topic in test_lane})
+        bl_traffic_template = _first_msg_from_by_stamp(bl_traffic_by)
+        te_traffic_template = _first_msg_from_by_stamp(te_traffic_by)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    diff_baseline_path = out_dir / "diff_baseline.bag"
-    diff_test_path = out_dir / "diff_test.bag"
-    common_path = out_dir / "common.bag"
+    compare_path = out_dir / "compare.bag"
 
-    # 表示で競合しないよう common / diff は別トピックで保存。common は baseline から 1 本のみ
+    # 表示で競合しないよう common / diff は別トピックで保存。common は baseline から 1 本のみ（すべて compare.bag に出力）
     common_wm = [f"{VALIDATION_COMMON_NS}{t}" for t in WM_TOPICS]
     common_lane = [f"{VALIDATION_COMMON_NS}{t}" for t in LANE_TOPICS]
     common_traffic = f"{VALIDATION_COMMON_NS}{TRAFFIC_TOPIC}"
@@ -1434,158 +1926,399 @@ def _write_diff_bags_impl(
     diff_test_lane = [f"{VALIDATION_DIFF_TEST_NS}{t}" for t in LANE_TOPICS]
     diff_test_traffic = f"{VALIDATION_DIFF_TEST_NS}{TRAFFIC_TOPIC}"
 
-    # common.bag: 共通部分のみ → baseline 由来で 1 本だけ /validation/common へ
-    with _open_out_bag(common_path) as out_bag:
-        _write_clock_at_stamps(out_bag, common_stamps_sorted)
-        for stamp in common_stamps_sorted:
-            if stamp in bl_traffic_by:
-                t, msg = bl_traffic_by[stamp]
-            else:
-                ref = bl_ref_by.get(stamp)
-                if ref is None:
+    # use_stamp_chunked_write 時は 1 チャンク読んで common / diff_baseline / diff_test を 1 つの compare.bag に書く（bag 読み・書きオーバーヘッド削減）
+    if use_stamp_chunked_write:
+        with _open_out_bag(compare_path) as out_bag:
+            _write_clock_at_stamps(out_bag, common_stamps_sorted)
+            for chunk_idx, chunk_stamps in enumerate(stamps_chunks, start=1):
+                chunk_steps = 3 * len(chunk_stamps) * (1 + len(baseline_wm) + len(baseline_lane))
+                diff_chunk_progress["idx"] = chunk_idx
+                diff_chunk_progress["total"] = chunk_steps
+                diff_chunk_progress["done"] = 0
+                diff_chunk_progress_state["last_percent"] = -1
+                chunk_raw = _build_compare_raw_cache_for_stamps(baseline_bag, test_bag, chunk_stamps, topic_lists)
+                chunk_cache = _build_compare_chunk_cache(chunk_raw, chunk_stamps)
+                bl_wm_by = chunk_cache["bl_wm_by"]
+                te_wm_by = chunk_cache["te_wm_by"]
+                bl_lane_by = chunk_cache["bl_lane_by"]
+                te_lane_by = chunk_cache["te_lane_by"]
+                bl_traffic_by = chunk_cache["bl_traffic_by"]
+                te_traffic_by = chunk_cache["te_traffic_by"]
+                bl_ref_by = bl_wm_by.get(baseline_wm[0], {})
+                te_ref_by = te_wm_by.get(test_wm[0], {})
+                wm_features = chunk_cache["wm_features"]
+                if bl_wm_templates is None:
+                    bl_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_wm_by.get(topic, {})) for topic in baseline_wm})
+                    te_wm_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_wm_by.get(topic, {})) for topic in test_wm})
+                    bl_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(bl_lane_by.get(topic, {})) for topic in baseline_lane})
+                    te_lane_templates = _fill_missing_templates({topic: _first_msg_from_by_stamp(te_lane_by.get(topic, {})) for topic in test_lane})
+                    bl_traffic_template = _first_msg_from_by_stamp(bl_traffic_by)
+                    te_traffic_template = _first_msg_from_by_stamp(te_traffic_by)
+                # common.bag にこのチャンク分
+                for stamp in chunk_stamps:
+                    if stamp in bl_traffic_by:
+                        t, msg = bl_traffic_by[stamp]
+                    else:
+                        ref = bl_ref_by.get(stamp)
+                        if ref is None:
+                            _tick_diff_progress()
+                            continue
+                        t = ref[0]
+                        msg = _empty_msg_like_cached(bl_traffic_template, stamp, "traffic")
+                    if msg is not None:
+                        out_bag.write(common_traffic, msg, t)
                     _tick_diff_progress()
-                    continue
-                t = ref[0]
-                msg = _empty_msg_like_cached(bl_traffic_template, stamp, "traffic")
-            if msg is not None:
-                out_bag.write(common_traffic, msg, t)
-            _tick_diff_progress()
-        for topic_b, out_topic in zip(baseline_wm, common_wm):
-            for stamp in common_stamps_sorted:
-                keep_ids = wm_common_obj.get(topic_b, {}).get(stamp, set())
-                keep_traj = wm_common_traj_keep.get(topic_b, {}).get(stamp, {})
-                keep_vsl = wm_common_vsl_keep.get(topic_b, {}).get(stamp, Counter())
-                if stamp in bl_wm_by.get(topic_b, {}):
-                    t, msg = bl_wm_by[topic_b][stamp]
-                    filtered = _filter_wm_msg(msg, wm_features["baseline"].get(topic_b, {}).get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
-                else:
-                    ref = bl_ref_by.get(stamp)
-                    if ref is None:
+                for topic_b, out_topic in zip(baseline_wm, common_wm):
+                    d_co = wm_common_obj.get(topic_b, {})
+                    d_ctk = wm_common_traj_keep.get(topic_b, {})
+                    d_cvk = wm_common_vsl_keep.get(topic_b, {})
+                    bl_wm_topic = bl_wm_by.get(topic_b, {})
+                    feat_topic = wm_features["baseline"].get(topic_b, {})
+                    for stamp in chunk_stamps:
+                        keep_ids = d_co.get(stamp, set())
+                        keep_traj = d_ctk.get(stamp, {})
+                        keep_vsl = d_cvk.get(stamp, Counter())
+                        if stamp in bl_wm_topic:
+                            t, msg = bl_wm_topic[stamp]
+                            filtered = _filter_wm_msg(msg, feat_topic.get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_wm_templates.get(topic_b), stamp, "wm")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
                         _tick_diff_progress()
-                        continue
-                    t = ref[0]
-                    filtered = _empty_msg_like_cached(bl_wm_templates.get(topic_b), stamp, "wm")
-                if filtered is not None:
-                    out_bag.write(out_topic, filtered, t)
-                _tick_diff_progress()
-        for topic_b, out_topic in zip(baseline_lane, common_lane):
-            for stamp in common_stamps_sorted:
-                keep_curves = lane_common.get(topic_b, {}).get(stamp, set())
-                if stamp in bl_lane_by.get(topic_b, {}):
-                    t, bl_msg = bl_lane_by[topic_b][stamp]
-                    filtered = _filter_lane_msg(bl_msg, stamp, keep_curves)
-                else:
-                    ref = bl_ref_by.get(stamp)
-                    if ref is None:
+                for topic_b, out_topic in zip(baseline_lane, common_lane):
+                    d_lc = lane_common.get(topic_b, {})
+                    bl_lane_topic = bl_lane_by.get(topic_b, {})
+                    for stamp in chunk_stamps:
+                        keep_curves = d_lc.get(stamp, set())
+                        if stamp in bl_lane_topic:
+                            t, bl_msg = bl_lane_topic[stamp]
+                            filtered = _filter_lane_msg(bl_msg, stamp, keep_curves)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_lane_templates.get(topic_b), stamp, "lane")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
                         _tick_diff_progress()
-                        continue
-                    t = ref[0]
-                    filtered = _empty_msg_like_cached(bl_lane_templates.get(topic_b), stamp, "lane")
-                if filtered is not None:
-                    out_bag.write(out_topic, filtered, t)
-                _tick_diff_progress()
+                # diff_baseline トピックにこのチャンク分
+                for stamp in chunk_stamps:
+                    if stamp in bl_traffic_by:
+                        t, msg = bl_traffic_by[stamp]
+                    else:
+                        ref = bl_ref_by.get(stamp)
+                        if ref is None:
+                            _tick_diff_progress()
+                            continue
+                        t = ref[0]
+                        msg = _empty_msg_like_cached(bl_traffic_template, stamp, "traffic")
+                    if msg is not None:
+                        out_bag.write(diff_baseline_traffic, msg, t)
+                    _tick_diff_progress()
+                for topic, out_topic in zip(baseline_wm, diff_baseline_wm):
+                    d_db = wm_diff_b.get(topic, {})
+                    d_dbtk = wm_diff_b_traj_keep.get(topic, {})
+                    d_dbvk = wm_diff_b_vsl_keep.get(topic, {})
+                    bl_wm_topic = bl_wm_by.get(topic, {})
+                    feat_topic = wm_features["baseline"].get(topic, {})
+                    for stamp in chunk_stamps:
+                        keep_ids = d_db.get(stamp, set())
+                        keep_traj = d_dbtk.get(stamp, {})
+                        keep_vsl = d_dbvk.get(stamp, Counter())
+                        if stamp in bl_wm_topic:
+                            t, msg = bl_wm_topic[stamp]
+                            filtered = _filter_wm_msg(msg, feat_topic.get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_wm_templates.get(topic), stamp, "wm")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
+                        _tick_diff_progress()
+                for topic_b, out_topic in zip(baseline_lane, diff_baseline_lane):
+                    d_lb = lane_diff_b.get(topic_b, {})
+                    bl_lane_topic = bl_lane_by.get(topic_b, {})
+                    for stamp in chunk_stamps:
+                        keep_curves = d_lb.get(stamp, set())
+                        if stamp in bl_lane_topic:
+                            t, bl_msg = bl_lane_topic[stamp]
+                            filtered = _filter_lane_msg(bl_msg, stamp, keep_curves)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_lane_templates.get(topic_b), stamp, "lane")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
+                        _tick_diff_progress()
+                # diff_test トピックにこのチャンク分
+                for stamp in chunk_stamps:
+                    if stamp in te_traffic_by:
+                        t, msg = te_traffic_by[stamp]
+                    else:
+                        ref = te_ref_by.get(stamp)
+                        if ref is None:
+                            _tick_diff_progress()
+                            continue
+                        t = ref[0]
+                        msg = _empty_msg_like_cached(te_traffic_template, stamp, "traffic")
+                    if msg is not None:
+                        out_bag.write(diff_test_traffic, msg, t)
+                    _tick_diff_progress()
+                for topic, out_topic in zip(test_wm, diff_test_wm):
+                    d_dt = wm_diff_t.get(topic, {})
+                    d_dttk = wm_diff_t_traj_keep.get(topic, {})
+                    d_dtvk = wm_diff_t_vsl_keep.get(topic, {})
+                    te_wm_topic = te_wm_by.get(topic, {})
+                    feat_topic = wm_features["test"].get(topic, {})
+                    for stamp in chunk_stamps:
+                        keep_ids = d_dt.get(stamp, set())
+                        keep_traj = d_dttk.get(stamp, {})
+                        keep_vsl = d_dtvk.get(stamp, Counter())
+                        if stamp in te_wm_topic:
+                            t, msg = te_wm_topic[stamp]
+                            filtered = _filter_wm_msg(msg, feat_topic.get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
+                        else:
+                            ref = te_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(te_wm_templates.get(topic), stamp, "wm")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
+                        _tick_diff_progress()
+                for topic_t, out_topic in zip(test_lane, diff_test_lane):
+                    d_lt = lane_diff_t.get(topic_t, {})
+                    te_lane_topic = te_lane_by.get(topic_t, {})
+                    for stamp in chunk_stamps:
+                        keep_curves = d_lt.get(stamp, set())
+                        if stamp in te_lane_topic:
+                            t, te_msg = te_lane_topic[stamp]
+                            filtered = _filter_lane_msg(te_msg, stamp, keep_curves)
+                        else:
+                            ref = te_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(te_lane_templates.get(topic_t), stamp, "lane")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
+                        _tick_diff_progress()
+                del chunk_raw
+                del chunk_cache
+                gc.collect()
+    else:
+        # common / diff_baseline / diff_test を 1 つの compare.bag に出力
+        with _open_out_bag(compare_path) as out_bag:
+            _write_clock_at_stamps(out_bag, common_stamps_sorted)
+            for chunk_stamps in stamps_chunks:
+                if use_raw_chunks:
+                    chunk_cache = _build_compare_chunk_cache(cache, chunk_stamps)
+                    wm_features = chunk_cache["wm_features"]
+                else:
+                    wm_features = cache["wm_features"]
+                for stamp in chunk_stamps:
+                    if stamp in bl_traffic_by:
+                        t, msg = bl_traffic_by[stamp]
+                    else:
+                        ref = bl_ref_by.get(stamp)
+                        if ref is None:
+                            _tick_diff_progress()
+                            continue
+                        t = ref[0]
+                        msg = _empty_msg_like_cached(bl_traffic_template, stamp, "traffic")
+                    if msg is not None:
+                        out_bag.write(common_traffic, msg, t)
+                    _tick_diff_progress()
+                for topic_b, out_topic in zip(baseline_wm, common_wm):
+                    d_co = wm_common_obj.get(topic_b, {})
+                    d_ctk = wm_common_traj_keep.get(topic_b, {})
+                    d_cvk = wm_common_vsl_keep.get(topic_b, {})
+                    bl_wm_topic = bl_wm_by.get(topic_b, {})
+                    feat_topic = wm_features["baseline"].get(topic_b, {})
+                    for stamp in chunk_stamps:
+                        keep_ids = d_co.get(stamp, set())
+                        keep_traj = d_ctk.get(stamp, {})
+                        keep_vsl = d_cvk.get(stamp, Counter())
+                        if stamp in bl_wm_topic:
+                            t, msg = bl_wm_topic[stamp]
+                            filtered = _filter_wm_msg(msg, feat_topic.get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_wm_templates.get(topic_b), stamp, "wm")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
+                        _tick_diff_progress()
+                for topic_b, out_topic in zip(baseline_lane, common_lane):
+                    d_lc = lane_common.get(topic_b, {})
+                    bl_lane_topic = bl_lane_by.get(topic_b, {})
+                    for stamp in chunk_stamps:
+                        keep_curves = d_lc.get(stamp, set())
+                        if stamp in bl_lane_topic:
+                            t, bl_msg = bl_lane_topic[stamp]
+                            filtered = _filter_lane_msg(bl_msg, stamp, keep_curves)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_lane_templates.get(topic_b), stamp, "lane")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
+                        _tick_diff_progress()
+                if use_raw_chunks:
+                    del chunk_cache
+                    gc.collect()
 
-    # diff_baseline.bag → diff_baseline トピックへ（他 bag とずれないよう全 common スタンプでメッセージを書く。差分なしは空メッセージ）
-    with _open_out_bag(diff_baseline_path) as out_bag:
-        _write_clock_at_stamps(out_bag, common_stamps_sorted)
-        for stamp in common_stamps_sorted:
-            if stamp in bl_traffic_by:
-                t, msg = bl_traffic_by[stamp]
-            else:
-                ref = bl_ref_by.get(stamp)
-                if ref is None:
+            # diff_baseline トピックへ
+            for chunk_stamps in stamps_chunks:
+                if use_raw_chunks:
+                    chunk_cache = _build_compare_chunk_cache(cache, chunk_stamps)
+                    wm_features = chunk_cache["wm_features"]
+                else:
+                    wm_features = cache["wm_features"]
+                for stamp in chunk_stamps:
+                    if stamp in bl_traffic_by:
+                        t, msg = bl_traffic_by[stamp]
+                    else:
+                        ref = bl_ref_by.get(stamp)
+                        if ref is None:
+                            _tick_diff_progress()
+                            continue
+                        t = ref[0]
+                        msg = _empty_msg_like_cached(bl_traffic_template, stamp, "traffic")
+                    if msg is not None:
+                        out_bag.write(diff_baseline_traffic, msg, t)
                     _tick_diff_progress()
-                    continue
-                t = ref[0]
-                msg = _empty_msg_like_cached(bl_traffic_template, stamp, "traffic")
-            if msg is not None:
-                out_bag.write(diff_baseline_traffic, msg, t)
-            _tick_diff_progress()
-        for topic, out_topic in zip(baseline_wm, diff_baseline_wm):
-            for stamp in common_stamps_sorted:
-                keep_ids = wm_diff_b.get(topic, {}).get(stamp, set())
-                keep_traj = wm_diff_b_traj_keep.get(topic, {}).get(stamp, {})
-                keep_vsl = wm_diff_b_vsl_keep.get(topic, {}).get(stamp, Counter())
-                if stamp in bl_wm_by.get(topic, {}):
-                    t, msg = bl_wm_by[topic][stamp]
-                    filtered = _filter_wm_msg(msg, wm_features["baseline"].get(topic, {}).get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
-                else:
-                    ref = bl_ref_by.get(stamp)
-                    if ref is None:
+                for topic, out_topic in zip(baseline_wm, diff_baseline_wm):
+                    d_db = wm_diff_b.get(topic, {})
+                    d_dbtk = wm_diff_b_traj_keep.get(topic, {})
+                    d_dbvk = wm_diff_b_vsl_keep.get(topic, {})
+                    bl_wm_topic = bl_wm_by.get(topic, {})
+                    feat_topic = wm_features["baseline"].get(topic, {})
+                    for stamp in chunk_stamps:
+                        keep_ids = d_db.get(stamp, set())
+                        keep_traj = d_dbtk.get(stamp, {})
+                        keep_vsl = d_dbvk.get(stamp, Counter())
+                        if stamp in bl_wm_topic:
+                            t, msg = bl_wm_topic[stamp]
+                            filtered = _filter_wm_msg(msg, feat_topic.get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_wm_templates.get(topic), stamp, "wm")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
                         _tick_diff_progress()
-                        continue
-                    t = ref[0]
-                    filtered = _empty_msg_like_cached(bl_wm_templates.get(topic), stamp, "wm")
-                if filtered is not None:
-                    out_bag.write(out_topic, filtered, t)
-                _tick_diff_progress()
-        for topic_b, out_topic in zip(baseline_lane, diff_baseline_lane):
-            for stamp in common_stamps_sorted:
-                keep_curves = lane_diff_b.get(topic_b, {}).get(stamp, set())
-                if stamp in bl_lane_by.get(topic_b, {}):
-                    t, bl_msg = bl_lane_by[topic_b][stamp]
-                    filtered = _filter_lane_msg(bl_msg, stamp, keep_curves)
-                else:
-                    ref = bl_ref_by.get(stamp)
-                    if ref is None:
+                for topic_b, out_topic in zip(baseline_lane, diff_baseline_lane):
+                    d_lb = lane_diff_b.get(topic_b, {})
+                    bl_lane_topic = bl_lane_by.get(topic_b, {})
+                    for stamp in chunk_stamps:
+                        keep_curves = d_lb.get(stamp, set())
+                        if stamp in bl_lane_topic:
+                            t, bl_msg = bl_lane_topic[stamp]
+                            filtered = _filter_lane_msg(bl_msg, stamp, keep_curves)
+                        else:
+                            ref = bl_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(bl_lane_templates.get(topic_b), stamp, "lane")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
                         _tick_diff_progress()
-                        continue
-                    t = ref[0]
-                    filtered = _empty_msg_like_cached(bl_lane_templates.get(topic_b), stamp, "lane")
-                if filtered is not None:
-                    out_bag.write(out_topic, filtered, t)
-                _tick_diff_progress()
+                if use_raw_chunks:
+                    del chunk_cache
+                    gc.collect()
 
-    # diff_test.bag → diff_test トピックへ（他 bag とずれないよう全 common スタンプでメッセージを書く。差分なしは空メッセージ）
-    with _open_out_bag(diff_test_path) as out_bag:
-        _write_clock_at_stamps(out_bag, common_stamps_sorted)
-        for stamp in common_stamps_sorted:
-            if stamp in te_traffic_by:
-                t, msg = te_traffic_by[stamp]
-            else:
-                ref = te_ref_by.get(stamp)
-                if ref is None:
+            # diff_test トピックへ
+            for chunk_stamps in stamps_chunks:
+                if use_raw_chunks:
+                    chunk_cache = _build_compare_chunk_cache(cache, chunk_stamps)
+                    wm_features = chunk_cache["wm_features"]
+                else:
+                    wm_features = cache["wm_features"]
+                for stamp in chunk_stamps:
+                    if stamp in te_traffic_by:
+                        t, msg = te_traffic_by[stamp]
+                    else:
+                        ref = te_ref_by.get(stamp)
+                        if ref is None:
+                            _tick_diff_progress()
+                            continue
+                        t = ref[0]
+                        msg = _empty_msg_like_cached(te_traffic_template, stamp, "traffic")
+                    if msg is not None:
+                        out_bag.write(diff_test_traffic, msg, t)
                     _tick_diff_progress()
-                    continue
-                t = ref[0]
-                msg = _empty_msg_like_cached(te_traffic_template, stamp, "traffic")
-            if msg is not None:
-                out_bag.write(diff_test_traffic, msg, t)
-            _tick_diff_progress()
-        for topic, out_topic in zip(test_wm, diff_test_wm):
-            for stamp in common_stamps_sorted:
-                keep_ids = wm_diff_t.get(topic, {}).get(stamp, set())
-                keep_traj = wm_diff_t_traj_keep.get(topic, {}).get(stamp, {})
-                keep_vsl = wm_diff_t_vsl_keep.get(topic, {}).get(stamp, Counter())
-                if stamp in te_wm_by.get(topic, {}):
-                    t, msg = te_wm_by[topic][stamp]
-                    filtered = _filter_wm_msg(msg, wm_features["test"].get(topic, {}).get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
-                else:
-                    ref = te_ref_by.get(stamp)
-                    if ref is None:
+                for topic, out_topic in zip(test_wm, diff_test_wm):
+                    d_dt = wm_diff_t.get(topic, {})
+                    d_dttk = wm_diff_t_traj_keep.get(topic, {})
+                    d_dtvk = wm_diff_t_vsl_keep.get(topic, {})
+                    te_wm_topic = te_wm_by.get(topic, {})
+                    feat_topic = wm_features["test"].get(topic, {})
+                    for stamp in chunk_stamps:
+                        keep_ids = d_dt.get(stamp, set())
+                        keep_traj = d_dttk.get(stamp, {})
+                        keep_vsl = d_dtvk.get(stamp, Counter())
+                        if stamp in te_wm_topic:
+                            t, msg = te_wm_topic[stamp]
+                            filtered = _filter_wm_msg(msg, feat_topic.get(stamp, {}), stamp, keep_ids, keep_traj, keep_vsl)
+                        else:
+                            ref = te_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(te_wm_templates.get(topic), stamp, "wm")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
                         _tick_diff_progress()
-                        continue
-                    t = ref[0]
-                    filtered = _empty_msg_like_cached(te_wm_templates.get(topic), stamp, "wm")
-                if filtered is not None:
-                    out_bag.write(out_topic, filtered, t)
-                _tick_diff_progress()
-        for topic_t, out_topic in zip(test_lane, diff_test_lane):
-            for stamp in common_stamps_sorted:
-                keep_curves = lane_diff_t.get(topic_t, {}).get(stamp, set())
-                if stamp in te_lane_by.get(topic_t, {}):
-                    t, te_msg = te_lane_by[topic_t][stamp]
-                    filtered = _filter_lane_msg(te_msg, stamp, keep_curves)
-                else:
-                    ref = te_ref_by.get(stamp)
-                    if ref is None:
+                for topic_t, out_topic in zip(test_lane, diff_test_lane):
+                    d_lt = lane_diff_t.get(topic_t, {})
+                    te_lane_topic = te_lane_by.get(topic_t, {})
+                    for stamp in chunk_stamps:
+                        keep_curves = d_lt.get(stamp, set())
+                        if stamp in te_lane_topic:
+                            t, te_msg = te_lane_topic[stamp]
+                            filtered = _filter_lane_msg(te_msg, stamp, keep_curves)
+                        else:
+                            ref = te_ref_by.get(stamp)
+                            if ref is None:
+                                _tick_diff_progress()
+                                continue
+                            t = ref[0]
+                            filtered = _empty_msg_like_cached(te_lane_templates.get(topic_t), stamp, "lane")
+                        if filtered is not None:
+                            out_bag.write(out_topic, filtered, t)
                         _tick_diff_progress()
-                        continue
-                    t = ref[0]
-                    filtered = _empty_msg_like_cached(te_lane_templates.get(topic_t), stamp, "lane")
-                if filtered is not None:
-                    out_bag.write(out_topic, filtered, t)
-                _tick_diff_progress()
+                if use_raw_chunks:
+                    del chunk_cache
+                    gc.collect()
 
 
 def main() -> int:
@@ -1598,6 +2331,8 @@ def main() -> int:
     dirs = discover_bag_directories(root / paths["test_bags"])
     if not dirs:
         return 0
+
+    print(f"[compare] Comparing {len(dirs)} scene(s)...", file=sys.stderr, flush=True)
 
     # Load commit info for baseline and test (recorded when run_baseline/run_test was executed)
     baseline_commit = {}
@@ -1621,8 +2356,8 @@ def main() -> int:
         baseline_bag = baseline_root / rel / "result_baseline.bag"
         test_bag = test_results_root / rel / "result_test.bag"
         input_bags = get_bag_files_in_dir(dir_path) if dir_path.is_dir() else []
-        scene_cache = _build_compare_scene_cache(baseline_bag, test_bag) if (baseline_bag.exists() and test_bag.exists() and HAS_ROSBAG) else None
-        res = compare_one(rel, baseline_bag, test_bag, input_bags=input_bags, scene_cache=scene_cache)
+        print(f"[compare] {rel}: comparing...", file=sys.stderr, flush=True)
+        res = compare_one(rel, baseline_bag, test_bag, input_bags=input_bags, scene_cache=None)
         res["baseline_commit"] = baseline_commit.get("commit", "")
         res["baseline_describe"] = baseline_commit.get("describe", "")
         res["test_commit"] = test_commit.get("commit", "")
@@ -1644,15 +2379,27 @@ def main() -> int:
         res["dt_max_test"] = _read_dt_max(test_results_root / rel / "dt_max")
         _merge_dt_summary_into_result(res, "baseline", baseline_dt_summary)
         _merge_dt_summary_into_result(res, "test", test_dt_summary)
-        all_results.append(res)
         out_dir = test_results_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)
+        diff_plan = res.pop("_diff_plan", None)
+        topic_lists = res.pop("_topic_lists", None)
+        common_stamps_sorted = res.pop("_common_stamps_sorted", None)
         with open(out_dir / "comparison_direct.json", "w", encoding="utf-8") as f:
             json.dump(res, f, indent=2, ensure_ascii=False)
         try:
-            _write_diff_bags(baseline_bag, test_bag, out_dir, scene_cache=scene_cache)
+            print(f"[compare] {rel}: writing diff bags...", file=sys.stderr, flush=True)
+            _write_diff_bags(
+                baseline_bag,
+                test_bag,
+                out_dir,
+                scene_cache=None,
+                diff_plan=diff_plan,
+                topic_lists=topic_lists,
+                common_stamps_sorted=common_stamps_sorted,
+            )
         except Exception as e:
             print(f"[compare] {rel}: diff bags 作成失敗: {e}", file=sys.stderr)
+        all_results.append(res)
         status = "Unchanged" if res["overall_ok"] else "Changed"
         valid = res.get("valid_frames")
         total = res.get("total_frames")

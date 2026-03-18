@@ -1740,6 +1740,7 @@ class ViewerAppPyQt(QMainWindow):
         collision_test_bag_legacy = self.test_results_root / rel / "collision_judgement.bag"
         validation_test_bag = self.test_results_root / rel / "validation_test.bag"
         out_dir = self.test_results_root / rel
+        compare_bag = out_dir / "compare.bag"
         common_bag = out_dir / "common.bag"
         diff_baseline_bag = out_dir / "diff_baseline.bag"
         diff_test_bag = out_dir / "diff_test.bag"
@@ -1772,12 +1773,15 @@ class ViewerAppPyQt(QMainWindow):
             play_bags.append(str(collision_test_bag_legacy))
         if validation_test_bag.exists():
             play_bags.append(str(validation_test_bag))
-        if common_bag.exists():
-            play_bags.append(str(common_bag))
-        if diff_baseline_bag.exists():
-            play_bags.append(str(diff_baseline_bag))
-        if diff_test_bag.exists():
-            play_bags.append(str(diff_test_bag))
+        if compare_bag.exists():
+            play_bags.append(str(compare_bag))
+        else:
+            if common_bag.exists():
+                play_bags.append(str(common_bag))
+            if diff_baseline_bag.exists():
+                play_bags.append(str(diff_baseline_bag))
+            if diff_test_bag.exists():
+                play_bags.append(str(diff_test_bag))
         # backward compatibility: when unified validation bag is absent, load legacy split bags.
         if (not validation_baseline_bag.exists()) or (not validation_test_bag.exists()):
             for horizon in VALIDATION_MODE_LAYOUT_HORIZONS:
