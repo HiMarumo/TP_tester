@@ -121,6 +121,7 @@ COLLISION_GROUPED_STATUSES = ("pred_collision", "pred_safe", "ego_pred_collision
 COLLISION_BASE_STATUSES = ("ego_observed_collision", "ego_observed_safe")
 COLLISION_ALL_STATUSES = COLLISION_GROUPED_STATUSES + COLLISION_BASE_STATUSES
 EVAL_STAMP_CHUNK_SIZE = 300
+# hard/soft: 他車のコライダー種別。middle: 自車用（hardとsoftの中間）。
 COLLISION_KIND_MULTIPLIERS = {
     "hard": {
         "size_scale": 1.0,
@@ -130,7 +131,15 @@ COLLISION_KIND_MULTIPLIERS = {
         "size_scale": 1.1,
         "major_scale": 2.0,
     },
+    "middle": {
+        "size_scale": 1.05,
+        "major_scale": 1.5,
+    },
 }
+# 衝突判定で自車に使うコライダー（hard判定＝自車middle vs 他車hard, soft判定＝自車middle vs 他車soft）
+COLLISION_EGO_COLLIDER_KIND = "middle"
+# プロファイルに持たせるコライダー形状（hard/soft は他車用、middle は自車用）
+COLLISION_COLLIDER_KINDS = ("hard", "soft", "middle")
 COLLISION_POINT_MATCH_MAX_DT = 0.26
 VSL_STOPLINE_ID = 500001
 VSL_CROSSING_MIN = 500100
@@ -456,7 +465,7 @@ def _build_path_cache(path_msg) -> dict:
         "traj_slice_cache": {},
         "traj_curve_cache": {},
         "collision_index_cache": {},
-        "collider_cache": {"hard": {}, "soft": {}},
+        "collider_cache": {k: {} for k in COLLISION_COLLIDER_KINDS},
     }
 
 
@@ -1394,8 +1403,7 @@ def _ensure_collision_profile(cache: dict | None, dims: tuple[float, float]) -> 
     point_count = len(cache.get("collision_points", []))
     profile = {
         "dims": key,
-        "hard": {"polys": [], "aabbs": [], "path_aabb": None},
-        "soft": {"polys": [], "aabbs": [], "path_aabb": None},
+        **{kind: {"polys": [], "aabbs": [], "path_aabb": None} for kind in COLLISION_COLLIDER_KINDS},
     }
     collider_cache = cache.setdefault("collider_cache", {})
     curve = cache.get("collision_curve", {})
@@ -1404,7 +1412,7 @@ def _ensure_collision_profile(cache: dict | None, dims: tuple[float, float]) -> 
     for idx in range(point_count):
         heading, speed = heading_speed[idx]
         base_s = float(s_vals[idx]) if s_vals and 0 <= idx < len(s_vals) else 0.0
-        for kind in COLLISION_KINDS:
+        for kind in COLLISION_COLLIDER_KINDS:
             kind_cache = collider_cache.setdefault(kind, {})
             local_pts = _collider_local_points(speed, length, width, kind)
             poly = _transform_collider_local_points(
@@ -1490,18 +1498,19 @@ def _path_collision_results(
     ego_profile = _ensure_collision_profile(ego_cache, ego_dims)
     if pred_profile is None or ego_profile is None:
         return out
+    ego_kind = COLLISION_EGO_COLLIDER_KIND
+    ego_polys = ego_profile[ego_kind]["polys"]
+    ego_aabbs = ego_profile[ego_kind]["aabbs"]
+    ego_path_aabb = ego_profile[ego_kind]["path_aabb"]
     ego_times = [float(p["t"]) for p in ego_pts]
-    ego_soft_polys = ego_profile["soft"]["polys"]
-    ego_soft_aabbs = ego_profile["soft"]["aabbs"]
-    ego_soft_path_aabb = ego_profile["soft"]["path_aabb"]
     pred_hard_polys = pred_profile["hard"]["polys"]
     pred_hard_aabbs = pred_profile["hard"]["aabbs"]
     pred_hard_path_aabb = pred_profile["hard"]["path_aabb"]
     pred_soft_polys = pred_profile["soft"]["polys"]
     pred_soft_aabbs = pred_profile["soft"]["aabbs"]
     pred_soft_path_aabb = pred_profile["soft"]["path_aabb"]
-    need_hard = _aabb_overlaps(pred_hard_path_aabb, ego_soft_path_aabb)
-    need_soft = _aabb_overlaps(pred_soft_path_aabb, ego_soft_path_aabb)
+    need_hard = _aabb_overlaps(pred_hard_path_aabb, ego_path_aabb)
+    need_soft = _aabb_overlaps(pred_soft_path_aabb, ego_path_aabb)
     if not need_hard and not need_soft:
         return out
     for i, pred in enumerate(pred_pts):
@@ -1509,17 +1518,17 @@ def _path_collision_results(
         if ego_pair is None:
             continue
         ego_idx, _ = ego_pair
-        ego_soft_poly = ego_soft_polys[ego_idx]
-        ego_soft_aabb = ego_soft_aabbs[ego_idx]
+        ego_poly = ego_polys[ego_idx]
+        ego_aabb = ego_aabbs[ego_idx]
         if need_hard and not out["hard"]:
             pred_hard_poly = pred_hard_polys[i]
             pred_hard_aabb = pred_hard_aabbs[i]
-            if _aabb_overlaps(pred_hard_aabb, ego_soft_aabb) and _polygons_intersect(pred_hard_poly, ego_soft_poly):
+            if _aabb_overlaps(pred_hard_aabb, ego_aabb) and _polygons_intersect(pred_hard_poly, ego_poly):
                 out["hard"] = True
         if need_soft and not out["soft"]:
             pred_soft_poly = pred_soft_polys[i]
             pred_soft_aabb = pred_soft_aabbs[i]
-            if _aabb_overlaps(pred_soft_aabb, ego_soft_aabb) and _polygons_intersect(pred_soft_poly, ego_soft_poly):
+            if _aabb_overlaps(pred_soft_aabb, ego_aabb) and _polygons_intersect(pred_soft_poly, ego_poly):
                 out["soft"] = True
         if (not need_hard or out["hard"]) and (not need_soft or out["soft"]):
             return out
