@@ -57,18 +57,18 @@ except ImportError:
 
 
 LANE_TOPICS = [
-    "/viz/su/multi_lane_ids_set",
-    "/viz/su/crossing_lane_ids_set",
-    "/viz/su/opposite_lane_ids_set",
+    "/trajectory_predictor/multi_lane_ids_set",
+    "/trajectory_predictor/crossing_lane_ids_set",
+    "/trajectory_predictor/opposite_lane_ids_set",
 ]
 WM_TOPICS = [
     "/WM/tracked_object_set_with_prediction",
-    "/WM/along_object_set_with_prediction",
-    "/WM/crossing_object_set_with_prediction",
-    "/WM/oncoming_object_set_with_prediction",
-    "/WM/other_object_set_with_prediction",
+    "/trajectory_predictor/along_object_set_with_prediction",
+    "/trajectory_predictor/crossing_object_set_with_prediction",
+    "/trajectory_predictor/oncoming_object_set_with_prediction",
+    "/trajectory_predictor/other_object_set_with_prediction",
 ]
-TRAFFIC_TOPIC = "/viz/su/ym0_converted_traffic_light_state"
+TRAFFIC_TOPIC = "/trajectory_predictor/ym0_converted_traffic_light_state"
 
 LANE_SOURCES = ("along", "opposite", "crossing")
 OBJECT_PATH_SOURCES = ("along", "opposite", "crossing", "other", "base")
@@ -76,25 +76,25 @@ VSL_SOURCES = ("along", "opposite", "crossing")
 PATH_COMPARE_SOURCES = ("along", "opposite", "crossing", "other")
 
 LANE_TOPIC_TO_SOURCE = {
-    "/viz/su/multi_lane_ids_set": "along",
-    "/viz/su/opposite_lane_ids_set": "opposite",
-    "/viz/su/crossing_lane_ids_set": "crossing",
+    "/trajectory_predictor/multi_lane_ids_set": "along",
+    "/trajectory_predictor/opposite_lane_ids_set": "opposite",
+    "/trajectory_predictor/crossing_lane_ids_set": "crossing",
 }
 WM_TOPIC_TO_SOURCE = {
     "/WM/tracked_object_set_with_prediction": "base",
-    "/WM/along_object_set_with_prediction": "along",
+    "/trajectory_predictor/along_object_set_with_prediction": "along",
     # topic名は oncoming だが比較ソース名は opposite として扱う
-    "/WM/oncoming_object_set_with_prediction": "opposite",
-    "/WM/crossing_object_set_with_prediction": "crossing",
-    "/WM/other_object_set_with_prediction": "other",
+    "/trajectory_predictor/oncoming_object_set_with_prediction": "opposite",
+    "/trajectory_predictor/crossing_object_set_with_prediction": "crossing",
+    "/trajectory_predictor/other_object_set_with_prediction": "other",
 }
 
 GROUP_TO_WM_SUFFIX = {
     "base": "/WM/tracked_object_set_with_prediction",
-    "along": "/WM/along_object_set_with_prediction",
-    "opposite": "/WM/oncoming_object_set_with_prediction",
-    "crossing": "/WM/crossing_object_set_with_prediction",
-    "other": "/WM/other_object_set_with_prediction",
+    "along": "/trajectory_predictor/along_object_set_with_prediction",
+    "opposite": "/trajectory_predictor/oncoming_object_set_with_prediction",
+    "crossing": "/trajectory_predictor/crossing_object_set_with_prediction",
+    "other": "/trajectory_predictor/other_object_set_with_prediction",
 }
 
 # VSL-related object IDs (from trajectory_predictor_data_type.h / core)

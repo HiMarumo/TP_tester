@@ -8,14 +8,14 @@
   },
   "record_topics": [
     "/WM/tracked_object_set_with_prediction",
-    "/WM/along_object_set_with_prediction",
-    "/WM/crossing_object_set_with_prediction",
-    "/WM/oncoming_object_set_with_prediction",
-    "/WM/other_object_set_with_prediction",
-    "/viz/su/multi_lane_ids_set",
-    "/viz/su/crossing_lane_ids_set",
-    "/viz/su/opposite_lane_ids_set",
-    "/viz/su/ym0_converted_traffic_light_state"
+    "/trajectory_predictor/along_object_set_with_prediction",
+    "/trajectory_predictor/crossing_object_set_with_prediction",
+    "/trajectory_predictor/oncoming_object_set_with_prediction",
+    "/trajectory_predictor/other_object_set_with_prediction",
+    "/trajectory_predictor/multi_lane_ids_set",
+    "/trajectory_predictor/crossing_lane_ids_set",
+    "/trajectory_predictor/opposite_lane_ids_set",
+    "/trajectory_predictor/ym0_converted_traffic_light_state"
   ],
   "paths": {
     "nrc_ws_devel": "/home/nissan/projects/nrc_ws/devel/setup.bash",

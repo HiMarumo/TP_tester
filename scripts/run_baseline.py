@@ -48,10 +48,10 @@ except Exception:
 
 WM_TOPIC_SUFFIXES = [
     "/WM/tracked_object_set_with_prediction",
-    "/WM/along_object_set_with_prediction",
-    "/WM/crossing_object_set_with_prediction",
-    "/WM/oncoming_object_set_with_prediction",
-    "/WM/other_object_set_with_prediction",
+    "/trajectory_predictor/along_object_set_with_prediction",
+    "/trajectory_predictor/crossing_object_set_with_prediction",
+    "/trajectory_predictor/oncoming_object_set_with_prediction",
+    "/trajectory_predictor/other_object_set_with_prediction",
 ]
 VALIDATION_OBSERVED_BASELINE_NS = "/validation/observed_baseline"
 TP_SIM_OFFLINE_INPUT_TOPICS = [

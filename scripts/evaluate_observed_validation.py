@@ -40,10 +40,10 @@ except ImportError:
 
 GROUP_TO_WM_SUFFIX = {
     "base": "/WM/tracked_object_set_with_prediction",
-    "along": "/WM/along_object_set_with_prediction",
-    "opposite": "/WM/oncoming_object_set_with_prediction",
-    "crossing": "/WM/crossing_object_set_with_prediction",
-    "other": "/WM/other_object_set_with_prediction",
+    "along": "/trajectory_predictor/along_object_set_with_prediction",
+    "opposite": "/trajectory_predictor/oncoming_object_set_with_prediction",
+    "crossing": "/trajectory_predictor/crossing_object_set_with_prediction",
+    "other": "/trajectory_predictor/other_object_set_with_prediction",
 }
 
 VALIDATION_GROUPS = ("along", "opposite", "crossing", "other")

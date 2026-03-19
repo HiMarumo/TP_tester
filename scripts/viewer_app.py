@@ -296,14 +296,14 @@ class RichTextComboBox(QComboBox):
 # bag は /validation/baseline または /validation/test の名前空間で記録されているため、viewer 起動時に渡す
 RECORD_TOPIC_TO_VIEWER_PARAM = {
     "/WM/tracked_object_set_with_prediction": "base_objects_topic",
-    "/WM/along_object_set_with_prediction": "along_objects_topic",
-    "/WM/crossing_object_set_with_prediction": "crossing_objects_topic",
-    "/WM/oncoming_object_set_with_prediction": "oncoming_objects_topic",
-    "/WM/other_object_set_with_prediction": "other_objects_topic",
-    "/viz/su/multi_lane_ids_set": "multi_lane_ids_topic",
-    "/viz/su/crossing_lane_ids_set": "crossing_lane_ids_topic",
-    "/viz/su/opposite_lane_ids_set": "opposite_lane_ids_topic",
-    "/viz/su/ym0_converted_traffic_light_state": "traffic_light_state_topic",
+    "/trajectory_predictor/along_object_set_with_prediction": "along_objects_topic",
+    "/trajectory_predictor/crossing_object_set_with_prediction": "crossing_objects_topic",
+    "/trajectory_predictor/oncoming_object_set_with_prediction": "oncoming_objects_topic",
+    "/trajectory_predictor/other_object_set_with_prediction": "other_objects_topic",
+    "/trajectory_predictor/multi_lane_ids_set": "multi_lane_ids_topic",
+    "/trajectory_predictor/crossing_lane_ids_set": "crossing_lane_ids_topic",
+    "/trajectory_predictor/opposite_lane_ids_set": "opposite_lane_ids_topic",
+    "/trajectory_predictor/ym0_converted_traffic_light_state": "traffic_light_state_topic",
 }
 
 
@@ -1681,7 +1681,7 @@ class ViewerAppPyQt(QMainWindow):
             if param:
                 viewer_args.append(f"_{param}:={VALIDATION_BASELINE_NS}{topic}")
                 viewer_args.append(f"_test_{param}:={VALIDATION_TEST_NS}{topic}")
-                if topic.startswith("/WM/"):
+                if topic.startswith("/WM/") or topic.startswith("/trajectory_predictor/"):
                     viewer_args.append(f"_observed_{param}:={VALIDATION_OBSERVED_BASELINE_NS}{topic}")
                     viewer_args.append(f"_observed_test_{param}:={VALIDATION_OBSERVED_TEST_NS}{topic}")
         self.viewer_proc = subprocess.Popen(
