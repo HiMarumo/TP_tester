@@ -31,3 +31,28 @@ services:
     stdin_open: true
     tty: true
     command: ["./run_viewer.sh"]
+
+  # Viewer 用: host network で起動し、ホスト側 rqt_image_view と同じ ROS graph を使う
+  tp_tester_viewer:
+    build: .
+    image: tp_tester:latest
+    user: "${UID:-1000}:${GID:-1000}"
+    network_mode: host
+    volumes:
+      - "${HOME}/projects:/home/nissan/projects"
+      - "${HOME}/TP_tester:/home/nissan/TP_tester"
+      - "/media/nissan:/media/nissan"
+    environment:
+      - DISPLAY=${DISPLAY}
+      - TP_TESTER_ROOT=/home/nissan/TP_tester
+      - NRC_WS_DEVEL=/home/nissan/projects/nrc_ws/devel/setup.bash
+      - TP_SKIP_BUILD=1
+      - TP_BASELINE_COMMIT=${TP_BASELINE_COMMIT:-}
+      - TP_TEST_COMMIT=${TP_TEST_COMMIT:-}
+      - HOME=/home/nissan/TP_tester
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://127.0.0.1:11311}
+      - ROS_IP=${ROS_IP:-127.0.0.1}
+    working_dir: /home/nissan/TP_tester
+    stdin_open: true
+    tty: true
+    command: ["./run_viewer.sh"]

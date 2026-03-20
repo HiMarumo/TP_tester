@@ -1938,7 +1938,15 @@ class ViewerAppPyQt(QMainWindow):
         test_bags_root = self.root / self.paths["test_bags"]
         test_bags_dir = test_bags_root / rel
         extra_bags = get_bag_files_in_dir(test_bags_dir) if test_bags_dir.is_dir() else []
-        play_bags = [str(b) for b in extra_bags]
+        image_bags = sorted(test_bags_dir.glob("images*.bag")) if test_bags_dir.is_dir() else []
+        play_bags: list[str] = []
+        seen_bags: set[str] = set()
+        for bag_path in [*extra_bags, *image_bags]:
+            bag_str = str(bag_path)
+            if bag_str in seen_bags:
+                continue
+            seen_bags.add(bag_str)
+            play_bags.append(bag_str)
         play_bags.append(str(baseline_bag))
         if observed_baseline_bag.exists():
             play_bags.append(str(observed_baseline_bag))
