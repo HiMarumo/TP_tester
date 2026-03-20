@@ -90,6 +90,7 @@ struct ProfileKindData {
 struct CollisionProfile {
     ProfileKindData hard;
     ProfileKindData soft;
+    ProfileKindData middle;
 };
 
 double normalize_angle(double angle) {
@@ -502,9 +503,28 @@ std::tuple<double, double, double, double> sample_collision_curve(
     return std::make_tuple(seg.x0 + seg.ux * delta, seg.y0 + seg.uy * delta, seg.ux, seg.uy);
 }
 
-std::vector<Point2> collider_local_points(double speed, double length, double width, bool soft) {
-    const double scale = soft ? 1.1 : 1.0;
-    const double major_scale = soft ? 2.0 : 1.0;
+enum class ColliderKind {
+    Hard,
+    Soft,
+    Middle,
+};
+
+std::pair<double, double> collider_scales(ColliderKind kind) {
+    switch (kind) {
+    case ColliderKind::Hard:
+        return {1.0, 1.0};
+    case ColliderKind::Soft:
+        return {1.1, 2.0};
+    case ColliderKind::Middle:
+        return {1.05, 1.5};
+    }
+    return {1.0, 1.0};
+}
+
+std::vector<Point2> collider_local_points(double speed, double length, double width, ColliderKind kind) {
+    const auto scales = collider_scales(kind);
+    const double scale = scales.first;
+    const double major_scale = scales.second;
     const double rect_l = std::max(0.1, length * scale);
     const double rect_w = std::max(0.1, width * scale);
     const double half_l = 0.5 * rect_l;
@@ -646,24 +666,33 @@ CollisionProfile build_collision_profile(const std::vector<Step>& points, double
     profile.hard.aabbs.reserve(n);
     profile.soft.polys.reserve(n);
     profile.soft.aabbs.reserve(n);
+    profile.middle.polys.reserve(n);
+    profile.middle.aabbs.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
         const auto heading_speed_pair = path_heading_speed(points, static_cast<int>(i));
         const double heading = heading_speed_pair.first;
         const double speed = heading_speed_pair.second;
         const double base_s = i < curve.s.size() ? curve.s[i] : 0.0;
-        const auto hard_local = collider_local_points(speed, length, width, false);
+        const auto hard_local = collider_local_points(speed, length, width, ColliderKind::Hard);
         auto hard_poly = transform_collider_local_points(curve, static_cast<int>(i), base_s, heading, hard_local);
         const Aabb hard_aabb = polygon_aabb(hard_poly);
         profile.hard.polys.push_back(std::move(hard_poly));
         profile.hard.aabbs.push_back(hard_aabb);
         merge_aabb(profile.hard, hard_aabb);
 
-        const auto soft_local = collider_local_points(speed, length, width, true);
+        const auto soft_local = collider_local_points(speed, length, width, ColliderKind::Soft);
         auto soft_poly = transform_collider_local_points(curve, static_cast<int>(i), base_s, heading, soft_local);
         const Aabb soft_aabb = polygon_aabb(soft_poly);
         profile.soft.polys.push_back(std::move(soft_poly));
         profile.soft.aabbs.push_back(soft_aabb);
         merge_aabb(profile.soft, soft_aabb);
+
+        const auto middle_local = collider_local_points(speed, length, width, ColliderKind::Middle);
+        auto middle_poly = transform_collider_local_points(curve, static_cast<int>(i), base_s, heading, middle_local);
+        const Aabb middle_aabb = polygon_aabb(middle_poly);
+        profile.middle.polys.push_back(std::move(middle_poly));
+        profile.middle.aabbs.push_back(middle_aabb);
+        merge_aabb(profile.middle, middle_aabb);
     }
     return profile;
 }
@@ -681,8 +710,8 @@ std::pair<bool, bool> evaluate_collision_pair(
     }
     const CollisionProfile pred_profile = build_collision_profile(pred_pts, pred_length, pred_width);
     const CollisionProfile ego_profile = build_collision_profile(ego_pts, ego_length, ego_width);
-    const bool need_hard = pred_profile.hard.has_path_aabb && ego_profile.soft.has_path_aabb && aabb_overlaps(pred_profile.hard.path_aabb, ego_profile.soft.path_aabb);
-    const bool need_soft = pred_profile.soft.has_path_aabb && ego_profile.soft.has_path_aabb && aabb_overlaps(pred_profile.soft.path_aabb, ego_profile.soft.path_aabb);
+    const bool need_hard = pred_profile.hard.has_path_aabb && ego_profile.middle.has_path_aabb && aabb_overlaps(pred_profile.hard.path_aabb, ego_profile.middle.path_aabb);
+    const bool need_soft = pred_profile.soft.has_path_aabb && ego_profile.middle.has_path_aabb && aabb_overlaps(pred_profile.soft.path_aabb, ego_profile.middle.path_aabb);
     if (!need_hard && !need_soft) {
         return {false, false};
     }
@@ -694,19 +723,19 @@ std::pair<bool, bool> evaluate_collision_pair(
         if (ego_idx < 0) {
             continue;
         }
-        const auto& ego_soft_poly = ego_profile.soft.polys[static_cast<std::size_t>(ego_idx)];
-        const auto& ego_soft_aabb = ego_profile.soft.aabbs[static_cast<std::size_t>(ego_idx)];
+        const auto& ego_middle_poly = ego_profile.middle.polys[static_cast<std::size_t>(ego_idx)];
+        const auto& ego_middle_aabb = ego_profile.middle.aabbs[static_cast<std::size_t>(ego_idx)];
         if (need_hard && !hard) {
             const auto& pred_poly = pred_profile.hard.polys[i];
             const auto& pred_aabb = pred_profile.hard.aabbs[i];
-            if (aabb_overlaps(pred_aabb, ego_soft_aabb) && polygons_intersect(pred_poly, ego_soft_poly)) {
+            if (aabb_overlaps(pred_aabb, ego_middle_aabb) && polygons_intersect(pred_poly, ego_middle_poly)) {
                 hard = true;
             }
         }
         if (need_soft && !soft) {
             const auto& pred_poly = pred_profile.soft.polys[i];
             const auto& pred_aabb = pred_profile.soft.aabbs[i];
-            if (aabb_overlaps(pred_aabb, ego_soft_aabb) && polygons_intersect(pred_poly, ego_soft_poly)) {
+            if (aabb_overlaps(pred_aabb, ego_middle_aabb) && polygons_intersect(pred_poly, ego_middle_poly)) {
                 soft = true;
             }
         }

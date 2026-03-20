@@ -74,6 +74,23 @@ CLASS_GROUP_BY_CLASSIFICATION = {
     CLASSIFICATION_PEDESTRIAN: CLASS_GROUP_PEDESTRIAN,
 }
 
+PATH_CLASS_GROUP_FOUR_WHEEL = "four_wheel"
+PATH_CLASS_GROUP_TWO_WHEEL = "two_wheel"
+PATH_CLASS_GROUP_PEDESTRIAN = "pedestrian"
+PATH_CLASS_GROUPS = (
+    PATH_CLASS_GROUP_FOUR_WHEEL,
+    PATH_CLASS_GROUP_TWO_WHEEL,
+    PATH_CLASS_GROUP_PEDESTRIAN,
+)
+PATH_CLASS_GROUP_BY_CLASSIFICATION = {
+    CLASSIFICATION_CAR: PATH_CLASS_GROUP_FOUR_WHEEL,
+    CLASSIFICATION_TRUCK: PATH_CLASS_GROUP_FOUR_WHEEL,
+    CLASSIFICATION_BUS: PATH_CLASS_GROUP_FOUR_WHEEL,
+    CLASSIFICATION_CYCLIST: PATH_CLASS_GROUP_TWO_WHEEL,
+    CLASSIFICATION_MOTORCYCLIST: PATH_CLASS_GROUP_TWO_WHEEL,
+    CLASSIFICATION_PEDESTRIAN: PATH_CLASS_GROUP_PEDESTRIAN,
+}
+
 CLASS_GROUP_TOLERANCES = {
     CLASS_GROUP_VEHICLE: {
         "time-relaxed_start": {
@@ -117,6 +134,7 @@ OPTIMAL_SELECTION_GROUP_PRIORITY = {
 VALIDATION_NS_ROOT = "/validation/eval"
 COLLISION_NS_ROOT = "/validation/collision"
 COLLISION_KINDS = ("hard", "soft")
+COLLISION_SOURCE_GROUPS = ("along", "opposite", "crossing")
 COLLISION_GROUPED_STATUSES = ("pred_collision", "pred_safe", "ego_pred_collision", "ego_pred_safe")
 COLLISION_BASE_STATUSES = ("ego_observed_collision", "ego_observed_safe")
 COLLISION_ALL_STATUSES = COLLISION_GROUPED_STATUSES + COLLISION_BASE_STATUSES
@@ -189,12 +207,76 @@ def _default_collision_kind_summary(detail: str = "ok") -> dict:
         "has_collision": False,
         "collision_paths": 0,
         "checked_paths": 0,
+        "by_group": {
+            group: {
+                "has_collision": False,
+                "collision_paths": 0,
+                "checked_paths": 0,
+                "detail": detail,
+            }
+            for group in COLLISION_SOURCE_GROUPS
+        },
         "detail": detail,
     }
 
 
 def _default_collision_summary(detail: str = "ok") -> dict:
     return {kind: _default_collision_kind_summary(detail) for kind in COLLISION_KINDS}
+
+
+def _default_path_class_group_summary(detail: str = "ok") -> dict:
+    return {
+        class_group: {
+            horizon: {
+                threshold: _default_threshold_summary(detail)
+                for threshold in VALIDATION_THRESHOLDS
+            }
+            for horizon in VALIDATION_HORIZONS
+        }
+        for class_group in PATH_CLASS_GROUPS
+    }
+
+
+def _new_collision_by_group_node(detail: str = "ok") -> dict:
+    return {
+        group: {
+            "has_collision": False,
+            "collision_paths": 0,
+            "checked_paths": 0,
+            "detail": detail,
+        }
+        for group in COLLISION_SOURCE_GROUPS
+    }
+
+
+def _merge_collision_kind_with_groups(dst: dict, src: dict | None) -> None:
+    if not isinstance(dst, dict) or not isinstance(src, dict):
+        return
+    dst["collision_paths"] = int(dst.get("collision_paths", 0) or 0) + int(src.get("collision_paths", 0) or 0)
+    dst["checked_paths"] = int(dst.get("checked_paths", 0) or 0) + int(src.get("checked_paths", 0) or 0)
+    dst["has_collision"] = bool(dst.get("has_collision", False) or src.get("has_collision", False))
+    if dst.get("detail") in (None, "", "ok") and src.get("detail") not in (None, "", "ok"):
+        dst["detail"] = src.get("detail")
+    dst_by_group = dst.get("by_group")
+    if not isinstance(dst_by_group, dict):
+        dst_by_group = _new_collision_by_group_node("ok")
+        dst["by_group"] = dst_by_group
+    src_by_group = src.get("by_group")
+    if not isinstance(src_by_group, dict):
+        return
+    for group in COLLISION_SOURCE_GROUPS:
+        dnode = dst_by_group.setdefault(
+            group,
+            {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+        )
+        snode = src_by_group.get(group, {})
+        if not isinstance(snode, dict):
+            continue
+        dnode["collision_paths"] = int(dnode.get("collision_paths", 0) or 0) + int(snode.get("collision_paths", 0) or 0)
+        dnode["checked_paths"] = int(dnode.get("checked_paths", 0) or 0) + int(snode.get("checked_paths", 0) or 0)
+        dnode["has_collision"] = bool(dnode.get("has_collision", False) or snode.get("has_collision", False))
+        if dnode.get("detail") in (None, "", "ok") and snode.get("detail") not in (None, "", "ok"):
+            dnode["detail"] = snode.get("detail")
 
 
 def default_side_summary(detail: str = "not_evaluated") -> dict:
@@ -377,6 +459,10 @@ def _obj_classification_of(obj) -> int:
 
 def _class_group_for_classification(classification: int) -> str:
     return CLASS_GROUP_BY_CLASSIFICATION.get(int(classification), CLASS_GROUP_VEHICLE)
+
+
+def _path_class_group_for_classification(classification: int) -> str | None:
+    return PATH_CLASS_GROUP_BY_CLASSIFICATION.get(int(classification))
 
 
 def _has_predicted_path(traj_obj) -> bool:
@@ -1084,6 +1170,72 @@ def _filter_scene_master_stamps_for_range(message_cache: dict, scene_timing: dic
         if is_stamp_in_evaluation_range(_to_nsec(ref_t), scene_timing):
             filtered.append(stamp)
     return filtered
+
+
+def _collect_object_class_maps_from_stamp_contexts(
+    stamp_contexts: dict[int, dict] | None,
+    object_classification_by_oid: dict[int, int],
+    object_path_class_group_by_oid: dict[int, str],
+) -> None:
+    if not isinstance(stamp_contexts, dict):
+        return
+    for context in stamp_contexts.values():
+        if not isinstance(context, dict):
+            continue
+        observed_objs_by_group = context.get("observed_objs_by_group", {})
+        observed_vsl_ids_by_group = context.get("observed_vsl_ids_by_group", {})
+        excluded_short = context.get("excluded_short_observed_ids", set()) or set()
+        if not isinstance(observed_objs_by_group, dict):
+            continue
+        for group in VALIDATION_GROUPS:
+            obs_map = observed_objs_by_group.get(group, {})
+            if not isinstance(obs_map, dict):
+                continue
+            vsl_ids = observed_vsl_ids_by_group.get(group, set()) if isinstance(observed_vsl_ids_by_group, dict) else set()
+            for oid, obs_entry in obs_map.items():
+                oid_int = int(oid)
+                if oid_int in excluded_short or oid_int in vsl_ids:
+                    continue
+                if not isinstance(obs_entry, dict):
+                    continue
+                classification = int(obs_entry.get("classification", CLASSIFICATION_UNCLASSIFIED))
+                object_classification_by_oid.setdefault(oid_int, classification)
+                class_group = _path_class_group_for_classification(classification)
+                if class_group in PATH_CLASS_GROUPS:
+                    object_path_class_group_by_oid.setdefault(oid_int, class_group)
+
+
+def _aggregate_path_class_group_validation(
+    per_object_validation: dict[int, dict[str, dict[str, dict]]],
+    object_path_class_group_by_oid: dict[int, str],
+) -> dict:
+    out = _default_path_class_group_summary("ok")
+    for oid, horizon_node in (per_object_validation or {}).items():
+        class_group = object_path_class_group_by_oid.get(int(oid))
+        if class_group not in PATH_CLASS_GROUPS:
+            continue
+        if not isinstance(horizon_node, dict):
+            continue
+        for horizon in VALIDATION_HORIZONS:
+            threshold_node = horizon_node.get(horizon, {})
+            if not isinstance(threshold_node, dict):
+                continue
+            for threshold in VALIDATION_THRESHOLDS:
+                src = threshold_node.get(threshold, {})
+                if not isinstance(src, dict):
+                    continue
+                dst = out[class_group][horizon][threshold]
+                dst["ok"] += int(src.get("ok", 0) or 0)
+                dst["total"] += int(src.get("total", 0) or 0)
+    for class_group in PATH_CLASS_GROUPS:
+        for horizon in VALIDATION_HORIZONS:
+            for threshold in VALIDATION_THRESHOLDS:
+                node = out[class_group][horizon][threshold]
+                if node["total"] > 0:
+                    node["rate"] = (100.0 * float(node["ok"])) / float(node["total"])
+                else:
+                    node["rate"] = 0.0
+    return out
 
 
 def _iter_stamp_chunks(master_stamps: list[int], chunk_size: int = EVAL_STAMP_CHUNK_SIZE):
@@ -1909,7 +2061,7 @@ def _build_collision_for_side(
     """Returns (summary, subscene_summaries, per_object_collision, per_subscene_object_collision)."""
     summary = _default_collision_summary("ok")
     subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
-    per_object_collision: dict[int, dict[str, dict]] = {}  # oid -> kind -> {collision_paths, checked_paths}
+    per_object_collision: dict[int, dict[str, dict]] = {}  # oid -> kind -> {collision_paths, checked_paths, by_group}
     per_subscene_object_collision: dict[int, dict[int, dict[str, dict]]] = {}
     bag_path = out_dir / f"collision_judgement_{side}.bag"
     manage_out_bag = False
@@ -2066,6 +2218,31 @@ def _build_collision_for_side(
                             sub_summary["collision"][kind]["has_collision"] = bool(
                                 sub_summary["collision"][kind]["has_collision"] or stamp_has_collision[kind]
                             )
+                        for group in COLLISION_SOURCE_GROUPS:
+                            group_collision = 0
+                            group_checked = 0
+                            for oid in set(pred_collision_indices[kind][group].keys()) | set(pred_safe_indices[kind][group].keys()):
+                                if _is_ego_id(oid) or oid in predicted_vsl_ids_by_group.get(group, set()):
+                                    continue
+                                c = len(pred_collision_indices[kind][group].get(oid, []))
+                                s = len(pred_safe_indices[kind][group].get(oid, []))
+                                group_collision += c
+                                group_checked += (c + s)
+                            gnode = summary[kind].setdefault("by_group", {}).setdefault(
+                                group,
+                                {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+                            )
+                            gnode["collision_paths"] += group_collision
+                            gnode["checked_paths"] += group_checked
+                            gnode["has_collision"] = bool(gnode["has_collision"] or (group_collision > 0))
+                            if sub_summary is not None:
+                                sub_gnode = sub_summary["collision"][kind].setdefault("by_group", {}).setdefault(
+                                    group,
+                                    {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+                                )
+                                sub_gnode["collision_paths"] += group_collision
+                                sub_gnode["checked_paths"] += group_checked
+                                sub_gnode["has_collision"] = bool(sub_gnode["has_collision"] or (group_collision > 0))
                         # Per-object collision for common-object aggregation
                         for group in VALIDATION_GROUPS:
                             for oid in set(pred_collision_indices[kind][group].keys()) | set(pred_safe_indices[kind][group].keys()):
@@ -2075,18 +2252,48 @@ def _build_collision_for_side(
                                 s = len(pred_safe_indices[kind][group].get(oid, []))
                                 oid_int = int(oid)
                                 if oid_int not in per_object_collision:
-                                    per_object_collision[oid_int] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                                    per_object_collision[oid_int] = {
+                                        k: {
+                                            "collision_paths": 0,
+                                            "checked_paths": 0,
+                                            "by_group": _new_collision_by_group_node("ok"),
+                                        }
+                                        for k in COLLISION_KINDS
+                                    }
                                 per_object_collision[oid_int][kind]["collision_paths"] += c
                                 per_object_collision[oid_int][kind]["checked_paths"] += c + s
+                                if group in COLLISION_SOURCE_GROUPS:
+                                    gnode = per_object_collision[oid_int][kind].setdefault("by_group", {}).setdefault(
+                                        group,
+                                        {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+                                    )
+                                    gnode["collision_paths"] += c
+                                    gnode["checked_paths"] += c + s
+                                    gnode["has_collision"] = bool(gnode["has_collision"] or (c > 0))
                                 if subscene_index is not None:
                                     sub_idx = int(subscene_index)
                                     if sub_idx not in per_subscene_object_collision:
                                         per_subscene_object_collision[sub_idx] = {}
                                     subscene_map = per_subscene_object_collision[sub_idx]
                                     if oid_int not in subscene_map:
-                                        subscene_map[oid_int] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                                        subscene_map[oid_int] = {
+                                            k: {
+                                                "collision_paths": 0,
+                                                "checked_paths": 0,
+                                                "by_group": _new_collision_by_group_node("ok"),
+                                            }
+                                            for k in COLLISION_KINDS
+                                        }
                                     subscene_map[oid_int][kind]["collision_paths"] += c
                                     subscene_map[oid_int][kind]["checked_paths"] += c + s
+                                    if group in COLLISION_SOURCE_GROUPS:
+                                        sub_gnode = subscene_map[oid_int][kind].setdefault("by_group", {}).setdefault(
+                                            group,
+                                            {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+                                        )
+                                        sub_gnode["collision_paths"] += c
+                                        sub_gnode["checked_paths"] += c + s
+                                        sub_gnode["has_collision"] = bool(sub_gnode["has_collision"] or (c > 0))
 
                     for group in VALIDATION_GROUPS:
                         for status in COLLISION_GROUPED_STATUSES:
@@ -2170,8 +2377,28 @@ def _build_collision_for_side(
 
     for kind in COLLISION_KINDS:
         summary[kind]["has_collision"] = bool(summary[kind]["collision_paths"] > 0)
+        by_group = summary[kind].get("by_group", {})
+        if not isinstance(by_group, dict):
+            by_group = {}
+            summary[kind]["by_group"] = by_group
+        for group in COLLISION_SOURCE_GROUPS:
+            gnode = by_group.setdefault(
+                group,
+                {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+            )
+            gnode["has_collision"] = bool(gnode.get("collision_paths", 0) > 0)
         for sub in subscene_summaries:
             sub["collision"][kind]["has_collision"] = bool(sub["collision"][kind]["collision_paths"] > 0)
+            sub_by_group = sub["collision"][kind].get("by_group", {})
+            if not isinstance(sub_by_group, dict):
+                sub_by_group = {}
+                sub["collision"][kind]["by_group"] = sub_by_group
+            for group in COLLISION_SOURCE_GROUPS:
+                gnode = sub_by_group.setdefault(
+                    group,
+                    {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+                )
+                gnode["has_collision"] = bool(gnode.get("collision_paths", 0) > 0)
     if manage_out_bag and out_bag is None and HAS_ROSBAG:
         with rosbag.Bag(str(bag_path), "w", chunk_threshold=64 * 1024):
             pass
@@ -2381,9 +2608,12 @@ def evaluate_validation_for_side(
             for threshold in VALIDATION_THRESHOLDS
         }
     summary["collision"] = _default_collision_summary("ok")
+    summary["path_class_group_validation"] = _default_path_class_group_summary("ok")
     per_object_validation: dict[int, dict[str, dict[str, dict]]] = {}
     per_subscene_object_validation: dict[int, dict[int, dict[str, dict[str, dict]]]] = {}
     per_subscene_object_collision: dict[int, dict[int, dict[str, dict]]] = {}
+    object_classification_by_oid: dict[int, int] = {}
+    object_path_class_group_by_oid: dict[int, str] = {}
     validation_bag_path = out_dir / f"validation_{side}.bag"
     collision_bag_path = out_dir / f"collision_judgement_{side}.bag"
     for stale_path in (validation_bag_path, collision_bag_path):
@@ -2393,10 +2623,16 @@ def evaluate_validation_for_side(
         summary["evaluated_object_ids"] = []
         summary["per_object_validation"] = {}
         summary["per_object_collision"] = {}
+        summary["evaluated_object_classification"] = {}
+        summary["evaluated_object_path_class_group"] = {}
+        summary["path_class_group_validation"] = _default_path_class_group_summary("ok")
         for sub in summary.get("subscenes", []):
             sub["evaluated_object_ids"] = []
             sub["per_object_validation"] = {}
             sub["per_object_collision"] = {}
+            sub["evaluated_object_classification"] = {}
+            sub["evaluated_object_path_class_group"] = {}
+            sub["path_class_group_validation"] = _default_path_class_group_summary("ok")
 
     if not HAS_ROSBAG:
         detail = "rosbag not available"
@@ -2452,6 +2688,11 @@ def evaluate_validation_for_side(
         chunk_total = max(1, (len(filtered_master_stamps) + EVAL_STAMP_CHUNK_SIZE - 1) // EVAL_STAMP_CHUNK_SIZE)
         for chunk_idx, chunk_stamps in enumerate(_iter_stamp_chunks(filtered_master_stamps), start=1):
             chunk_cache = _build_scene_eval_chunk_cache(message_cache, chunk_stamps)
+            _collect_object_class_maps_from_stamp_contexts(
+                chunk_cache.get("stamp_contexts"),
+                object_classification_by_oid,
+                object_path_class_group_by_oid,
+            )
             chunk_label = f"chunk {chunk_idx}/{chunk_total}"
             try:
                 for horizon in VALIDATION_HORIZONS:
@@ -2537,10 +2778,19 @@ def evaluate_validation_for_side(
                 )
                 for oid, kind_d in (chunk_per_object_collision or {}).items():
                     if oid not in per_object_collision:
-                        per_object_collision[oid] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                        per_object_collision[oid] = {
+                            k: {
+                                "collision_paths": 0,
+                                "checked_paths": 0,
+                                "by_group": _new_collision_by_group_node("ok"),
+                            }
+                            for k in COLLISION_KINDS
+                        }
                     for kind in COLLISION_KINDS:
-                        per_object_collision[oid][kind]["collision_paths"] += int(kind_d.get(kind, {}).get("collision_paths", 0))
-                        per_object_collision[oid][kind]["checked_paths"] += int(kind_d.get(kind, {}).get("checked_paths", 0))
+                        _merge_collision_kind_with_groups(
+                            per_object_collision[oid][kind],
+                            kind_d.get(kind, {}),
+                        )
                 for sub_idx, sub_kind_d in (chunk_per_subscene_object_collision or {}).items():
                     sub_idx_int = int(sub_idx)
                     if sub_idx_int not in per_subscene_object_collision:
@@ -2549,28 +2799,31 @@ def evaluate_validation_for_side(
                     for oid, kind_d in (sub_kind_d or {}).items():
                         oid_int = int(oid)
                         if oid_int not in subscene_map:
-                            subscene_map[oid_int] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                            subscene_map[oid_int] = {
+                                k: {
+                                    "collision_paths": 0,
+                                    "checked_paths": 0,
+                                    "by_group": _new_collision_by_group_node("ok"),
+                                }
+                                for k in COLLISION_KINDS
+                            }
                         for kind in COLLISION_KINDS:
-                            subscene_map[oid_int][kind]["collision_paths"] += int(kind_d.get(kind, {}).get("collision_paths", 0))
-                            subscene_map[oid_int][kind]["checked_paths"] += int(kind_d.get(kind, {}).get("checked_paths", 0))
+                            _merge_collision_kind_with_groups(
+                                subscene_map[oid_int][kind],
+                                kind_d.get(kind, {}),
+                            )
                 for kind in COLLISION_KINDS:
-                    dst = summary["collision"][kind]
-                    src = chunk_collision_summary.get(kind, {})
-                    dst["collision_paths"] += int(src.get("collision_paths", 0))
-                    dst["checked_paths"] += int(src.get("checked_paths", 0))
-                    dst["has_collision"] = bool(dst["has_collision"] or src.get("has_collision", False))
-                    if dst.get("detail") == "ok" and src.get("detail") not in (None, "ok"):
-                        dst["detail"] = src.get("detail")
+                    _merge_collision_kind_with_groups(
+                        summary["collision"][kind],
+                        chunk_collision_summary.get(kind, {}),
+                    )
                 for idx, sub in enumerate(chunk_collision_subscenes):
                     if idx < len(summary["subscenes"]):
                         for kind in COLLISION_KINDS:
-                            dst = summary["subscenes"][idx]["collision"][kind]
-                            src = sub["collision"][kind]
-                            dst["collision_paths"] += int(src.get("collision_paths", 0))
-                            dst["checked_paths"] += int(src.get("checked_paths", 0))
-                            dst["has_collision"] = bool(dst["has_collision"] or src.get("has_collision", False))
-                            if dst.get("detail") == "not_evaluated" and src.get("detail") not in (None, "ok", "not_evaluated"):
-                                dst["detail"] = src.get("detail")
+                            _merge_collision_kind_with_groups(
+                                summary["subscenes"][idx]["collision"][kind],
+                                sub["collision"][kind],
+                            )
             finally:
                 del chunk_cache
                 gc.collect()
@@ -2602,11 +2855,31 @@ def evaluate_validation_for_side(
                     node["detail"] = "ok"
         for kind in COLLISION_KINDS:
             sub["collision"][kind]["has_collision"] = bool(sub["collision"][kind]["collision_paths"] > 0)
+            by_group = sub["collision"][kind].get("by_group", {})
+            if not isinstance(by_group, dict):
+                by_group = {}
+                sub["collision"][kind]["by_group"] = by_group
+            for group in COLLISION_SOURCE_GROUPS:
+                gnode = by_group.setdefault(
+                    group,
+                    {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+                )
+                gnode["has_collision"] = bool(gnode.get("collision_paths", 0) > 0)
             if sub["collision"][kind].get("detail") == "not_evaluated":
                 sub["collision"][kind]["detail"] = "ok"
     for kind in COLLISION_KINDS:
         node = summary["collision"].get(kind, {})
         node["has_collision"] = bool(node.get("collision_paths", 0) > 0)
+        by_group = node.get("by_group", {})
+        if not isinstance(by_group, dict):
+            by_group = {}
+            node["by_group"] = by_group
+        for group in COLLISION_SOURCE_GROUPS:
+            gnode = by_group.setdefault(
+                group,
+                {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+            )
+            gnode["has_collision"] = bool(gnode.get("collision_paths", 0) > 0)
         state = "Collision" if bool(node.get("has_collision")) else "Safe"
         print(
             f"[collision] {rel} {side}-{kind}: {state} "
@@ -2623,6 +2896,18 @@ def evaluate_validation_for_side(
         }
         for oid in evaluated_object_ids
     }
+    summary["evaluated_object_classification"] = {
+        str(oid): int(object_classification_by_oid.get(int(oid), CLASSIFICATION_UNCLASSIFIED))
+        for oid in evaluated_object_ids
+    }
+    summary["evaluated_object_path_class_group"] = {
+        str(oid): object_path_class_group_by_oid.get(int(oid), "")
+        for oid in evaluated_object_ids
+    }
+    summary["path_class_group_validation"] = _aggregate_path_class_group_validation(
+        per_object_validation,
+        object_path_class_group_by_oid,
+    )
     summary["per_object_collision"] = {
         str(oid): {kind: per_object_collision[oid][kind] for kind in COLLISION_KINDS}
         for oid in sorted(per_object_collision.keys())
@@ -2639,6 +2924,18 @@ def evaluate_validation_for_side(
             }
             for oid in sub_evaluated_object_ids
         }
+        sub["evaluated_object_classification"] = {
+            str(oid): int(object_classification_by_oid.get(int(oid), CLASSIFICATION_UNCLASSIFIED))
+            for oid in sub_evaluated_object_ids
+        }
+        sub["evaluated_object_path_class_group"] = {
+            str(oid): object_path_class_group_by_oid.get(int(oid), "")
+            for oid in sub_evaluated_object_ids
+        }
+        sub["path_class_group_validation"] = _aggregate_path_class_group_validation(
+            sub_per_object_validation,
+            object_path_class_group_by_oid,
+        )
         sub_per_object_collision = per_subscene_object_collision.get(sub_idx, {})
         sub["per_object_collision"] = {
             str(oid): {kind: sub_per_object_collision[oid][kind] for kind in COLLISION_KINDS}

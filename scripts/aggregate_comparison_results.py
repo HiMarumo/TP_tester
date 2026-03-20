@@ -19,6 +19,8 @@ except Exception:
 VALIDATION_HORIZONS = ("half-time-relaxed", "time-relaxed")
 VALIDATION_THRESHOLDS = ("approximate", "strict")
 COLLISION_KINDS = ("hard", "soft")
+COLLISION_SOURCE_GROUPS = ("along", "opposite", "crossing")
+PATH_CLASS_GROUPS = ("four_wheel", "two_wheel", "pedestrian")
 VALIDATION_SAMPLE_TOPIC_RE = re.compile(
     r"^/validation/eval/(?P<side>baseline|test)/(?P<horizon>[^/]+)/(?P<threshold>[^/]+)/"
     r"(?P<group>along|opposite|crossing|other)/(?P<status>optimal|observed_ok|observed_ng)/WM/tracked_object_set_with_prediction$"
@@ -80,12 +82,34 @@ def _default_collision_kind_summary(detail: str) -> dict:
         "has_collision": False,
         "collision_paths": 0,
         "checked_paths": 0,
+        "by_group": {
+            group: {
+                "has_collision": False,
+                "collision_paths": 0,
+                "checked_paths": 0,
+                "detail": detail,
+            }
+            for group in COLLISION_SOURCE_GROUPS
+        },
         "detail": detail,
     }
 
 
 def _default_collision_side_summary(detail: str) -> dict:
     return {kind: _default_collision_kind_summary(detail) for kind in COLLISION_KINDS}
+
+
+def _default_path_class_group_validation(detail: str) -> dict:
+    return {
+        class_group: {
+            horizon: {
+                threshold: _default_threshold_summary(detail)
+                for threshold in VALIDATION_THRESHOLDS
+            }
+            for horizon in VALIDATION_HORIZONS
+        }
+        for class_group in PATH_CLASS_GROUPS
+    }
 
 
 def _load_json_dict(path: Path) -> dict | None:
@@ -160,6 +184,30 @@ def _load_side_summary(path: Path, side: str) -> dict:
     return out
 
 
+def _load_side_path_class_group_validation(path: Path, side: str) -> dict:
+    raw = _load_json_dict(path)
+    if raw is None:
+        return _default_path_class_group_validation(f"{side}_path_class_group_missing")
+    class_raw = raw.get("path_class_group_validation", {})
+    if not isinstance(class_raw, dict):
+        return _default_path_class_group_validation(f"{side}_path_class_group_missing")
+    out = _default_path_class_group_validation("ok")
+    for class_group in PATH_CLASS_GROUPS:
+        group_node = class_raw.get(class_group, {})
+        if not isinstance(group_node, dict):
+            group_node = {}
+        for horizon in VALIDATION_HORIZONS:
+            hnode = group_node.get(horizon, group_node.get(horizon.replace("-", "_"), {}))
+            if not isinstance(hnode, dict):
+                hnode = {}
+            for threshold in VALIDATION_THRESHOLDS:
+                out[class_group][horizon][threshold] = _normalize_threshold_summary(
+                    hnode.get(threshold, {}),
+                    detail_fallback=f"{side}_{class_group}_{horizon}_{threshold}_summary_missing",
+                )
+    return out
+
+
 def _normalize_collision_kind_summary(node: dict, detail_fallback: str) -> dict:
     if not isinstance(node, dict):
         return _default_collision_kind_summary(detail_fallback)
@@ -175,10 +223,33 @@ def _normalize_collision_kind_summary(node: dict, detail_fallback: str) -> dict:
     detail = str(node.get("detail") or detail_fallback)
     if collision_paths > 0:
         has_collision = True
+    by_group_raw = node.get("by_group", {})
+    by_group = {}
+    for group in COLLISION_SOURCE_GROUPS:
+        gnode = by_group_raw.get(group, {}) if isinstance(by_group_raw, dict) else {}
+        if not isinstance(gnode, dict):
+            gnode = {}
+        try:
+            g_collision_paths = max(0, int(gnode.get("collision_paths", 0) or 0))
+        except Exception:
+            g_collision_paths = 0
+        try:
+            g_checked_paths = max(0, int(gnode.get("checked_paths", 0) or 0))
+        except Exception:
+            g_checked_paths = 0
+        g_has_collision = bool(gnode.get("has_collision", False) or (g_collision_paths > 0))
+        by_group[group] = {
+            "has_collision": g_has_collision,
+            "collision_paths": g_collision_paths,
+            "checked_paths": g_checked_paths,
+            "detail": str(gnode.get("detail") or detail_fallback),
+        }
+
     return {
         "has_collision": has_collision,
         "collision_paths": collision_paths,
         "checked_paths": checked_paths,
+        "by_group": by_group,
         "detail": detail,
     }
 
@@ -259,22 +330,32 @@ def _extract_validation_sample_sets(
     scene_timing: dict | None,
     evaluated_scene_oids: set[int] | None = None,
     evaluated_subscene_oids: dict[int, set[int]] | None = None,
+    scene_path_class_group_by_oid: dict[int, str] | None = None,
+    subscene_path_class_group_by_oid: dict[int, dict[int, str]] | None = None,
     progress_prefix: str | None = None,
-) -> tuple[dict, dict[int, dict], bool]:
+) -> tuple[dict, dict[int, dict], dict[str, dict], dict[int, dict[str, dict]], bool]:
     scene_sets = _new_validation_sample_sets()
     subscene_sets: dict[int, dict] = {}
+    scene_sets_by_class = {class_group: _new_validation_sample_sets() for class_group in PATH_CLASS_GROUPS}
+    subscene_sets_by_class: dict[int, dict[str, dict]] = {}
     scene_observed_ok = _new_validation_sample_sets()
     scene_observed_ng = _new_validation_sample_sets()
     scene_optimal = _new_validation_sample_sets()
     subscene_observed_ok: dict[int, dict] = {}
     subscene_observed_ng: dict[int, dict] = {}
     subscene_optimal: dict[int, dict] = {}
+    scene_observed_ok_by_class = {class_group: _new_validation_sample_sets() for class_group in PATH_CLASS_GROUPS}
+    scene_observed_ng_by_class = {class_group: _new_validation_sample_sets() for class_group in PATH_CLASS_GROUPS}
+    scene_optimal_by_class = {class_group: _new_validation_sample_sets() for class_group in PATH_CLASS_GROUPS}
+    subscene_observed_ok_by_class: dict[int, dict[str, dict]] = {}
+    subscene_observed_ng_by_class: dict[int, dict[str, dict]] = {}
+    subscene_optimal_by_class: dict[int, dict[str, dict]] = {}
     has_optimal_topic = {
         horizon: {threshold: False for threshold in VALIDATION_THRESHOLDS}
         for horizon in VALIDATION_HORIZONS
     }
     if not HAS_ROSBAG or not validation_bag_path.exists():
-        return scene_sets, subscene_sets, False
+        return scene_sets, subscene_sets, scene_sets_by_class, subscene_sets_by_class, False
     try:
         with rosbag.Bag(str(validation_bag_path), "r") as bag:
             info = bag.get_type_and_topic_info()
@@ -301,7 +382,7 @@ def _extract_validation_sample_sets(
                 target_topics.append(topic_str)
 
             if not target_topics:
-                return scene_sets, subscene_sets, False
+                return scene_sets, subscene_sets, scene_sets_by_class, subscene_sets_by_class, False
 
             read_total = 0
             try:
@@ -327,6 +408,22 @@ def _extract_validation_sample_sets(
                     subscene_observed_ok[subscene_index] = _new_validation_sample_sets()
                     subscene_observed_ng[subscene_index] = _new_validation_sample_sets()
                     subscene_optimal[subscene_index] = _new_validation_sample_sets()
+                    subscene_sets_by_class[subscene_index] = {
+                        class_group: _new_validation_sample_sets()
+                        for class_group in PATH_CLASS_GROUPS
+                    }
+                    subscene_observed_ok_by_class[subscene_index] = {
+                        class_group: _new_validation_sample_sets()
+                        for class_group in PATH_CLASS_GROUPS
+                    }
+                    subscene_observed_ng_by_class[subscene_index] = {
+                        class_group: _new_validation_sample_sets()
+                        for class_group in PATH_CLASS_GROUPS
+                    }
+                    subscene_optimal_by_class[subscene_index] = {
+                        class_group: _new_validation_sample_sets()
+                        for class_group in PATH_CLASS_GROUPS
+                    }
 
                 objects = getattr(msg, "objects", []) or []
                 for obj in objects:
@@ -336,12 +433,22 @@ def _extract_validation_sample_sets(
                     if evaluated_scene_oids is not None and oid not in evaluated_scene_oids:
                         continue
                     key = (int(stamp_ns), int(oid))
+                    class_group = None
+                    if isinstance(scene_path_class_group_by_oid, dict):
+                        class_group = scene_path_class_group_by_oid.get(int(oid))
                     if status == "observed_ok":
                         scene_observed_ok[horizon][threshold]["ok"].add(key)
                     elif status == "observed_ng":
                         scene_observed_ng[horizon][threshold]["total"].add(key)
                     elif status == "optimal":
                         scene_optimal[horizon][threshold]["ok"].add(key)
+                    if class_group in PATH_CLASS_GROUPS:
+                        if status == "observed_ok":
+                            scene_observed_ok_by_class[class_group][horizon][threshold]["ok"].add(key)
+                        elif status == "observed_ng":
+                            scene_observed_ng_by_class[class_group][horizon][threshold]["total"].add(key)
+                        elif status == "optimal":
+                            scene_optimal_by_class[class_group][horizon][threshold]["ok"].add(key)
                     if subscene_index is not None:
                         allow_subscene = True
                         if evaluated_subscene_oids is not None:
@@ -349,18 +456,30 @@ def _extract_validation_sample_sets(
                             if allowed_ids is not None and oid not in allowed_ids:
                                 allow_subscene = False
                         if allow_subscene:
+                            sub_class_group = class_group
+                            if isinstance(subscene_path_class_group_by_oid, dict):
+                                sub_class_group = (
+                                    subscene_path_class_group_by_oid.get(int(subscene_index), {}) or {}
+                                ).get(int(oid), sub_class_group)
                             if status == "observed_ok":
                                 subscene_observed_ok[subscene_index][horizon][threshold]["ok"].add(key)
                             elif status == "observed_ng":
                                 subscene_observed_ng[subscene_index][horizon][threshold]["total"].add(key)
                             elif status == "optimal":
                                 subscene_optimal[subscene_index][horizon][threshold]["ok"].add(key)
+                            if sub_class_group in PATH_CLASS_GROUPS:
+                                if status == "observed_ok":
+                                    subscene_observed_ok_by_class[subscene_index][sub_class_group][horizon][threshold]["ok"].add(key)
+                                elif status == "observed_ng":
+                                    subscene_observed_ng_by_class[subscene_index][sub_class_group][horizon][threshold]["total"].add(key)
+                                elif status == "optimal":
+                                    subscene_optimal_by_class[subscene_index][sub_class_group][horizon][threshold]["ok"].add(key)
                 if progress_prefix and read_total > 0:
                     _print_live_progress(progress_prefix, read_done, read_total, progress_state)
             if progress_prefix and read_total > 0 and read_done < read_total:
                 _print_live_progress(progress_prefix, read_total, read_total, progress_state)
     except Exception:
-        return _new_validation_sample_sets(), {}, False
+        return _new_validation_sample_sets(), {}, {class_group: _new_validation_sample_sets() for class_group in PATH_CLASS_GROUPS}, {}, False
 
     for horizon in VALIDATION_HORIZONS:
         for threshold in VALIDATION_THRESHOLDS:
@@ -372,6 +491,15 @@ def _extract_validation_sample_sets(
                 ok_keys = set(ok_candidates)
             scene_sets[horizon][threshold]["ok"] = ok_keys
             scene_sets[horizon][threshold]["total"] = set(ok_keys) | set(ng_keys)
+            for class_group in PATH_CLASS_GROUPS:
+                ok_candidates_cls = scene_observed_ok_by_class[class_group][horizon][threshold]["ok"]
+                ng_keys_cls = scene_observed_ng_by_class[class_group][horizon][threshold]["total"]
+                if has_optimal_topic[horizon][threshold]:
+                    ok_keys_cls = ok_candidates_cls & scene_optimal_by_class[class_group][horizon][threshold]["ok"]
+                else:
+                    ok_keys_cls = set(ok_candidates_cls)
+                scene_sets_by_class[class_group][horizon][threshold]["ok"] = ok_keys_cls
+                scene_sets_by_class[class_group][horizon][threshold]["total"] = set(ok_keys_cls) | set(ng_keys_cls)
 
     for subscene_index in subscene_sets.keys():
         for horizon in VALIDATION_HORIZONS:
@@ -384,8 +512,17 @@ def _extract_validation_sample_sets(
                     ok_keys = set(ok_candidates)
                 subscene_sets[subscene_index][horizon][threshold]["ok"] = ok_keys
                 subscene_sets[subscene_index][horizon][threshold]["total"] = set(ok_keys) | set(ng_keys)
+                for class_group in PATH_CLASS_GROUPS:
+                    ok_candidates_cls = subscene_observed_ok_by_class[subscene_index][class_group][horizon][threshold]["ok"]
+                    ng_keys_cls = subscene_observed_ng_by_class[subscene_index][class_group][horizon][threshold]["total"]
+                    if has_optimal_topic[horizon][threshold]:
+                        ok_keys_cls = ok_candidates_cls & subscene_optimal_by_class[subscene_index][class_group][horizon][threshold]["ok"]
+                    else:
+                        ok_keys_cls = set(ok_candidates_cls)
+                    subscene_sets_by_class[subscene_index][class_group][horizon][threshold]["ok"] = ok_keys_cls
+                    subscene_sets_by_class[subscene_index][class_group][horizon][threshold]["total"] = set(ok_keys_cls) | set(ng_keys_cls)
 
-    return scene_sets, subscene_sets, True
+    return scene_sets, subscene_sets, scene_sets_by_class, subscene_sets_by_class, True
 
 
 def _build_validation_common_from_sample_sets(
@@ -457,6 +594,45 @@ def _evaluated_oid_filters_from_summary(raw_summary: dict | None) -> tuple[set[i
     return scene_oids, subscene_oids
 
 
+def _path_class_group_maps_from_summary(raw_summary: dict | None) -> tuple[dict[int, str], dict[int, dict[int, str]]]:
+    scene_map: dict[int, str] = {}
+    subscene_map: dict[int, dict[int, str]] = {}
+    if not isinstance(raw_summary, dict):
+        return scene_map, subscene_map
+    raw_scene_map = raw_summary.get("evaluated_object_path_class_group", {})
+    if isinstance(raw_scene_map, dict):
+        for oid, class_group in raw_scene_map.items():
+            try:
+                oid_int = int(oid)
+            except Exception:
+                continue
+            class_group_str = str(class_group or "")
+            if class_group_str in PATH_CLASS_GROUPS:
+                scene_map[oid_int] = class_group_str
+    for idx, sub in enumerate(raw_summary.get("subscenes", []) or []):
+        if not isinstance(sub, dict):
+            continue
+        try:
+            sub_idx = int(sub.get("index", idx) or idx)
+        except Exception:
+            sub_idx = idx
+        raw_sub_map = sub.get("evaluated_object_path_class_group", {})
+        if not isinstance(raw_sub_map, dict):
+            continue
+        out_map: dict[int, str] = {}
+        for oid, class_group in raw_sub_map.items():
+            try:
+                oid_int = int(oid)
+            except Exception:
+                continue
+            class_group_str = str(class_group or "")
+            if class_group_str in PATH_CLASS_GROUPS:
+                out_map[oid_int] = class_group_str
+        if out_map:
+            subscene_map[sub_idx] = out_map
+    return scene_map, subscene_map
+
+
 def _build_validation_common_from_bags(
     baseline_validation_bag_path: Path,
     test_validation_bag_path: Path,
@@ -464,32 +640,68 @@ def _build_validation_common_from_bags(
     baseline_summary_raw: dict | None = None,
     test_summary_raw: dict | None = None,
     progress_label: str | None = None,
-) -> tuple[dict, dict, list[int], dict[int, dict], bool]:
+) -> tuple[dict, dict, list[int], dict[int, dict], dict, dict, bool]:
     baseline_scene_oids, baseline_subscene_oids = _evaluated_oid_filters_from_summary(baseline_summary_raw)
     test_scene_oids, test_subscene_oids = _evaluated_oid_filters_from_summary(test_summary_raw)
-    baseline_scene_sets, baseline_subscene_sets, baseline_ok = _extract_validation_sample_sets(
+    baseline_scene_class_map, baseline_subscene_class_map = _path_class_group_maps_from_summary(baseline_summary_raw)
+    test_scene_class_map, test_subscene_class_map = _path_class_group_maps_from_summary(test_summary_raw)
+
+    (
+        baseline_scene_sets,
+        baseline_subscene_sets,
+        baseline_scene_class_sets,
+        baseline_subscene_class_sets,
+        baseline_ok,
+    ) = _extract_validation_sample_sets(
         baseline_validation_bag_path,
         side="baseline",
         scene_timing=scene_timing,
         evaluated_scene_oids=baseline_scene_oids,
         evaluated_subscene_oids=baseline_subscene_oids,
+        scene_path_class_group_by_oid=baseline_scene_class_map,
+        subscene_path_class_group_by_oid=baseline_subscene_class_map,
         progress_prefix=(f"[aggregate] {progress_label} baseline validation" if progress_label else None),
     )
-    test_scene_sets, test_subscene_sets, test_ok = _extract_validation_sample_sets(
+    (
+        test_scene_sets,
+        test_subscene_sets,
+        test_scene_class_sets,
+        test_subscene_class_sets,
+        test_ok,
+    ) = _extract_validation_sample_sets(
         test_validation_bag_path,
         side="test",
         scene_timing=scene_timing,
         evaluated_scene_oids=test_scene_oids,
         evaluated_subscene_oids=test_subscene_oids,
+        scene_path_class_group_by_oid=test_scene_class_map,
+        subscene_path_class_group_by_oid=test_subscene_class_map,
         progress_prefix=(f"[aggregate] {progress_label} test validation" if progress_label else None),
     )
     if not baseline_ok or not test_ok:
-        return _default_side_summary("ok"), _default_side_summary("ok"), [], {}, False
+        return (
+            _default_side_summary("ok"),
+            _default_side_summary("ok"),
+            [],
+            {},
+            _default_path_class_group_validation("ok"),
+            _default_path_class_group_validation("ok"),
+            False,
+        )
 
     scene_baseline_common, scene_test_common, scene_common_ids = _build_validation_common_from_sample_sets(
         baseline_scene_sets,
         test_scene_sets,
     )
+    scene_baseline_common_by_class = _default_path_class_group_validation("ok")
+    scene_test_common_by_class = _default_path_class_group_validation("ok")
+    for class_group in PATH_CLASS_GROUPS:
+        b_common, t_common, _common_ids = _build_validation_common_from_sample_sets(
+            baseline_scene_class_sets.get(class_group, _new_validation_sample_sets()),
+            test_scene_class_sets.get(class_group, _new_validation_sample_sets()),
+        )
+        scene_baseline_common_by_class[class_group] = b_common
+        scene_test_common_by_class[class_group] = t_common
 
     subscene_common_map: dict[int, dict] = {}
     indices = set(baseline_subscene_sets.keys()) | set(test_subscene_sets.keys())
@@ -506,13 +718,34 @@ def _build_validation_common_from_bags(
         b_sets = baseline_subscene_sets.get(sub_idx, _new_validation_sample_sets())
         t_sets = test_subscene_sets.get(sub_idx, _new_validation_sample_sets())
         b_common, t_common, common_ids = _build_validation_common_from_sample_sets(b_sets, t_sets)
+        b_common_by_class = _default_path_class_group_validation("ok")
+        t_common_by_class = _default_path_class_group_validation("ok")
+        for class_group in PATH_CLASS_GROUPS:
+            b_cls_sets = (baseline_subscene_class_sets.get(sub_idx, {}) or {}).get(class_group, _new_validation_sample_sets())
+            t_cls_sets = (test_subscene_class_sets.get(sub_idx, {}) or {}).get(class_group, _new_validation_sample_sets())
+            b_cls_common, t_cls_common, _common_ids = _build_validation_common_from_sample_sets(
+                b_cls_sets,
+                t_cls_sets,
+            )
+            b_common_by_class[class_group] = b_cls_common
+            t_common_by_class[class_group] = t_cls_common
         subscene_common_map[sub_idx] = {
             "baseline_common": b_common,
             "test_common": t_common,
+            "baseline_common_by_class_group": b_common_by_class,
+            "test_common_by_class_group": t_common_by_class,
             "common_object_ids": common_ids,
         }
 
-    return scene_baseline_common, scene_test_common, scene_common_ids, subscene_common_map, True
+    return (
+        scene_baseline_common,
+        scene_test_common,
+        scene_common_ids,
+        subscene_common_map,
+        scene_baseline_common_by_class,
+        scene_test_common_by_class,
+        True,
+    )
 
 
 def _aggregate_validation_common(raw_summary: dict, common_ids: set[int]) -> dict:
@@ -557,8 +790,26 @@ def _aggregate_collision_common(raw_summary: dict, common_ids: set[int]) -> dict
             node = kind_d.get(kind, {})
             out[kind]["collision_paths"] += int(node.get("collision_paths", 0) or 0)
             out[kind]["checked_paths"] += int(node.get("checked_paths", 0) or 0)
+            by_group = node.get("by_group", {})
+            if isinstance(by_group, dict):
+                for group in COLLISION_SOURCE_GROUPS:
+                    gnode = by_group.get(group, {})
+                    if not isinstance(gnode, dict):
+                        continue
+                    out_group = out[kind].setdefault("by_group", {}).setdefault(
+                        group,
+                        {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+                    )
+                    out_group["collision_paths"] += int(gnode.get("collision_paths", 0) or 0)
+                    out_group["checked_paths"] += int(gnode.get("checked_paths", 0) or 0)
     for kind in COLLISION_KINDS:
         out[kind]["has_collision"] = out[kind]["collision_paths"] > 0
+        for group in COLLISION_SOURCE_GROUPS:
+            gnode = out[kind].setdefault("by_group", {}).setdefault(
+                group,
+                {"has_collision": False, "collision_paths": 0, "checked_paths": 0, "detail": "ok"},
+            )
+            gnode["has_collision"] = bool(gnode.get("collision_paths", 0) > 0)
     return out
 
 
@@ -674,7 +925,36 @@ def _load_side_subscenes(path: Path, side: str) -> dict[int, dict]:
                 collision_raw.get(kind, {}),
                 detail_fallback=f"{side}_subscene_{meta['index']}_{kind}_collision_summary_missing",
             )
+        sub_class_raw = node.get("path_class_group_validation", {})
+        if isinstance(sub_class_raw, dict):
+            sub["path_class_group_validation"] = _default_path_class_group_validation("ok")
+            for class_group in PATH_CLASS_GROUPS:
+                group_node = sub_class_raw.get(class_group, {})
+                if not isinstance(group_node, dict):
+                    group_node = {}
+                for horizon in VALIDATION_HORIZONS:
+                    hnode = group_node.get(horizon, group_node.get(horizon.replace("-", "_"), {}))
+                    if not isinstance(hnode, dict):
+                        hnode = {}
+                    for threshold in VALIDATION_THRESHOLDS:
+                        sub["path_class_group_validation"][class_group][horizon][threshold] = _normalize_threshold_summary(
+                            hnode.get(threshold, {}),
+                            detail_fallback=f"{side}_subscene_{meta['index']}_{class_group}_{horizon}_{threshold}_missing",
+                        )
+        else:
+            sub["path_class_group_validation"] = _default_path_class_group_validation(
+                f"{side}_subscene_{meta['index']}_path_class_group_missing"
+            )
         sub["evaluated_object_ids"] = sorted(_to_oid_set(node.get("evaluated_object_ids", [])))
+        class_map = node.get("evaluated_object_path_class_group", {})
+        if isinstance(class_map, dict):
+            sub["evaluated_object_path_class_group"] = {
+                str(oid): str(class_group)
+                for oid, class_group in class_map.items()
+                if str(class_group) in PATH_CLASS_GROUPS
+            }
+        else:
+            sub["evaluated_object_path_class_group"] = {}
         per_object_validation = node.get("per_object_validation", {})
         sub["per_object_validation"] = per_object_validation if isinstance(per_object_validation, dict) else {}
         per_object_collision = node.get("per_object_collision", {})
@@ -741,6 +1021,8 @@ def main() -> int:
         comp["validation"] = {
             "baseline": _load_side_summary(baseline_summary_path, "baseline"),
             "test": _load_side_summary(test_summary_path, "test"),
+            "baseline_by_class_group": _load_side_path_class_group_validation(baseline_summary_path, "baseline"),
+            "test_by_class_group": _load_side_path_class_group_validation(test_summary_path, "test"),
         }
         comp["collision"] = {
             "baseline": _load_side_collision(baseline_summary_path, "baseline"),
@@ -751,6 +1033,8 @@ def main() -> int:
             scene_test_common,
             scene_common_ids,
             subscene_common_map,
+            scene_baseline_common_by_class,
+            scene_test_common_by_class,
             sample_common_ok,
         ) = _build_validation_common_from_bags(
             baseline_validation_bag_path=baseline_validation_bag_path,
@@ -768,6 +1052,12 @@ def main() -> int:
             )
             comp["validation"]["baseline_common"] = _default_side_summary(f"{rel}_common_samples_missing")
             comp["validation"]["test_common"] = _default_side_summary(f"{rel}_common_samples_missing")
+            comp["validation"]["baseline_common_by_class_group"] = _default_path_class_group_validation(
+                f"{rel}_common_samples_missing"
+            )
+            comp["validation"]["test_common_by_class_group"] = _default_path_class_group_validation(
+                f"{rel}_common_samples_missing"
+            )
             comp["common_object_ids"] = []
             collision_common_ids = set()
             subscene_common_map = {}
@@ -775,6 +1065,8 @@ def main() -> int:
         else:
             comp["validation"]["baseline_common"] = scene_baseline_common
             comp["validation"]["test_common"] = scene_test_common
+            comp["validation"]["baseline_common_by_class_group"] = scene_baseline_common_by_class
+            comp["validation"]["test_common_by_class_group"] = scene_test_common_by_class
             comp["common_object_ids"] = scene_common_ids
             collision_common_ids = set(scene_common_ids)
         comp["collision"]["baseline_common"] = _aggregate_collision_common(baseline_summary_raw, collision_common_ids)
@@ -886,17 +1178,41 @@ def main() -> int:
                 }
                 for horizon in VALIDATION_HORIZONS
             }
+            sub["validation"]["baseline_by_class_group"] = (
+                baseline_subscene_map.get(index, {}).get("path_class_group_validation")
+                if isinstance(baseline_subscene_map.get(index, {}), dict)
+                else None
+            ) or _default_path_class_group_validation(f"baseline_subscene_{index}_path_class_group_missing")
+            sub["validation"]["test_by_class_group"] = (
+                test_subscene_map.get(index, {}).get("path_class_group_validation")
+                if isinstance(test_subscene_map.get(index, {}), dict)
+                else None
+            ) or _default_path_class_group_validation(f"test_subscene_{index}_path_class_group_missing")
             baseline_sub = baseline_subscene_map.get(index, {})
             test_sub = test_subscene_map.get(index, {})
             if index in subscene_common_map:
                 sub["validation"]["baseline_common"] = subscene_common_map[index]["baseline_common"]
                 sub["validation"]["test_common"] = subscene_common_map[index]["test_common"]
+                sub["validation"]["baseline_common_by_class_group"] = subscene_common_map[index].get(
+                    "baseline_common_by_class_group",
+                    _default_path_class_group_validation(f"baseline_subscene_{index}_common_path_class_group_missing"),
+                )
+                sub["validation"]["test_common_by_class_group"] = subscene_common_map[index].get(
+                    "test_common_by_class_group",
+                    _default_path_class_group_validation(f"test_subscene_{index}_common_path_class_group_missing"),
+                )
                 sub_common_ids = set(subscene_common_map[index]["common_object_ids"])
             else:
                 sub["validation"]["baseline_common"] = _default_side_summary(
                     f"baseline_subscene_{index}_common_samples_missing"
                 )
                 sub["validation"]["test_common"] = _default_side_summary(
+                    f"test_subscene_{index}_common_samples_missing"
+                )
+                sub["validation"]["baseline_common_by_class_group"] = _default_path_class_group_validation(
+                    f"baseline_subscene_{index}_common_samples_missing"
+                )
+                sub["validation"]["test_common_by_class_group"] = _default_path_class_group_validation(
                     f"test_subscene_{index}_common_samples_missing"
                 )
                 sub_common_ids = set()

@@ -55,7 +55,7 @@ from PyQt5.QtGui import QColor, QBrush, QPalette, QTextDocument, QAbstractTextDo
 
 
 # Column headers for comparison table (leftmost column is scene expand/collapse toggle)
-TABLE_HEADERS = ["", "", "C", "L", "O", "P", "Directory", "Valid/Total", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic", "Seg fault", "DT status"]
+TABLE_HEADERS = ["", "", "C", "L", "O", "P", "Directory", "Valid/Total", "Seg fault", "DT status", "Lane IDs", "VSL", "Object IDs", "Path", "Traffic"]
 COL_TOGGLE = 0
 COL_HALF_DELTA = 1
 COL_COLLISION = 2
@@ -120,6 +120,13 @@ VALIDATION_SUMMARY_ROWS = (
     ("time-relaxed", "approximate"),
     ("time-relaxed", "strict"),
 )
+PATH_CLASS_GROUPS = ("four_wheel", "two_wheel", "pedestrian")
+PATH_CLASS_GROUP_LABELS = {
+    "four_wheel": "4-wheel (car/truck/bus)",
+    "two_wheel": "2-wheel (motorcycle/cyclist)",
+    "pedestrian": "Pedestrian",
+}
+COLLISION_SOURCE_GROUPS = ("along", "crossing", "opposite")
 VALIDATION_GROUPS = ("along", "opposite", "crossing", "other")
 VALIDATION_MODE_GROUPS = ("all", "along", "opposite", "crossing", "other")
 VALIDATION_MODE_GROUP_CODE = {
@@ -469,7 +476,7 @@ def _collision_mark(comp: dict | None) -> str:
 
 
 def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
-    """Return [toggle, half_delta, collision, L, O, P, rel, valid_frames, lane_ids, vsl, object_ids, path, traffic, segfault, dt_status]."""
+    """Return [toggle, half_delta, collision, L, O, P, rel, valid_frames, segfault, dt_status, lane_ids, vsl, object_ids, path, traffic]."""
     if not comp:
         return ["", "-", "-", "-", "-", "-", rel, "-", "-", "-", "-", "-", "-", "-", "-"]
     valid = comp.get("valid_frames")
@@ -492,7 +499,7 @@ def _row_from_comp(rel: str, comp: dict | None) -> list[str]:
     dt_status = _dt_summary_text(comp)
     half_delta = _half_delta_mark(comp)
     collision_mark = _collision_mark(comp)
-    return ["", half_delta, collision_mark, "■", "■", "■", rel, valid_str, a, b, c, d, e, seg, dt_status]
+    return ["", half_delta, collision_mark, "■", "■", "■", rel, valid_str, seg, dt_status, a, b, c, d, e]
 
 
 def _validation_rate_stats(node: dict | None) -> tuple[str, float | None]:
@@ -513,6 +520,17 @@ def _collision_kind_node(side_collision: dict | None, kind: str):
     if not isinstance(side_collision, dict):
         return None
     node = side_collision.get(kind)
+    return node if isinstance(node, dict) else None
+
+
+def _collision_group_node(side_collision: dict | None, kind: str, group: str):
+    kind_node = _collision_kind_node(side_collision, kind)
+    if not isinstance(kind_node, dict):
+        return None
+    by_group = kind_node.get("by_group", {})
+    if not isinstance(by_group, dict):
+        return None
+    node = by_group.get(group)
     return node if isinstance(node, dict) else None
 
 
@@ -555,16 +573,56 @@ def _dt_mean_cell(value: object) -> tuple[str, QColor | None]:
     return f"{mean:.1f}", None
 
 
-def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QColor | None, QColor | None]]:
+def _validation_class_metric_node(class_validation: dict | None, class_group: str, horizon: str, threshold: str):
+    if not isinstance(class_validation, dict):
+        return None
+    group_node = class_validation.get(class_group, {})
+    if not isinstance(group_node, dict):
+        return None
+    return _validation_metric_node(group_node, horizon, threshold)
+
+
+def _validation_summary_entries(comp: dict | None, expanded_keys: set[str] | None = None) -> list[dict]:
+    expanded = set(expanded_keys or set())
     validation = comp.get("validation", {}) if isinstance(comp, dict) else {}
     baseline = validation.get("baseline", {}) if isinstance(validation, dict) else {}
     test = validation.get("test", {}) if isinstance(validation, dict) else {}
     baseline_common = validation.get("baseline_common", {}) if isinstance(validation, dict) else {}
     test_common = validation.get("test_common", {}) if isinstance(validation, dict) else {}
+    baseline_by_class = validation.get("baseline_by_class_group", {}) if isinstance(validation, dict) else {}
+    test_by_class = validation.get("test_by_class_group", {}) if isinstance(validation, dict) else {}
+    baseline_common_by_class = validation.get("baseline_common_by_class_group", {}) if isinstance(validation, dict) else {}
+    test_common_by_class = validation.get("test_common_by_class_group", {}) if isinstance(validation, dict) else {}
     collision = comp.get("collision", {}) if isinstance(comp, dict) else {}
     collision_baseline = collision.get("baseline", {}) if isinstance(collision, dict) else {}
     collision_test = collision.get("test", {}) if isinstance(collision, dict) else {}
-    rows: list[tuple[str, str, str, QColor | None, QColor | None]] = []
+    rows: list[dict] = []
+
+    def _push_row(
+        key: str,
+        label: str,
+        baseline_text: str,
+        test_text: str,
+        baseline_color: QColor | None = None,
+        test_color: QColor | None = None,
+        *,
+        expandable: bool = False,
+        indent: int = 0,
+    ) -> None:
+        rows.append(
+            {
+                "key": key,
+                "label": label,
+                "baseline_text": baseline_text,
+                "test_text": test_text,
+                "baseline_color": baseline_color,
+                "test_color": test_color,
+                "expandable": bool(expandable),
+                "expanded": bool(expandable and key in expanded),
+                "indent": max(0, int(indent)),
+            }
+        )
+
     if isinstance(comp, dict):
         dt_b_text, dt_b_color = _dt_status_cell(comp.get("dt_status_baseline"), comp.get("dt_max_baseline"))
         dt_t_text, dt_t_color = _dt_status_cell(comp.get("dt_status_test"), comp.get("dt_max_test"))
@@ -586,13 +644,14 @@ def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QCo
         dt_t_text, dt_t_color = "-", None
         dt_mean_b_text, dt_mean_b_color = "-", None
         dt_mean_t_text, dt_mean_t_color = "-", None
-    rows.append(("DT status", dt_b_text, dt_t_text, dt_b_color, dt_t_color))
-    rows.append(("DT mean", dt_mean_b_text, dt_mean_t_text, dt_mean_b_color, dt_mean_t_color))
+    _push_row("dt_status", "DT status", dt_b_text, dt_t_text, dt_b_color, dt_t_color)
+    _push_row("dt_mean", "DT mean", dt_mean_b_text, dt_mean_t_text, dt_mean_b_color, dt_mean_t_color)
     # Common-object rows first when available (baseline_common/test_common from aggregate)
     # Collision(common) is intentionally omitted because collision common-axis is not meaningful.
     has_common = isinstance(baseline_common, dict) and isinstance(test_common, dict)
     if has_common:
         for horizon, threshold in VALIDATION_SUMMARY_ROWS:
+            row_key = f"validation_common:{horizon}:{threshold}"
             b_node = _validation_metric_node(baseline_common, horizon, threshold)
             t_node = _validation_metric_node(test_common, horizon, threshold)
             b_text, b_rate = _validation_rate_stats(b_node)
@@ -608,13 +667,60 @@ def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QCo
                     t_color = COLOR_GREEN
             th_label = "approximate" if threshold == "approximate" else "strict"
             label = f"half-time-relaxed {th_label} (common)" if horizon == "half-time-relaxed" else f"time-relaxed {th_label} (common)"
-            rows.append((label, b_text, t_text, b_color, t_color))
+            _push_row(row_key, label, b_text, t_text, b_color, t_color, expandable=True)
+            if row_key in expanded:
+                for class_group in PATH_CLASS_GROUPS:
+                    cb_node = _validation_class_metric_node(baseline_common_by_class, class_group, horizon, threshold)
+                    ct_node = _validation_class_metric_node(test_common_by_class, class_group, horizon, threshold)
+                    cb_text, cb_rate = _validation_rate_stats(cb_node)
+                    ct_text, ct_rate = _validation_rate_stats(ct_node)
+                    cb_color = None
+                    ct_color = None
+                    if cb_rate is not None and ct_rate is not None and abs(cb_rate - ct_rate) > 1e-9:
+                        if cb_rate > ct_rate:
+                            cb_color = COLOR_GREEN
+                            ct_color = COLOR_RED
+                        else:
+                            cb_color = COLOR_RED
+                            ct_color = COLOR_GREEN
+                    _push_row(
+                        f"{row_key}:class:{class_group}",
+                        PATH_CLASS_GROUP_LABELS.get(class_group, class_group),
+                        cb_text,
+                        ct_text,
+                        cb_color,
+                        ct_color,
+                        indent=1,
+                    )
     # All-object rows
     for kind in COLLISION_KINDS:
+        row_key = f"collision:{kind}"
         b_text, b_color = _collision_state_stats(_collision_kind_node(collision_baseline, kind))
         t_text, t_color = _collision_state_stats(_collision_kind_node(collision_test, kind))
-        rows.append((f"{kind}-collision judgement", b_text, t_text, b_color, t_color))
+        _push_row(
+            row_key,
+            f"{kind}-collision judgement",
+            b_text,
+            t_text,
+            b_color,
+            t_color,
+            expandable=True,
+        )
+        if row_key in expanded:
+            for group in COLLISION_SOURCE_GROUPS:
+                gb_text, gb_color = _collision_state_stats(_collision_group_node(collision_baseline, kind, group))
+                gt_text, gt_color = _collision_state_stats(_collision_group_node(collision_test, kind, group))
+                _push_row(
+                    f"{row_key}:group:{group}",
+                    f"{group} collision",
+                    gb_text,
+                    gt_text,
+                    gb_color,
+                    gt_color,
+                    indent=1,
+                )
     for horizon, threshold in VALIDATION_SUMMARY_ROWS:
+        row_key = f"validation_all:{horizon}:{threshold}"
         b_node = _validation_metric_node(baseline, horizon, threshold)
         t_node = _validation_metric_node(test, horizon, threshold)
         b_text, b_rate = _validation_rate_stats(b_node)
@@ -636,7 +742,31 @@ def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QCo
             label = f"half-time-relaxed {th_label} success rate"
         else:
             label = f"time-relaxed {th_label} success rate"
-        rows.append((label, b_text, t_text, b_color, t_color))
+        _push_row(row_key, label, b_text, t_text, b_color, t_color, expandable=True)
+        if row_key in expanded:
+            for class_group in PATH_CLASS_GROUPS:
+                cb_node = _validation_class_metric_node(baseline_by_class, class_group, horizon, threshold)
+                ct_node = _validation_class_metric_node(test_by_class, class_group, horizon, threshold)
+                cb_text, cb_rate = _validation_rate_stats(cb_node)
+                ct_text, ct_rate = _validation_rate_stats(ct_node)
+                cb_color = None
+                ct_color = None
+                if cb_rate is not None and ct_rate is not None and abs(cb_rate - ct_rate) > 1e-9:
+                    if cb_rate > ct_rate:
+                        cb_color = COLOR_GREEN
+                        ct_color = COLOR_RED
+                    else:
+                        cb_color = COLOR_RED
+                        ct_color = COLOR_GREEN
+                _push_row(
+                    f"{row_key}:class:{class_group}",
+                    PATH_CLASS_GROUP_LABELS.get(class_group, class_group),
+                    cb_text,
+                    ct_text,
+                    cb_color,
+                    ct_color,
+                    indent=1,
+                )
     return rows
 
 
@@ -881,6 +1011,19 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
         }
         for side in validation_sides
     }
+    validation_by_class_group = {
+        side: {
+            class_group: {
+                horizon: {
+                    threshold: {"ok": 0, "total": 0, "rate": 0.0, "detail": "overall"}
+                    for threshold in VALIDATION_THRESHOLDS
+                }
+                for horizon in VALIDATION_SUMMARY_HORIZONS
+            }
+            for class_group in PATH_CLASS_GROUPS
+        }
+        for side in validation_sides
+    }
     collision_sides = VALIDATION_SIDES + ("baseline_common", "test_common")
     collision = {
         side: {
@@ -888,6 +1031,15 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                 "has_collision": False,
                 "collision_paths": 0,
                 "checked_paths": 0,
+                "by_group": {
+                    group: {
+                        "has_collision": False,
+                        "collision_paths": 0,
+                        "checked_paths": 0,
+                        "detail": "overall",
+                    }
+                    for group in COLLISION_SOURCE_GROUPS
+                },
                 "detail": "overall",
             }
             for kind in COLLISION_KINDS
@@ -946,6 +1098,24 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                     ok, total_cnt = _ok_total(node)
                     validation[side][horizon][threshold]["ok"] += ok
                     validation[side][horizon][threshold]["total"] += total_cnt
+            side_by_class = (
+                comp_validation.get(f"{side}_by_class_group", {})
+                if isinstance(comp_validation, dict)
+                else {}
+            )
+            for class_group in PATH_CLASS_GROUPS:
+                group_node = side_by_class.get(class_group, {}) if isinstance(side_by_class, dict) else {}
+                if not isinstance(group_node, dict):
+                    group_node = {}
+                for horizon in VALIDATION_SUMMARY_HORIZONS:
+                    hnode = group_node.get(horizon, group_node.get(horizon.replace("-", "_"), {}))
+                    if not isinstance(hnode, dict):
+                        hnode = {}
+                    for threshold in VALIDATION_THRESHOLDS:
+                        node = hnode.get(threshold, {})
+                        ok, total_cnt = _ok_total(node if isinstance(node, dict) else {})
+                        validation_by_class_group[side][class_group][horizon][threshold]["ok"] += ok
+                        validation_by_class_group[side][class_group][horizon][threshold]["total"] += total_cnt
         comp_collision = comp.get("collision", {})
         for side in collision_sides:
             side_collision = comp_collision.get(side, {}) if isinstance(comp_collision, dict) else {}
@@ -958,6 +1128,22 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                 )
                 collision[side][kind]["collision_paths"] += _to_int_nonneg(node.get("collision_paths"), 0)
                 collision[side][kind]["checked_paths"] += _to_int_nonneg(node.get("checked_paths"), 0)
+                by_group = node.get("by_group", {})
+                if isinstance(by_group, dict):
+                    for group in COLLISION_SOURCE_GROUPS:
+                        gnode = by_group.get(group, {})
+                        if not isinstance(gnode, dict):
+                            continue
+                        collision[side][kind]["by_group"][group]["collision_paths"] += _to_int_nonneg(
+                            gnode.get("collision_paths"), 0
+                        )
+                        collision[side][kind]["by_group"][group]["checked_paths"] += _to_int_nonneg(
+                            gnode.get("checked_paths"), 0
+                        )
+                        collision[side][kind]["by_group"][group]["has_collision"] = bool(
+                            collision[side][kind]["by_group"][group]["has_collision"]
+                            or bool(gnode.get("has_collision", False))
+                        )
 
     for side in validation_sides:
         for horizon in VALIDATION_SUMMARY_HORIZONS:
@@ -967,6 +1153,21 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                 ok = _to_int_nonneg(node.get("ok"), 0)
                 node["rate"] = (float(ok) / float(total_cnt)) if total_cnt > 0 else 0.0
                 node["detail"] = "overall_aggregated"
+        for class_group in PATH_CLASS_GROUPS:
+            for horizon in VALIDATION_SUMMARY_HORIZONS:
+                for threshold in VALIDATION_THRESHOLDS:
+                    node = validation_by_class_group[side][class_group][horizon][threshold]
+                    total_cnt = _to_int_nonneg(node.get("total"), 0)
+                    ok = _to_int_nonneg(node.get("ok"), 0)
+                    node["rate"] = (float(ok) / float(total_cnt)) if total_cnt > 0 else 0.0
+                    node["detail"] = "overall_aggregated"
+    for side in collision_sides:
+        for kind in COLLISION_KINDS:
+            collision[side][kind]["has_collision"] = bool(collision[side][kind]["collision_paths"] > 0)
+            for group in COLLISION_SOURCE_GROUPS:
+                gnode = collision[side][kind]["by_group"][group]
+                gnode["has_collision"] = bool(gnode["collision_paths"] > 0)
+                gnode["detail"] = "overall_aggregated"
 
     out = {
         "valid_frames": agg_valid,
@@ -1003,6 +1204,8 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
     }
     if has_total:
         out["total_frames"] = agg_total
+    for side in validation_sides:
+        out["validation"][f"{side}_by_class_group"] = validation_by_class_group[side]
     return out
 
 
@@ -1046,6 +1249,8 @@ class ViewerAppPyQt(QMainWindow):
         self._viewer_launch_start = None
         self._table_rows: list[dict] = []
         self._expanded_scene_rels: set[str] = set()
+        self._validation_expanded_keys: set[str] = set()
+        self._validation_row_entries: list[dict] = []
         self._selected_row_data: dict | None = None
         self._selected_subscene_table = None
         self._handling_selection_change = False
@@ -1146,6 +1351,7 @@ class ViewerAppPyQt(QMainWindow):
         self.validation_table.setVerticalHeaderLabels(["", ""])
         self.validation_table.setSelectionMode(QTableWidget.NoSelection)
         self.validation_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.validation_table.cellClicked.connect(self._on_validation_table_clicked)
         # Metric は固定幅、Baseline/Test は残り幅を固定比率で配分する。
         self.validation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.validation_table.verticalHeader().setVisible(False)
@@ -1217,7 +1423,7 @@ class ViewerAppPyQt(QMainWindow):
 
         layout.addWidget(splitter)
         self.resize(900, 600)
-        self._set_validation_table_rows(_validation_summary_rows(None))
+        self._set_validation_table_rows(_validation_summary_entries(None, self._validation_expanded_keys))
         self._set_diff_table_empty()
         self._set_detail_table_rows([])
 
@@ -1312,15 +1518,28 @@ class ViewerAppPyQt(QMainWindow):
         self.diff_table.setMinimumHeight(height)
         self.diff_table.setMaximumHeight(height)
 
-    def _set_validation_table_rows(self, rows: list[tuple[str, str, str, QColor | None, QColor | None]]):
-        self.validation_table.setRowCount(len(rows))
-        for i, (name, baseline_text, test_text, baseline_color, test_color) in enumerate(rows):
-            metric_item = QTableWidgetItem(name)
+    def _set_validation_table_rows(self, rows: list[dict]):
+        self._validation_row_entries = list(rows or [])
+        self.validation_table.setRowCount(len(self._validation_row_entries))
+        for i, row in enumerate(self._validation_row_entries):
+            name = str(row.get("label") or "")
+            baseline_text = str(row.get("baseline_text") or "-")
+            test_text = str(row.get("test_text") or "-")
+            baseline_color = row.get("baseline_color")
+            test_color = row.get("test_color")
+            expandable = bool(row.get("expandable"))
+            expanded = bool(row.get("expanded"))
+            indent = max(0, int(row.get("indent", 0) or 0))
+            prefix = ""
+            if expandable:
+                prefix = "▾ " if expanded else "▸ "
+            metric_text = f"{'    ' * indent}{prefix}{name}"
+            metric_item = QTableWidgetItem(metric_text)
             metric_item.setBackground(QBrush(QColor(236, 236, 236)))
             metric_item.setForeground(QBrush(QColor(0, 0, 0)))
-            metric_item.setTextAlignment(Qt.AlignCenter)
+            metric_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
             metric_font = metric_item.font()
-            metric_font.setBold(True)
+            metric_font.setBold(bool(expandable or indent == 0))
             metric_item.setFont(metric_font)
             baseline_item = QTableWidgetItem(baseline_text)
             test_item = QTableWidgetItem(test_text)
@@ -1335,6 +1554,25 @@ class ViewerAppPyQt(QMainWindow):
             self.validation_table.setItem(i, 2, test_item)
         self.validation_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self._update_validation_table_column_widths()
+
+    def _on_validation_table_clicked(self, row: int, col: int):
+        if col != 0:
+            return
+        if row < 0 or row >= len(self._validation_row_entries):
+            return
+        row_meta = self._validation_row_entries[row]
+        if not bool(row_meta.get("expandable")):
+            return
+        key = str(row_meta.get("key") or "")
+        if not key:
+            return
+        if key in self._validation_expanded_keys:
+            self._validation_expanded_keys.discard(key)
+        else:
+            self._validation_expanded_keys.add(key)
+        selected = self._get_selected_row_data() or {}
+        comp = selected.get("comp") if isinstance(selected, dict) else None
+        self._set_validation_table_rows(_validation_summary_entries(comp if isinstance(comp, dict) else None, self._validation_expanded_keys))
 
     def _update_validation_table_column_widths(self):
         table = getattr(self, "validation_table", None)
@@ -1640,7 +1878,7 @@ class ViewerAppPyQt(QMainWindow):
         comp = row_data.get("comp")
 
         if comp is None:
-            self._set_validation_table_rows(_validation_summary_rows(None))
+            self._set_validation_table_rows(_validation_summary_entries(None, self._validation_expanded_keys))
             self._set_diff_table_no_data()
             if is_overall:
                 total_dirs = sum(1 for item in self._table_rows if item.get("is_scene"))
@@ -1660,7 +1898,7 @@ class ViewerAppPyQt(QMainWindow):
             self._refresh_play_button_enabled()
             return
 
-        self._set_validation_table_rows(_validation_summary_rows(comp))
+        self._set_validation_table_rows(_validation_summary_entries(comp, self._validation_expanded_keys))
         diff_map, diff_counts = _extract_diff_maps(comp)
         for r, (cat, _label) in enumerate(DIFF_CATEGORY_ROWS):
             supported = DIFF_SUPPORTED_SOURCES.get(cat, set())
@@ -1716,13 +1954,13 @@ class ViewerAppPyQt(QMainWindow):
                 ("Directory", OVERALL_LABEL),
                 ("comparison.json", f"loaded {loaded_dirs}/{total_dirs}"),
                 ("Valid/Total", valid_text),
+                ("Seg fault", seg_text),
+                ("DT status", dt_text),
                 ("Lane IDs", lane_text),
                 ("VSL", vsl_text),
                 ("Object IDs", object_text),
                 ("Path", path_text),
                 ("Traffic", traffic_text),
-                ("Seg fault", seg_text),
-                ("DT status", dt_text),
             ]
         else:
             baseline_bag = self.baseline_root / self.current_rel / "result_baseline.bag"
@@ -1733,13 +1971,13 @@ class ViewerAppPyQt(QMainWindow):
             detail_rows = [
                 *detail_rows,
                 ("Valid/Total", valid_text),
+                ("Seg fault", seg_text),
+                ("DT status", dt_text),
                 ("Lane IDs", lane_text),
                 ("VSL", vsl_text),
                 ("Object IDs", object_text),
                 ("Path", path_text),
                 ("Traffic", traffic_text),
-                ("Seg fault", seg_text),
-                ("DT status", dt_text),
                 ("Baseline bag", str(baseline_bag)),
                 ("Test bag", str(test_bag)),
             ]

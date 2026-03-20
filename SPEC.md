@@ -59,6 +59,11 @@
 ### 3.2 実行時の ROS master 要否
 - baseline/test の offline 実行（`run_baseline.sh`, `run_test.sh`）は ROS master 不要。
 - viewer 実行（`run_viewer.sh`）は ROS master が必要。
+- `run_viewer.sh` はホスト側で `rqt_image_view` を起動し、viewer（Docker）とは同一 ROS graph を使う。
+  - 既定値: `RQT_IMAGE_TOPIC=/odet_cam_front_tele/image_raw`, `RQT_IMAGE_TRANSPORT=compressed`
+  - `rqt_image_view --clear-config _image_transport:=compressed image:=<topic>` で起動する。
+  - `rqt_image_view` 未インストール時は warning を出してスキップする。
+  - `XDG_RUNTIME_DIR` 未設定時は `/tmp/runtime-<user>` を作成して利用する。
 
 ### 3.3 名前空間
 - baseline 記録: `/validation/baseline`
@@ -85,6 +90,8 @@
 - `baseline_results/<rel>/collision_judgement_baseline.bag`
 - `baseline_results/<rel>/dt_status` (`valid|warning|invalid`)
 - `baseline_results/<rel>/dt_max` (最大 dt、取れなければ `-`)
+- `baseline_results/<rel>/dt_mean` (平均 dt、取れなければ `-`)
+- `baseline_results/<rel>/dt_summary.json`（scene+subscene の `dt_status/dt_max/dt_mean/sample_count` と mapping 情報）
 - `baseline_results/<rel>/segfault` (trajectory_predictor 異常終了時のみ touch)
 
 ### 4.2 test_results
@@ -97,8 +104,9 @@
 - `test_results/<rel>/collision_judgement_test.bag`
 - `test_results/<rel>/comparison_direct.json`
 - `test_results/<rel>/comparison.json`
-- `test_results/<rel>/compare.bag`（common / diff_baseline / diff_test の全トピックを格納。旧形式の common.bag, diff_baseline.bag, diff_test.bag は廃止）
-- `test_results/<rel>/dt_status`, `dt_max`, `segfault`
+- `test_results/<rel>/compare.bag`（common / diff_baseline / diff_test の全トピックを格納。旧形式の common.bag, diff_baseline.bag, diff_test.bag は新規生成しないが後方互換で読み込み可能）
+- `test_results/<rel>/dt_status`, `dt_max`, `dt_mean`, `segfault`
+- `test_results/<rel>/dt_summary.json`
 
 ---
 
@@ -184,7 +192,7 @@
   - `/target_tracker/tracked_object_set2` を含む bag が無い scene はエラー終了。
 - scene ごとに以下を実行する:
   1. `rosrun nrc_wm_svcs trajectory_predictor_sim_offline --input-bag ... --output-bag ... --output-ns /validation/baseline --map-name <settings.offline.map_name> --runtime-file <result_baseline.runtime_ms.txt>`
-  2. `--runtime-file` に出力された dt(ms) 一覧を読み取り `dt_status` / `dt_max` を生成
+  2. `--runtime-file` に出力された dt(ms) 一覧を読み取り `dt_status` / `dt_max` / `dt_mean` を生成
   3. 実行終了コードが 0 以外なら `segfault` を作成
 - 生成対象は baseline 名前空間の 9 トピック:
   - `/validation/baseline/WM/tracked_object_set_with_prediction`
@@ -205,7 +213,7 @@
 
 ### 5.1.3 baseline の出力
 - `result_baseline.bag` を sceneごとに生成。
-- `dt_status` (`valid|warning|invalid`) / `dt_max` / `segfault` を付帯生成。
+- `dt_status` (`valid|warning|invalid`) / `dt_max` / `dt_mean` / `dt_summary.json` / `segfault` を付帯生成。
 - その後に `observed_baseline.bag` を同sceneで生成（5.2）。
 - `validation_baseline_summary.json`・`validation_baseline.bag`・`collision_judgement_baseline.bag` は、baseline 作成直後ではなく **test 実行時の評価** でまとめて生成する（5.3.3）。`run_evaluation.py --side all` で baseline/test 両方を評価するため、baseline だけを先に評価する必要はなく、二重に評価しない。
 
@@ -301,7 +309,7 @@
 - 実行前に必須オプション（`--map-name`, `--runtime-file`）対応チェックを行い、非対応ならエラー終了する。
 - scene ごとに以下を実行する:
   1. `rosrun nrc_wm_svcs trajectory_predictor_sim_offline --input-bag ... --output-bag ... --output-ns /validation/test --map-name <settings.offline.map_name> --runtime-file <result_test.runtime_ms.txt>`
-  2. `--runtime-file` に出力された dt(ms) 一覧を読み取り `dt_status` / `dt_max` を生成
+  2. `--runtime-file` に出力された dt(ms) 一覧を読み取り `dt_status` / `dt_max` / `dt_mean` を生成
   3. 実行終了コードが 0 以外なら `segfault` を作成
 - 生成対象は test 名前空間の 9 トピック:
   - `/validation/test/WM/tracked_object_set_with_prediction`
@@ -320,10 +328,10 @@
 - `trajectory_predictor_sim_offline` 利用時の stamp 決定規則は 5.0 を参照。
 
 ### 5.3.3 test の出力と比較
-- sceneごとに `result_test.bag`, `dt_status`, `dt_max`, `segfault` を生成。
+- sceneごとに `result_test.bag`, `dt_status`, `dt_max`, `dt_mean`, `dt_summary.json`, `segfault` を生成。
 - 各sceneで `result_test.bag` 作成成功後に `observed_test.bag` を生成（5.2）。
 - **評価**は `run_evaluation.py` で行う。`--side all` で baseline と test の両方を評価し、各 scene で `validation_baseline_summary.json`・`validation_test_summary.json` および対応する validation/collision bag を生成する（baseline 側は baseline_results 配下、test 側は test_results 配下）。同一の評価処理を二重に回さない。
-- 全scene後に `compare_baseline_test.py` を実行し、`comparison_direct.json` と `common/diff_*.bag` を生成。
+- 全scene後に `compare_baseline_test.py` を実行し、`comparison_direct.json` と `compare.bag` を生成（旧 `common.bag` / `diff_baseline.bag` / `diff_test.bag` は後方互換入力のみ）。
 - その後 `aggregate_comparison_results.py` を実行し、`comparison_direct.json` と baseline/test の validation/collision summary を集約して `comparison.json` を生成。
 - 補足:
   - `compare_baseline_test.py` 単体終了コード: 全scene Unchanged=0、1つでも Changed=1。
@@ -358,7 +366,11 @@
 - どこか不一致で `object_ids_ok=False`。
 
 ### 6.2.3 VSL (`vsl_ok`)
-- 対象 object: `object_id == 500001` または `>=500100`。
+- 対象 object は `VSL-like` 判定で抽出する（object_id 固定比較に限定しない）。
+- `VSL-like` 判定:
+  - `object_id in {1, 500001}` または `object_id >= 500100`
+  - または寸法が stopline 形状（`length <= 0.2` かつ `width >= 2.0`）
+  - または `debug_info` に `vsl` / `stopline` を含む
 - 対象 source: `along / opposite / crossing` の WM 3系統。
   - `opposite` はトピック上は `oncoming`（`/WM/oncoming_object_set_with_prediction`）として入力される。
 - 比較キー: `(x,y,yaw)` を小数5桁丸めした multiset。
@@ -402,6 +414,8 @@ path_and_traffic_ok = path_ok and traffic_ok
 - `segfault_baseline/test`: `segfault` ファイル有無。
 - `dt_status_baseline/test`: `valid|warning|invalid`。
 - `dt_max_baseline/test`: 最大 dt 値（文字列）。
+- `dt_mean_baseline/test`: 平均 dt 値（文字列）。
+- `dt_sample_count_baseline/test`: dt サンプル数。
 
 ## 6.6 compare 実行時の進捗表示
 - scene ごとに比較進捗を表示する（lane + WM + traffic の比較ステップ合計を分母）。
@@ -438,6 +452,7 @@ path_and_traffic_ok = path_ok and traffic_ok
   - `baseline_commit`, `baseline_describe`, `test_commit`, `test_describe`
   - `segfault_baseline`, `segfault_test`
   - `dt_status_baseline`, `dt_status_test`, `dt_max_baseline`, `dt_max_test`
+  - `dt_mean_baseline`, `dt_mean_test`, `dt_sample_count_baseline`, `dt_sample_count_test`
 - observed妥当性評価:
   - `validation.baseline.half-time-relaxed.approximate.{ok,total,rate,detail}`
   - `validation.baseline.half-time-relaxed.strict.{ok,total,rate,detail}`
@@ -447,23 +462,40 @@ path_and_traffic_ok = path_ok and traffic_ok
   - `validation.test.half-time-relaxed.strict.{ok,total,rate,detail}`
   - `validation.test.time-relaxed.approximate.{ok,total,rate,detail}`
   - `validation.test.time-relaxed.strict.{ok,total,rate,detail}`
+  - `validation.baseline_by_class_group.<four_wheel|two_wheel|pedestrian>.<horizon>.<threshold>.{ok,total,rate,detail}`
+  - `validation.test_by_class_group.<four_wheel|two_wheel|pedestrian>.<horizon>.<threshold>.{ok,total,rate,detail}`
+  - `validation.baseline_common.<horizon>.<threshold>.{ok,total,rate,detail}`
+  - `validation.test_common.<horizon>.<threshold>.{ok,total,rate,detail}`
+  - `validation.baseline_common_by_class_group.<four_wheel|two_wheel|pedestrian>.<horizon>.<threshold>.{ok,total,rate,detail}`
+  - `validation.test_common_by_class_group.<four_wheel|two_wheel|pedestrian>.<horizon>.<threshold>.{ok,total,rate,detail}`
+  - `common_object_ids`（scene で共通評価対象となった object_id 一覧）
 - collision評価:
   - `collision.baseline.hard.{has_collision,collision_paths,checked_paths,detail}`
   - `collision.baseline.soft.{has_collision,collision_paths,checked_paths,detail}`
   - `collision.test.hard.{has_collision,collision_paths,checked_paths,detail}`
   - `collision.test.soft.{has_collision,collision_paths,checked_paths,detail}`
+  - `collision.<side>.<kind>.by_group.<along|opposite|crossing>.{has_collision,collision_paths,checked_paths,detail}`
+  - `collision.baseline_common.<kind>.{has_collision,collision_paths,checked_paths,detail,by_group}`
+  - `collision.test_common.<kind>.{has_collision,collision_paths,checked_paths,detail,by_group}`
 - subscene配列:
   - `subscenes[]`
   - 各要素は `index`, `label`, `start_offset_sec`, `end_offset_sec`, `duration_sec` を持つ。
   - scene root と同じ direct compare key を持つ。
-  - `validation.baseline|test.*` と `collision.baseline|test.*` も scene root と同型で保持する。
+  - `validation.baseline|test|baseline_common|test_common.*` と `collision.baseline|test|baseline_common|test_common.*` も scene root と同型で保持する。
+  - 各 subscene も `dt_status_*`, `dt_max_*`, `dt_mean_*`, `dt_sample_count_*`, `common_object_ids` を持つ。
+
+### 7.2 common 再集約（aggregate）仕様
+- `baseline_common/test_common` は、validation bag から抽出した `ID+stamp` の共通サンプル集合で再集計する。
+- class group（`four_wheel/two_wheel/pedestrian`）も同じ `ID+stamp` 軸で再集計する。
+- common再集約に失敗したsceneは処理を継続し、当該sceneの common 系フィールドを `*_common_samples_missing` で埋めてスキップする。
+- `aggregate_comparison_results.py` は scene 全体進捗に加え、subscene merge の進捗バーを表示する。
 
 ---
 
 ## 8. common/diff bag 生成仕様
 `compare_baseline_test.py::_write_diff_bags_impl`。
 - 比較・差分判定はこの生成段階で完結させる。
-- Viewer側（mode 2..9）は `common/diff_*.bag` に保存済みの結果を選択描画するだけで、baseline/test の再差分計算は行わない。
+- Viewer側（mode 2..9）は `compare.bag`（内部 namespace は `common/diff_*`）に保存済みの結果を選択描画するだけで、baseline/test の再差分計算は行わない。
 - diff/common bag 生成中は進捗バーを表示する（計算 + 書き込みの合計ステップ基準）。
 
 ## 8.1 対象stamp
@@ -537,17 +569,19 @@ path_and_traffic_ok = path_ok and traffic_ok
 ## 9. Viewer GUI 仕様 (`scripts/viewer_app.py`)
 
 ## 9.1 一覧表示（左表）
-- 列: `↑/↓/-`, `C`, `L`, `O`, `P`, `Directory`, `Valid/Total`, `Lane IDs`, `VSL`, `Object IDs`, `Path`, `Traffic`, `Seg fault`, `DT status`。
+- 列: `toggle`, `↑/↓/-`, `C`, `L`, `O`, `P`, `Directory`, `Valid/Total`, `Seg fault`, `DT status`, `Lane IDs`, `VSL`, `Object IDs`, `Path`, `Traffic`。
 - 先頭行に `overall` を追加し、全sceneの `comparison.json` を集約した総合評価を表示する。
 - 起動時のデフォルト選択は `overall` 行とする。
-- scene 行はトグル可能な親行とする。scene に `subscenes[]` がある場合、ダブルクリックで展開/折りたたみする。
-- 展開時は子行として subscene 行を追加表示する。親行は scene 全体の評価、子行は当該subsceneの評価を表示する。
+- scene 行は最左 `toggle` 列のボタン（`▸/▾`）で展開/折りたたみする。
+- 展開時はインデント付きの子テーブルを挿入し、子テーブルの `Directory` ヘッダは `Subsequence` とする。
+- 親行は scene 全体の評価、子行は当該 subscene の評価を表示する。
 - `Play` ボタンは「scene行またはsubscene行が選択されている場合のみ」有効化する。未選択または `overall` 選択時は無効（グレーアウト）とする。
-- `↑/↓/-` 列のヘッダ文字は空（非表示）とし、`C/L/O/P` 列のヘッダにはそれぞれ `C`, `L`, `O`, `P` を表示する。
+- `toggle` 列と `↑/↓/-` 列のヘッダ文字は空（非表示）とし、`C/L/O/P` 列のヘッダにはそれぞれ `C`, `L`, `O`, `P` を表示する。
 - `C` 列は collision 判定結果を表示する:
-  - baseline/test の hard/soft のいずれかで `has_collision=true` が1件でもあれば `×`（赤）
-  - すべて `has_collision=false` なら `○`（緑）
+  - **test 側** hard/soft のいずれかで `has_collision=true` が1件でもあれば `×`（赤）
+  - test 側 hard/soft がすべて `has_collision=false` なら `○`（緑）
   - collision summary が欠損している場合は `-`（黒）
+- `DT status` 列は test 側の `dt_status_test` / `dt_max_test` を表示する。
 - `L/O/P` 列は `■` マーカーで changed/unchanged を表示する:
   - `L`: `Lane IDs` と `VSL` の統合判定（どちらか一方でも changed なら changed）
   - `O`: `Object IDs`
@@ -565,12 +599,14 @@ path_and_traffic_ok = path_ok and traffic_ok
   - 同値または欠損: `-`（黒）
 
 ## 9.2 Diff matrix（右上）
-- 行: Lane IDs / Object IDs / Path / VSL
+- 行: Lane IDs / Object IDs / Path / VSL / Traffic
 - 列: along / opposite / crossing / other / base
 - `base` は `tracked_object_set_with_prediction`（group分割前の全体集合）を意味する。
 - ただし VSL 行は `along / opposite / crossing` のみ対象（`other` と `base` は `-`）。
+- Traffic 行は `base` のみ対象（それ以外は `-`）。
 - 値は `comparison.json.diff_by_source` と `diff_counts_by_source` 由来。
 - `overall` 選択時は全sceneの差分を source別に合算した結果を表示する。
+- Diff matrix の高さは固定（全行が収まる高さ）で、縦方向の余剰は validation summary 側へ配分する。
 
 ## 9.3 Detail（右中）
 - 常時表示:
@@ -579,8 +615,24 @@ path_and_traffic_ok = path_ok and traffic_ok
 - scene選択時: 選択sceneの summary と bag パスを表形式で表示。
 - subscene選択時: scene名に加えて subscene ラベルを表示し、そのsubscene集計値を表形式で表示する。
 - `overall` 選択時: 全scene集約の summary（`comparison.json` 読み込み件数を含む）を表形式で表示する。
+- Detail の主要項目順は左表サマリー列と揃える（`Valid/Total` → `Seg fault` → `DT status` → `Lane IDs` → `VSL` → `Object IDs` → `Path` → `Traffic`）。
 
-## 9.4 Viewer 起動
+## 9.4 Validation summary（右上）
+- `Metric / Baseline / Test` の3列表示。
+- 表示順:
+  1. `DT status`
+  2. `DT mean`
+  3. `half-time-relaxed/time-relaxed` の common success rate（approximate/strict）
+  4. `hard/soft-collision judgement`
+  5. 通常 success rate（approximate/strict）
+- `DT status` は `Invalid` 赤 / `Warning` 橙 / `Valid` 緑で表示。
+- collision は `Collision (N)` / `Safe` 表示（`N = collision_paths`）。
+- `DT` 行以外はトグル展開可能:
+  - validation 行の展開: `four_wheel / two_wheel / pedestrian` の内訳を表示。
+  - collision 行の展開: `along / crossing / opposite` の内訳を表示。
+- collision の `common` は評価軸として採用していないため、validation summary には表示しない。
+
+## 9.5 Viewer 起動
 - `rosrun <viewer_pkg> <viewer_validation_node> -m` を実行。
 - 引数 remap:
   - baseline topics: `_xxx_topic:=/validation/baseline/...`
@@ -594,29 +646,31 @@ path_and_traffic_ok = path_ok and traffic_ok
   - `opposite`: 赤
   - `crossing`: 青
   - `other`: オレンジ
-  - `Baseline` / `Test`: 太字
+  - `Baseline` / `Test` / `Compare`: 太字
   - 上記は該当語のみを部分装飾し、ラベル全文の単色化は行わない。
+- GUI の display mode 先頭に `Compare`（mode=59）を配置し、デフォルト選択にする。
 - display mode 選択肢の並び（Diff path系）:
   - `Diff along path` → `Diff along path with observed` → `Diff opposite path` → `Diff opposite path with observed` → `Diff crossing path` → `Diff crossing path with observed` → `Diff other path` → `Diff other path with observed`
 
-## 9.5 再生 bag セット
+## 9.6 再生 bag セット
 Play時に **常に全bagを同時再生** し、表示は mode で切替する。
 再生順:
-1. `test_bags/<rel>/*.bag`（入力bag群）
+1. `test_bags/<rel>/*.bag`（入力bag群。`images*.bag` も含む。重複は除去）
 2. `baseline_results/<rel>/result_baseline.bag`
 3. `baseline_results/<rel>/observed_baseline.bag`（存在時）
-4. `test_results/<rel>/result_test.bag`（存在時）
-5. `test_results/<rel>/observed_test.bag`（存在時）
-6. `test_results/<rel>/compare.bag`（存在時。旧: common.bag / diff_baseline.bag / diff_test.bag は後方互換で参照可）
-7. `baseline_results/<rel>/collision_judgement_baseline.bag`（存在時）
-8. `test_results/<rel>/collision_judgement_test.bag`（存在時）
-9. `baseline_results/<rel>/validation_baseline.bag`（存在時）
-10. `test_results/<rel>/validation_test.bag`（存在時）
+4. `baseline_results/<rel>/collision_judgement_baseline.bag`（存在時、なければ legacy `collision_judgement.bag`）
+5. `baseline_results/<rel>/validation_baseline.bag`（存在時）
+6. `test_results/<rel>/result_test.bag`（存在時）
+7. `test_results/<rel>/observed_test.bag`（存在時）
+8. `test_results/<rel>/collision_judgement_test.bag`（存在時、なければ legacy `collision_judgement.bag`）
+9. `test_results/<rel>/validation_test.bag`（存在時）
+10. `test_results/<rel>/compare.bag`（存在時。なければ legacy `common.bag` / `diff_baseline.bag` / `diff_test.bag` を後方互換で使用）
+- `Play` 押下直後はボタン文言を `Preparing...` に変更し、起動完了まで押下不可にする。
 
 scene親行の再生は `rosbag play --clock --loop` を使用する。
 subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>` と `-u <duration_sec>` を付けて、該当区間のみをループ再生する。
 
-## 9.6 長尺sceneのsubscene分割
+## 9.7 長尺sceneのsubscene分割
 - scene 長は raw input bags の bag time 範囲（最小 start 〜 最大 end）から求める。
 - `duration_sec >= 40.0` の scene を分割対象とする。
 - 窓長は 30.0 秒固定。
@@ -651,6 +705,7 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
 - 56: Test hard collision
 - 57: Baseline soft collision
 - 58: Test soft collision
+- 59: Compare
 - GUI viewer の display mode 選択肢では、validation系は `half-time-relaxed` のみ表示する（`time-relaxed` は backend 実装として残し、選択肢からは除外）。
 
 ## 10.2 mode別の入力ソース
@@ -667,6 +722,7 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
 - 56: collision test hard（`/validation/collision/test/hard/*`）
 - 57: collision baseline soft（`/validation/collision/baseline/soft/*`）
 - 58: collision test soft（`/validation/collision/test/soft/*`）
+- 59: compare 表示（baseline/test を同一画面で左右比較）
 - modeごとの不足データは他modeへフォールバックしない。不足stampは破棄して次stampへ進む。
 
 ## 10.3 各modeの描画仕様
@@ -754,6 +810,14 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
   - `ego_observed_collision`: 赤
 - lane polygon は baseline/test mode と同じ仕様（通常色）で描画する。
 
+### 59 Compare
+- 4分割表示は維持し、左半分を baseline 系、右半分を test 系として描画する。
+- 上段は従来4分割の左下相当、下段は従来4分割の右下相当を左右比較で表示する。
+- 視点操作は compare モード時のみ左右連動:
+  - 上段は左右同期（どちらをドラッグしても反対側へ反映）
+  - 下段は左右同期（どちらをドラッグしても反対側へ反映）
+  - 上段と下段の相互同期はしない
+
 ---
 
 ## 11. observed予測妥当性評価（validation）
@@ -769,7 +833,8 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
 - 評価は side ごとに独立に実行する。
 - `other` group の評価対象object_idは、`result`側 `other_object_set_with_prediction` で予測path（`trajectory_set`）を持つものに限定する。
   - `observed`側に存在しても、上記を満たさないIDは `other`評価から除外する。
-- VSL関連ID（`500001` および `>=500100`）は validation 評価対象から除外する。
+- `VSL-like` 物体は validation 評価対象から除外する。
+  - 判定は compare と同一軸（`object_id in {1,500001} or >=500100`、または stopline 形状、または `debug_info` の `vsl/stopline`）を使う。
 - observed軌道の有効長（先頭からの最終 `t`）が 3.0 秒未満の物体は、`half-time-relaxed` / `time-relaxed` の `approximate` / `strict` すべて評価対象外とする。
   - ただし bag 出力では、該当 observed 軌道は `observed_ok`、その物体IDに紐づく予測 path は `ignore` として保存する（viewer 描画も同フラグ扱い）。
 
@@ -839,15 +904,23 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
   - `validation.test.time-relaxed.strict.{ok,total,rate,detail}`
 - `comparison.json` への取り込みは `aggregate_comparison_results.py` が行う。
 - viewer GUI では Diff matrix の上に validation summary 表を表示する。
-- 行は `hard-collision judgement`, `soft-collision judgement`, `half-time-relaxed approximate`, `half-time-relaxed strict`, `time-relaxed approximate`, `time-relaxed strict` の順、列は `Baseline`, `Test`。
-- 各セルの表示形式は `70.0% (200/300)`。
-- collision行は `Collision` / `Safe` を表示する。
-  - 1件以上 collision があれば `Collision`（赤）
+- 行は `DT status`, `DT mean` を先頭に置き、その後に common success rate / collision / success rate を表示する。
+- `validation common` は `ID+stamp` 共通サンプルで再集約した値を使う。
+- 各セルの表示形式:
+  - success rate: `70.0% (200/300)`
+  - collision: `Collision (N)` または `Safe`
+- collision 行は `Collision (N)` / `Safe` を表示する。
+  - 1件以上 collision があれば `Collision (N)`（赤）
   - collision が0件なら `Safe`（緑）
-- success rate 行（validation 4行）は Baseline/Test を比較し:
+- success rate 行（validation 4行 + common 4行）は Baseline/Test を比較し:
   - 高い方を緑文字
   - 低い方を赤文字
   - 同値なら両方黒文字
+- `DT mean` は Baseline/Test が両方ある場合のみ大小比較色を付ける。
+- `DT` 以外の行はトグル展開可能:
+  - validation 行の展開: `four_wheel / two_wheel / pedestrian` の内訳
+  - collision 行の展開: `along / crossing / opposite` の内訳
+- collision common は評価軸として表示しない（JSON には保持するが summary 行には出さない）。
 
 ## 11.6 collision評価（hard / soft）
 - 実装: `scripts/evaluate_observed_validation.py`（validation評価と同時に生成）
@@ -865,6 +938,9 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
   - `soft`:
     - 長方形: `length = object.length * 1.1`, `width = object.width * 1.1`
     - 進行方向前方に半楕円: 長軸長 `= speed * 2.0`, 短軸長 `= object.width * 1.1`
+  - `middle`（ego 用）:
+    - 長方形: `length = object.length * 1.05`, `width = object.width * 1.05`
+    - 進行方向前方に半楕円: 長軸長 `= speed * 1.5`, 短軸長 `= object.width * 1.05`
 - 各 step の基準点を path の累積距離 `s_i` とし、輪郭をローカル座標 `(ds, d)` で定義する。
   - `ds`: path 接線方向（s方向）
   - `d`: path 法線方向（d方向）
@@ -874,8 +950,8 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
 - 速度が `3.6/3.6` m/s 以下の step では、半楕円成分は追加せず長方形成分のみをコライダーとする。
 - 接線/法線は path 幾何から求める。path が退化（有効な線分がない）している場合のみ、stepの向きは従来どおり `yaw`/速度差分フォールバックを使う。
 - 判定ルール:
-  - `hard-collision judgement`: `ego soft` と `other hard` の重なり判定
-  - `soft-collision judgement`: `ego soft` と `other soft` の重なり判定
+  - `hard-collision judgement`: `ego middle` と `other hard` の重なり判定
+  - `soft-collision judgement`: `ego middle` と `other soft` の重なり判定
   - 同一 timestep 同士（近傍時刻マッチ）で重なりが1回でもあればその path を collision とする。
 - `collision_judgement_<side>.bag` の topic:
   - grouped（along/oncoming/crossing/other）:
@@ -888,6 +964,8 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
     - `/validation/collision/<side>/<kind>/ego_observed_safe/WM/tracked_object_set_with_prediction`
 - summary JSON:
   - `validation_*_summary.json` に `collision.{hard,soft}` を保存する。
+  - `collision.<kind>.by_group.<along|opposite|crossing>.{has_collision,collision_paths,checked_paths,detail}` を保存する。
+  - common再集約用に `per_object_collision` も保存する。
   - `aggregate_comparison_results.py` が `comparison.json` の `collision.baseline.*` / `collision.test.*` へ集約する。
 
 ---
@@ -902,6 +980,11 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
   - `warning`: 上記がなく `dt >= 70` が1回でもある
   - `valid`: それ以外
 - `dt_max`: scene内最大値（未取得時 `-`）。
+- `dt_mean`: scene内平均値（未取得時 `-`）。
+- `sample_count`: scene内サンプル数。
+- `dt_summary.json` を scene ごとに保存し、subscene 単位の `dt_status/dt_max/dt_mean/sample_count` も格納する。
+  - runtime と `/clock` の件数不一致時は `mapping.status=clock_count_mismatch` として subscene 割り当てを行わない。
+  - 一致時は `mapping.status=clock_aligned` で subscene に分配する。
 
 ## 12.2 segfault
 - scene実行の終了コードが 0 以外なら `segfault` ファイルを作成。
@@ -921,4 +1004,4 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
 3. `comparison.json` の集約仕様を変える場合は、`aggregate_comparison_results.py` と `viewer_app.py` と本 `SPEC.md` を同時更新する。
 4. 描画モード仕様を変える場合は、`TrajectoryPredictorViewer_validation.cpp` と `viewer_app.py` の mode ラベルを同期する。
 5. bagフォーマット（topic名・namespace・stamp基準）を変える場合は、baseline/test/compare/viewer を一式で整合させる。
-4. buildは行わない
+6. buildは行わない。
