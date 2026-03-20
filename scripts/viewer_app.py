@@ -153,6 +153,7 @@ DISPLAY_MODE_COLLISION_HARD_BASELINE = 55
 DISPLAY_MODE_COLLISION_HARD_TEST = 56
 DISPLAY_MODE_COLLISION_SOFT_BASELINE = 57
 DISPLAY_MODE_COLLISION_SOFT_TEST = 58
+DISPLAY_MODE_COMPARE = 59
 DISPLAY_MODE_LABELS = [label for (label, _value) in _DISPLAY_MODE_BASE_ITEMS]
 DISPLAY_MODE_VALUES = [value for (_label, value) in _DISPLAY_MODE_BASE_ITEMS]
 _validation_group_count_for_mode_value = len(VALIDATION_MODE_GROUP_CODE)
@@ -195,6 +196,8 @@ DISPLAY_MODE_VALUES.extend(
         DISPLAY_MODE_COLLISION_SOFT_TEST,
     ]
 )
+DISPLAY_MODE_LABELS.insert(0, "Compare")
+DISPLAY_MODE_VALUES.insert(0, DISPLAY_MODE_COMPARE)
 
 VALIDATION_SUMMARY_METRIC_WIDTH = 220
 VALIDATION_SUMMARY_VALUE_COL_RATIO = (1, 1)  # Baseline : Test
@@ -242,6 +245,7 @@ def _styled_mode_label_html(text: str) -> str:
         s = pat.sub(lambda m: f'<span style="color:{color};">{m.group(1)}</span>', s)
     s = re.sub(r"\b(Baseline)\b", r"<b>\1</b>", s)
     s = re.sub(r"\b(Test)\b", r"<b>\1</b>", s)
+    s = re.sub(r"\b(Compare)\b", r"<b>\1</b>", s)
     return s
 
 
