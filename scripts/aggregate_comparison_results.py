@@ -3,13 +3,60 @@
 from __future__ import annotations
 
 import json
+import re
+import sys
 from pathlib import Path
 
-from common import discover_bag_directories, get_tester_root, load_settings
+from common import discover_bag_directories, find_subscene_index, get_tester_root, load_settings
+
+try:
+    import rosbag
+
+    HAS_ROSBAG = True
+except Exception:
+    HAS_ROSBAG = False
 
 VALIDATION_HORIZONS = ("half-time-relaxed", "time-relaxed")
 VALIDATION_THRESHOLDS = ("approximate", "strict")
 COLLISION_KINDS = ("hard", "soft")
+VALIDATION_SAMPLE_TOPIC_RE = re.compile(
+    r"^/validation/eval/(?P<side>baseline|test)/(?P<horizon>[^/]+)/(?P<threshold>[^/]+)/"
+    r"(?P<group>along|opposite|crossing|other)/(?P<status>optimal|observed_ok|observed_ng)/WM/tracked_object_set_with_prediction$"
+)
+
+
+def _print_progress_line(prefix: str, done: int, total: int) -> None:
+    if total <= 0:
+        return
+    done = max(0, min(done, total))
+    width = 30
+    fill = int((done * width) / total)
+    bar = "#" * fill + "-" * (width - fill)
+    percent = int((done * 100) / total)
+    print(f"{prefix} [{bar}] {percent}% ({done}/{total})", file=sys.stderr, flush=True)
+
+
+def _print_live_progress(prefix: str, done: int, total: int, state: dict) -> None:
+    if total <= 0:
+        return
+    done = max(0, min(done, total))
+    percent = int((done * 100) / total)
+    last_percent = int(state.get("last_percent", -1) or -1)
+    if percent == last_percent and done < total:
+        return
+    state["last_percent"] = percent
+    width = 30
+    fill = int((done * width) / total)
+    bar = "#" * fill + "-" * (width - fill)
+    line = f"{prefix} [{bar}] {percent}% ({done}/{total})"
+    last_len = int(state.get("last_len", 0) or 0)
+    pad = " " * max(0, last_len - len(line))
+    state["last_len"] = len(line)
+    if done >= total:
+        print(f"\r{line}{pad}", file=sys.stderr, flush=True)
+        state["last_len"] = 0
+    else:
+        print(f"\r{line}{pad}", end="", file=sys.stderr, flush=True)
 
 
 def _default_threshold_summary(detail: str) -> dict:
@@ -152,6 +199,322 @@ def _load_side_collision(path: Path, side: str) -> dict:
     return out
 
 
+def _to_oid_set(values) -> set[int]:
+    out = set()
+    for value in values or []:
+        try:
+            out.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _to_nsec(ts) -> int:
+    if ts is None:
+        return 0
+    if hasattr(ts, "to_nsec"):
+        try:
+            return int(ts.to_nsec())
+        except Exception:
+            return 0
+    sec = getattr(ts, "secs", getattr(ts, "sec", 0)) or 0
+    nsec = getattr(ts, "nsecs", getattr(ts, "nsec", getattr(ts, "nanosec", 0))) or 0
+    try:
+        return int(sec) * 10**9 + int(nsec)
+    except Exception:
+        return 0
+
+
+def _msg_stamp_ns(msg, bag_t) -> int:
+    if msg is None:
+        return _to_nsec(bag_t)
+    header = getattr(msg, "header", None)
+    stamp = getattr(header, "stamp", None) if header is not None else None
+    if stamp is not None:
+        return _to_nsec(stamp)
+    return _to_nsec(bag_t)
+
+
+def _obj_id_of(obj) -> int:
+    base_obj = getattr(obj, "object", obj)
+    try:
+        return int(getattr(base_obj, "object_id", -1))
+    except Exception:
+        return -1
+
+
+def _new_validation_sample_sets() -> dict:
+    return {
+        horizon: {
+            threshold: {"ok": set(), "total": set()}
+            for threshold in VALIDATION_THRESHOLDS
+        }
+        for horizon in VALIDATION_HORIZONS
+    }
+
+
+def _extract_validation_sample_sets(
+    validation_bag_path: Path,
+    side: str,
+    scene_timing: dict | None,
+    evaluated_scene_oids: set[int] | None = None,
+    evaluated_subscene_oids: dict[int, set[int]] | None = None,
+    progress_prefix: str | None = None,
+) -> tuple[dict, dict[int, dict], bool]:
+    scene_sets = _new_validation_sample_sets()
+    subscene_sets: dict[int, dict] = {}
+    scene_observed_ok = _new_validation_sample_sets()
+    scene_observed_ng = _new_validation_sample_sets()
+    scene_optimal = _new_validation_sample_sets()
+    subscene_observed_ok: dict[int, dict] = {}
+    subscene_observed_ng: dict[int, dict] = {}
+    subscene_optimal: dict[int, dict] = {}
+    has_optimal_topic = {
+        horizon: {threshold: False for threshold in VALIDATION_THRESHOLDS}
+        for horizon in VALIDATION_HORIZONS
+    }
+    if not HAS_ROSBAG or not validation_bag_path.exists():
+        return scene_sets, subscene_sets, False
+    try:
+        with rosbag.Bag(str(validation_bag_path), "r") as bag:
+            info = bag.get_type_and_topic_info()
+            raw_topics = info[1] if isinstance(info, tuple) and len(info) >= 2 else getattr(info, "topics", {})
+            topic_names = raw_topics.keys() if hasattr(raw_topics, "keys") else raw_topics
+
+            topic_meta: dict[str, tuple[str, str, str]] = {}
+            target_topics: list[str] = []
+            for topic in topic_names:
+                m = VALIDATION_SAMPLE_TOPIC_RE.match(str(topic))
+                if not m:
+                    continue
+                if m.group("side") != side:
+                    continue
+                horizon = m.group("horizon").replace("_", "-")
+                threshold = m.group("threshold").replace("_", "-")
+                status = m.group("status")
+                if horizon not in VALIDATION_HORIZONS or threshold not in VALIDATION_THRESHOLDS:
+                    continue
+                if status == "optimal":
+                    has_optimal_topic[horizon][threshold] = True
+                topic_str = str(topic)
+                topic_meta[topic_str] = (horizon, threshold, status)
+                target_topics.append(topic_str)
+
+            if not target_topics:
+                return scene_sets, subscene_sets, False
+
+            read_total = 0
+            try:
+                read_total = max(0, int(bag.get_message_count(topic_filters=target_topics) or 0))
+            except Exception:
+                read_total = 0
+            read_done = 0
+            progress_state = {"last_percent": -1, "last_len": 0}
+            if progress_prefix and read_total > 0:
+                _print_live_progress(progress_prefix, 0, read_total, progress_state)
+
+            for topic, msg, bag_t in bag.read_messages(topics=target_topics):
+                read_done += 1
+                horizon, threshold, status = topic_meta.get(str(topic), ("", "", ""))
+                if not horizon or not threshold:
+                    if progress_prefix and read_total > 0:
+                        _print_live_progress(progress_prefix, read_done, read_total, progress_state)
+                    continue
+                stamp_ns = _msg_stamp_ns(msg, bag_t)
+                subscene_index = find_subscene_index(stamp_ns, scene_timing)
+                if subscene_index is not None and subscene_index not in subscene_sets:
+                    subscene_sets[subscene_index] = _new_validation_sample_sets()
+                    subscene_observed_ok[subscene_index] = _new_validation_sample_sets()
+                    subscene_observed_ng[subscene_index] = _new_validation_sample_sets()
+                    subscene_optimal[subscene_index] = _new_validation_sample_sets()
+
+                objects = getattr(msg, "objects", []) or []
+                for obj in objects:
+                    oid = _obj_id_of(obj)
+                    if oid < 0:
+                        continue
+                    if evaluated_scene_oids is not None and oid not in evaluated_scene_oids:
+                        continue
+                    key = (int(stamp_ns), int(oid))
+                    if status == "observed_ok":
+                        scene_observed_ok[horizon][threshold]["ok"].add(key)
+                    elif status == "observed_ng":
+                        scene_observed_ng[horizon][threshold]["total"].add(key)
+                    elif status == "optimal":
+                        scene_optimal[horizon][threshold]["ok"].add(key)
+                    if subscene_index is not None:
+                        allow_subscene = True
+                        if evaluated_subscene_oids is not None:
+                            allowed_ids = evaluated_subscene_oids.get(int(subscene_index))
+                            if allowed_ids is not None and oid not in allowed_ids:
+                                allow_subscene = False
+                        if allow_subscene:
+                            if status == "observed_ok":
+                                subscene_observed_ok[subscene_index][horizon][threshold]["ok"].add(key)
+                            elif status == "observed_ng":
+                                subscene_observed_ng[subscene_index][horizon][threshold]["total"].add(key)
+                            elif status == "optimal":
+                                subscene_optimal[subscene_index][horizon][threshold]["ok"].add(key)
+                if progress_prefix and read_total > 0:
+                    _print_live_progress(progress_prefix, read_done, read_total, progress_state)
+            if progress_prefix and read_total > 0 and read_done < read_total:
+                _print_live_progress(progress_prefix, read_total, read_total, progress_state)
+    except Exception:
+        return _new_validation_sample_sets(), {}, False
+
+    for horizon in VALIDATION_HORIZONS:
+        for threshold in VALIDATION_THRESHOLDS:
+            ok_candidates = scene_observed_ok[horizon][threshold]["ok"]
+            ng_keys = scene_observed_ng[horizon][threshold]["total"]
+            if has_optimal_topic[horizon][threshold]:
+                ok_keys = ok_candidates & scene_optimal[horizon][threshold]["ok"]
+            else:
+                ok_keys = set(ok_candidates)
+            scene_sets[horizon][threshold]["ok"] = ok_keys
+            scene_sets[horizon][threshold]["total"] = set(ok_keys) | set(ng_keys)
+
+    for subscene_index in subscene_sets.keys():
+        for horizon in VALIDATION_HORIZONS:
+            for threshold in VALIDATION_THRESHOLDS:
+                ok_candidates = subscene_observed_ok[subscene_index][horizon][threshold]["ok"]
+                ng_keys = subscene_observed_ng[subscene_index][horizon][threshold]["total"]
+                if has_optimal_topic[horizon][threshold]:
+                    ok_keys = ok_candidates & subscene_optimal[subscene_index][horizon][threshold]["ok"]
+                else:
+                    ok_keys = set(ok_candidates)
+                subscene_sets[subscene_index][horizon][threshold]["ok"] = ok_keys
+                subscene_sets[subscene_index][horizon][threshold]["total"] = set(ok_keys) | set(ng_keys)
+
+    return scene_sets, subscene_sets, True
+
+
+def _build_validation_common_from_sample_sets(
+    baseline_sets: dict,
+    test_sets: dict,
+) -> tuple[dict, dict, list[int]]:
+    baseline_common = _default_side_summary("ok")
+    test_common = _default_side_summary("ok")
+    common_object_ids: set[int] = set()
+
+    for horizon in VALIDATION_HORIZONS:
+        for threshold in VALIDATION_THRESHOLDS:
+            baseline_total = baseline_sets[horizon][threshold]["total"]
+            test_total = test_sets[horizon][threshold]["total"]
+            common_total = baseline_total & test_total
+            baseline_ok = baseline_sets[horizon][threshold]["ok"] & common_total
+            test_ok = test_sets[horizon][threshold]["ok"] & common_total
+
+            total_count = len(common_total)
+            baseline_ok_count = len(baseline_ok)
+            test_ok_count = len(test_ok)
+
+            b_node = baseline_common[horizon][threshold]
+            t_node = test_common[horizon][threshold]
+            b_node["ok"] = baseline_ok_count
+            b_node["total"] = total_count
+            b_node["rate"] = (100.0 * float(baseline_ok_count) / float(total_count)) if total_count > 0 else 0.0
+            t_node["ok"] = test_ok_count
+            t_node["total"] = total_count
+            t_node["rate"] = (100.0 * float(test_ok_count) / float(total_count)) if total_count > 0 else 0.0
+
+            common_object_ids |= {int(oid) for _stamp, oid in common_total}
+
+    return baseline_common, test_common, sorted(common_object_ids)
+
+
+def _evaluated_oid_filters_from_summary(raw_summary: dict | None) -> tuple[set[int] | None, dict[int, set[int]]]:
+    scene_oids: set[int] | None = None
+    subscene_oids: dict[int, set[int]] = {}
+    if not isinstance(raw_summary, dict):
+        return scene_oids, subscene_oids
+
+    if "evaluated_object_ids" in raw_summary:
+        scene_vals = raw_summary.get("evaluated_object_ids")
+        scene_oids = _to_oid_set(scene_vals if isinstance(scene_vals, list) else [])
+    elif isinstance(raw_summary.get("per_object_validation"), dict):
+        scene_oids = _to_oid_set(list(raw_summary.get("per_object_validation", {}).keys()))
+
+    subscenes = raw_summary.get("subscenes", [])
+    if not isinstance(subscenes, list):
+        return scene_oids, subscene_oids
+    for idx, node in enumerate(subscenes):
+        if not isinstance(node, dict):
+            continue
+        if "evaluated_object_ids" not in node:
+            pov = node.get("per_object_validation")
+            if not isinstance(pov, dict):
+                continue
+        raw_index = node.get("index", idx)
+        try:
+            sub_idx = int(idx if raw_index is None else raw_index)
+        except Exception:
+            sub_idx = idx
+        vals = node.get("evaluated_object_ids")
+        if isinstance(vals, list):
+            subscene_oids[sub_idx] = _to_oid_set(vals)
+        else:
+            subscene_oids[sub_idx] = _to_oid_set(list(node.get("per_object_validation", {}).keys()))
+    return scene_oids, subscene_oids
+
+
+def _build_validation_common_from_bags(
+    baseline_validation_bag_path: Path,
+    test_validation_bag_path: Path,
+    scene_timing: dict | None,
+    baseline_summary_raw: dict | None = None,
+    test_summary_raw: dict | None = None,
+    progress_label: str | None = None,
+) -> tuple[dict, dict, list[int], dict[int, dict], bool]:
+    baseline_scene_oids, baseline_subscene_oids = _evaluated_oid_filters_from_summary(baseline_summary_raw)
+    test_scene_oids, test_subscene_oids = _evaluated_oid_filters_from_summary(test_summary_raw)
+    baseline_scene_sets, baseline_subscene_sets, baseline_ok = _extract_validation_sample_sets(
+        baseline_validation_bag_path,
+        side="baseline",
+        scene_timing=scene_timing,
+        evaluated_scene_oids=baseline_scene_oids,
+        evaluated_subscene_oids=baseline_subscene_oids,
+        progress_prefix=(f"[aggregate] {progress_label} baseline validation" if progress_label else None),
+    )
+    test_scene_sets, test_subscene_sets, test_ok = _extract_validation_sample_sets(
+        test_validation_bag_path,
+        side="test",
+        scene_timing=scene_timing,
+        evaluated_scene_oids=test_scene_oids,
+        evaluated_subscene_oids=test_subscene_oids,
+        progress_prefix=(f"[aggregate] {progress_label} test validation" if progress_label else None),
+    )
+    if not baseline_ok or not test_ok:
+        return _default_side_summary("ok"), _default_side_summary("ok"), [], {}, False
+
+    scene_baseline_common, scene_test_common, scene_common_ids = _build_validation_common_from_sample_sets(
+        baseline_scene_sets,
+        test_scene_sets,
+    )
+
+    subscene_common_map: dict[int, dict] = {}
+    indices = set(baseline_subscene_sets.keys()) | set(test_subscene_sets.keys())
+    if isinstance(scene_timing, dict):
+        for idx, sub in enumerate(scene_timing.get("subscenes", []) or []):
+            if not isinstance(sub, dict):
+                continue
+            try:
+                sub_idx = int(sub.get("index", idx) or idx)
+            except Exception:
+                sub_idx = idx
+            indices.add(sub_idx)
+    for sub_idx in sorted(indices):
+        b_sets = baseline_subscene_sets.get(sub_idx, _new_validation_sample_sets())
+        t_sets = test_subscene_sets.get(sub_idx, _new_validation_sample_sets())
+        b_common, t_common, common_ids = _build_validation_common_from_sample_sets(b_sets, t_sets)
+        subscene_common_map[sub_idx] = {
+            "baseline_common": b_common,
+            "test_common": t_common,
+            "common_object_ids": common_ids,
+        }
+
+    return scene_baseline_common, scene_test_common, scene_common_ids, subscene_common_map, True
+
+
 def _aggregate_validation_common(raw_summary: dict, common_ids: set[int]) -> dict:
     """Aggregate per_object_validation for common_ids only. Returns same structure as _load_side_summary."""
     out = _default_side_summary("ok")
@@ -203,6 +566,7 @@ def _default_dt_summary(detail: str) -> dict:
     return {
         "dt_status": "valid",
         "dt_max": "-",
+        "dt_mean": "-",
         "sample_count": 0,
         "detail": detail,
     }
@@ -212,7 +576,10 @@ def _normalize_dt_summary(node: dict | None, detail_fallback: str) -> dict:
     if not isinstance(node, dict):
         return _default_dt_summary(detail_fallback)
     status = str(node.get("dt_status") or "valid")
-    dt_max = node.get("dt_max", "-")
+    dt_max_raw = node.get("dt_max", "-")
+    dt_mean_raw = node.get("dt_mean", "-")
+    dt_max = "-" if dt_max_raw in (None, "") else dt_max_raw
+    dt_mean = "-" if dt_mean_raw in (None, "") else dt_mean_raw
     try:
         sample_count = max(0, int(node.get("sample_count", 0) or 0))
     except Exception:
@@ -220,6 +587,7 @@ def _normalize_dt_summary(node: dict | None, detail_fallback: str) -> dict:
     return {
         "dt_status": status,
         "dt_max": dt_max,
+        "dt_mean": dt_mean,
         "sample_count": sample_count,
         "detail": str(node.get("detail") or detail_fallback),
     }
@@ -306,6 +674,11 @@ def _load_side_subscenes(path: Path, side: str) -> dict[int, dict]:
                 collision_raw.get(kind, {}),
                 detail_fallback=f"{side}_subscene_{meta['index']}_{kind}_collision_summary_missing",
             )
+        sub["evaluated_object_ids"] = sorted(_to_oid_set(node.get("evaluated_object_ids", [])))
+        per_object_validation = node.get("per_object_validation", {})
+        sub["per_object_validation"] = per_object_validation if isinstance(per_object_validation, dict) else {}
+        per_object_collision = node.get("per_object_collision", {})
+        sub["per_object_collision"] = per_object_collision if isinstance(per_object_collision, dict) else {}
         out[meta["index"]] = sub
     return out
 
@@ -321,8 +694,12 @@ def main() -> int:
     if not dirs:
         return 0
 
+    total_dirs = len(dirs)
     written = 0
-    for rel, _dir_path in dirs:
+    common_skipped: list[str] = []
+    _print_progress_line("[aggregate] progress", 0, total_dirs)
+    for idx, (rel, _dir_path) in enumerate(dirs, start=1):
+        print(f"[aggregate] processing {rel} ({idx}/{total_dirs})", file=sys.stderr, flush=True)
         out_dir = test_results_root / rel
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -330,6 +707,8 @@ def main() -> int:
         merged_path = out_dir / "comparison.json"
         baseline_summary_path = baseline_root / rel / "validation_baseline_summary.json"
         test_summary_path = out_dir / "validation_test_summary.json"
+        baseline_validation_bag_path = baseline_root / rel / "validation_baseline.bag"
+        test_validation_bag_path = out_dir / "validation_test.bag"
         baseline_dt_summary_path = baseline_root / rel / "dt_summary.json"
         test_dt_summary_path = out_dir / "dt_summary.json"
         baseline_summary_raw = _load_json_dict(baseline_summary_path) or {}
@@ -367,29 +746,49 @@ def main() -> int:
             "baseline": _load_side_collision(baseline_summary_path, "baseline"),
             "test": _load_side_collision(test_summary_path, "test"),
         }
-        # Common-object aggregates: only objects evaluated in both baseline and test
-        def _oid_set(lst):
-            s = set()
-            for x in lst or []:
-                try:
-                    s.add(int(x))
-                except (TypeError, ValueError):
-                    pass
-            return s
-        baseline_oids = _oid_set(baseline_summary_raw.get("evaluated_object_ids"))
-        test_oids = _oid_set(test_summary_raw.get("evaluated_object_ids"))
-        common_ids = baseline_oids & test_oids
-        comp["validation"]["baseline_common"] = _aggregate_validation_common(baseline_summary_raw, common_ids)
-        comp["validation"]["test_common"] = _aggregate_validation_common(test_summary_raw, common_ids)
-        comp["collision"]["baseline_common"] = _aggregate_collision_common(baseline_summary_raw, common_ids)
-        comp["collision"]["test_common"] = _aggregate_collision_common(test_summary_raw, common_ids)
-        comp["common_object_ids"] = sorted(common_ids)
+        (
+            scene_baseline_common,
+            scene_test_common,
+            scene_common_ids,
+            subscene_common_map,
+            sample_common_ok,
+        ) = _build_validation_common_from_bags(
+            baseline_validation_bag_path=baseline_validation_bag_path,
+            test_validation_bag_path=test_validation_bag_path,
+            scene_timing=scene_timing,
+            baseline_summary_raw=baseline_summary_raw,
+            test_summary_raw=test_summary_raw,
+            progress_label=rel,
+        )
+        if not sample_common_ok:
+            print(
+                f"[aggregate] {rel}: validation common (ID+stamp) の算出に失敗しました。"
+                "この scene の common は未算出としてスキップします。",
+                file=sys.stderr,
+            )
+            comp["validation"]["baseline_common"] = _default_side_summary(f"{rel}_common_samples_missing")
+            comp["validation"]["test_common"] = _default_side_summary(f"{rel}_common_samples_missing")
+            comp["common_object_ids"] = []
+            collision_common_ids = set()
+            subscene_common_map = {}
+            common_skipped.append(rel)
+        else:
+            comp["validation"]["baseline_common"] = scene_baseline_common
+            comp["validation"]["test_common"] = scene_test_common
+            comp["common_object_ids"] = scene_common_ids
+            collision_common_ids = set(scene_common_ids)
+        comp["collision"]["baseline_common"] = _aggregate_collision_common(baseline_summary_raw, collision_common_ids)
+        comp["collision"]["test_common"] = _aggregate_collision_common(test_summary_raw, collision_common_ids)
         baseline_dt = _load_dt_summary(baseline_dt_summary_path, "baseline")
         test_dt = _load_dt_summary(test_dt_summary_path, "test")
         comp["dt_status_baseline"] = baseline_dt["dt_status"]
         comp["dt_max_baseline"] = baseline_dt["dt_max"]
+        comp["dt_mean_baseline"] = baseline_dt["dt_mean"]
+        comp["dt_sample_count_baseline"] = baseline_dt["sample_count"]
         comp["dt_status_test"] = test_dt["dt_status"]
         comp["dt_max_test"] = test_dt["dt_max"]
+        comp["dt_mean_test"] = test_dt["dt_mean"]
+        comp["dt_sample_count_test"] = test_dt["sample_count"]
 
         baseline_subscene_map = _load_side_subscenes(baseline_summary_path, "baseline")
         test_subscene_map = _load_side_subscenes(test_summary_path, "test")
@@ -423,7 +822,11 @@ def main() -> int:
                 ordered_indices.append(idx)
 
         comp_subscenes = []
-        for index in ordered_indices:
+        subscene_total = len(ordered_indices)
+        subscene_progress_state = {"last_percent": -1, "last_len": 0}
+        if subscene_total > 0:
+            _print_live_progress(f"[aggregate] {rel} subscene merge", 0, subscene_total, subscene_progress_state)
+        for sub_idx, index in enumerate(ordered_indices, start=1):
             sub = dict(direct_subscene_map.get(index, {}))
             if not sub:
                 meta_source = baseline_subscene_map.get(index) or test_subscene_map.get(index)
@@ -441,12 +844,14 @@ def main() -> int:
                         "vsl": {k: False for k in ("along", "opposite", "crossing")},
                         "object_ids": {k: False for k in ("along", "opposite", "crossing", "other", "base")},
                         "path": {k: False for k in ("along", "opposite", "crossing", "other", "base")},
+                        "traffic": {"base": False},
                     }
                     sub["diff_counts_by_source"] = {
                         "lane": {k: 0 for k in ("along", "opposite", "crossing")},
                         "vsl": {k: 0 for k in ("along", "opposite", "crossing")},
                         "object_ids": {k: 0 for k in ("along", "opposite", "crossing", "other", "base")},
                         "path": {k: 0 for k in ("along", "opposite", "crossing", "other", "base")},
+                        "traffic": {"base": 0},
                     }
             if "directory" not in sub:
                 sub["directory"] = None
@@ -481,6 +886,20 @@ def main() -> int:
                 }
                 for horizon in VALIDATION_HORIZONS
             }
+            baseline_sub = baseline_subscene_map.get(index, {})
+            test_sub = test_subscene_map.get(index, {})
+            if index in subscene_common_map:
+                sub["validation"]["baseline_common"] = subscene_common_map[index]["baseline_common"]
+                sub["validation"]["test_common"] = subscene_common_map[index]["test_common"]
+                sub_common_ids = set(subscene_common_map[index]["common_object_ids"])
+            else:
+                sub["validation"]["baseline_common"] = _default_side_summary(
+                    f"baseline_subscene_{index}_common_samples_missing"
+                )
+                sub["validation"]["test_common"] = _default_side_summary(
+                    f"test_subscene_{index}_common_samples_missing"
+                )
+                sub_common_ids = set()
             sub["collision"] = {
                 "baseline": baseline_subscene_map.get(index, {}).get(
                     "collision",
@@ -491,20 +910,42 @@ def main() -> int:
                     _default_collision_side_summary(f"test_subscene_{index}_collision_missing"),
                 ),
             }
+            sub["collision"]["baseline_common"] = _aggregate_collision_common(
+                {"per_object_collision": baseline_sub.get("per_object_collision", {})},
+                sub_common_ids,
+            )
+            sub["collision"]["test_common"] = _aggregate_collision_common(
+                {"per_object_collision": test_sub.get("per_object_collision", {})},
+                sub_common_ids,
+            )
+            sub["common_object_ids"] = sorted(sub_common_ids)
             baseline_dt_sub = baseline_dt_subscene_map.get(index, _default_dt_summary(f"baseline_subscene_{index}_dt_missing"))
             test_dt_sub = test_dt_subscene_map.get(index, _default_dt_summary(f"test_subscene_{index}_dt_missing"))
             sub["dt_status_baseline"] = baseline_dt_sub.get("dt_status", "valid")
             sub["dt_max_baseline"] = baseline_dt_sub.get("dt_max", "-")
+            sub["dt_mean_baseline"] = baseline_dt_sub.get("dt_mean", "-")
+            sub["dt_sample_count_baseline"] = baseline_dt_sub.get("sample_count", 0)
             sub["dt_status_test"] = test_dt_sub.get("dt_status", "valid")
             sub["dt_max_test"] = test_dt_sub.get("dt_max", "-")
+            sub["dt_mean_test"] = test_dt_sub.get("dt_mean", "-")
+            sub["dt_sample_count_test"] = test_dt_sub.get("sample_count", 0)
             comp_subscenes.append(sub)
+            if subscene_total > 0:
+                _print_live_progress(f"[aggregate] {rel} subscene merge", sub_idx, subscene_total, subscene_progress_state)
         comp["subscenes"] = comp_subscenes
 
         with open(merged_path, "w", encoding="utf-8") as f:
             json.dump(comp, f, indent=2, ensure_ascii=False)
         written += 1
+        _print_progress_line("[aggregate] progress", idx, total_dirs)
 
     print(f"[aggregate] wrote {written} comparison.json file(s)")
+    if common_skipped:
+        print(
+            f"[aggregate] common skipped {len(common_skipped)} scene(s): "
+            + ", ".join(common_skipped),
+            file=sys.stderr,
+        )
     return 0
 
 

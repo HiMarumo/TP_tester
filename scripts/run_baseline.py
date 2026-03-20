@@ -963,6 +963,7 @@ def main() -> int:
             (out_dir / "tp_run.log").write_text(run_log, encoding="utf-8")
 
         max_dt = max(dt_values) if dt_values else None
+        mean_dt = (sum(dt_values) / float(len(dt_values))) if dt_values else None
         if any(v >= 100 for v in dt_values):
             (out_dir / "dt_status").write_text("invalid")
         elif any(v >= 70 for v in dt_values):
@@ -970,6 +971,7 @@ def main() -> int:
         else:
             (out_dir / "dt_status").write_text("valid")
         (out_dir / "dt_max").write_text(str(max_dt) if max_dt is not None else "-")
+        (out_dir / "dt_mean").write_text(str(mean_dt) if mean_dt is not None else "-")
         dt_timeline_ns = collect_topic_timeline_in_bags(
             selected_bags,
             "/target_tracker/tracked_object_set2",

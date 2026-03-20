@@ -386,8 +386,28 @@ def _has_predicted_path(traj_obj) -> bool:
     return False
 
 
-def _is_vsl_id(object_id: int) -> bool:
-    return object_id in (1, VSL_STOPLINE_ID) or object_id >= VSL_CROSSING_MIN
+def _is_vsl_object_id(object_id: int) -> bool:
+    return int(object_id) in (1, VSL_STOPLINE_ID) or int(object_id) >= VSL_CROSSING_MIN
+
+
+def _is_vsl_like_shape(obj) -> bool:
+    base_obj = getattr(obj, "object", obj)
+    dims = getattr(base_obj, "dimensions", None)
+    length = max(0.0, float(getattr(dims, "x", 0.0) or 0.0)) if dims is not None else 0.0
+    width = max(0.0, float(getattr(dims, "y", 0.0) or 0.0)) if dims is not None else 0.0
+    return (length <= 0.2) and (width >= 2.0)
+
+
+def _has_vsl_debug_keyword(obj) -> bool:
+    base_obj = getattr(obj, "object", obj)
+    text = str(getattr(base_obj, "debug_info", "") or "").lower()
+    return ("vsl" in text) or ("stopline" in text)
+
+
+def _is_vsl_object(obj) -> bool:
+    base_obj = getattr(obj, "object", obj)
+    oid = int(getattr(base_obj, "object_id", -1))
+    return _is_vsl_object_id(oid) or _is_vsl_like_shape(base_obj) or _has_vsl_debug_keyword(base_obj)
 
 
 def _is_ego_id(object_id: int) -> bool:
@@ -514,6 +534,7 @@ def _build_observed_obj_cache(obj) -> dict:
         end_t = float(path_cache["traj_points"][-1][0])
     return {
         "obj": obj,
+        "is_vsl": _is_vsl_object(obj),
         "classification": _obj_classification_of(obj),
         "path_cache": path_cache,
         "has_min_duration": end_t >= (float(MIN_OBSERVED_EVAL_DURATION_SEC) - 1e-6),
@@ -525,6 +546,7 @@ def _build_predicted_obj_cache(obj) -> dict:
     traj_set = list(getattr(obj, "trajectory_set", []) or [])
     return {
         "obj": obj,
+        "is_vsl": _is_vsl_object(obj),
         "dims": _obj_dimensions_of(obj),
         "path_caches": [_build_path_cache(path_msg) for path_msg in traj_set],
     }
@@ -1001,6 +1023,15 @@ def _build_scene_stamp_contexts(message_cache: dict, master_stamps: list[int]) -
                     ego_pred_objs_by_group[group] = entry
                     break
 
+        observed_vsl_ids_by_group = {
+            group: {int(oid) for oid, entry in observed_objs_by_group[group].items() if bool(entry.get("is_vsl"))}
+            for group in VALIDATION_GROUPS
+        }
+        predicted_vsl_ids_by_group = {
+            group: {int(oid) for oid, entry in predicted_objs_by_group[group].items() if bool(entry.get("is_vsl"))}
+            for group in VALIDATION_GROUPS
+        }
+
         stamp_contexts[stamp] = {
             "stamp": stamp,
             "ref_t": ref_t,
@@ -1012,6 +1043,8 @@ def _build_scene_stamp_contexts(message_cache: dict, master_stamps: list[int]) -
             "base_template": base_template,
             "ego_observed_entry": ego_observed_entry,
             "ego_pred_objs_by_group": ego_pred_objs_by_group,
+            "observed_vsl_ids_by_group": observed_vsl_ids_by_group,
+            "predicted_vsl_ids_by_group": predicted_vsl_ids_by_group,
         }
     return stamp_contexts
 
@@ -1661,6 +1694,7 @@ def _ensure_context_validation_plan_cache(context: dict) -> dict[tuple[str, str]
     observed_objs_by_group = context["observed_objs_by_group"]
     predicted_objs_by_group = context["predicted_objs_by_group"]
     excluded_short_observed_ids = context["excluded_short_observed_ids"]
+    observed_vsl_ids_by_group = context.get("observed_vsl_ids_by_group", {})
     metrics = [(horizon, threshold) for horizon in VALIDATION_HORIZONS for threshold in VALIDATION_THRESHOLDS]
     candidates_by_metric: dict[tuple[str, str], dict[int, list[tuple[str, int, float]]]] = {
         metric: {} for metric in metrics
@@ -1679,7 +1713,7 @@ def _ensure_context_validation_plan_cache(context: dict) -> dict[tuple[str, str]
             for horizon in VALIDATION_HORIZONS
         }
         for oid, obs_entry in obs_map.items():
-            if _is_vsl_id(oid) or oid in excluded_short_observed_ids:
+            if oid in observed_vsl_ids_by_group.get(group, set()) or oid in excluded_short_observed_ids:
                 continue
             obs_path_cache = obs_entry.get("path_cache")
             if obs_path_cache is None:
@@ -1740,7 +1774,7 @@ def _ensure_context_validation_plan_cache(context: dict) -> dict[tuple[str, str]
 
     observed_ids = set()
     for group in VALIDATION_GROUPS:
-        observed_ids |= {oid for oid in observed_objs_by_group[group].keys() if not _is_vsl_id(oid)}
+        observed_ids |= {oid for oid in observed_objs_by_group[group].keys() if oid not in observed_vsl_ids_by_group.get(group, set())}
 
     plan_cache: dict[tuple[str, str], dict] = {}
     for metric in metrics:
@@ -1871,11 +1905,12 @@ def _build_collision_for_side(
     scene_cache: dict | None = None,
     out_bag=None,
     chunk_label: str = "",
-) -> tuple[dict, list[dict], dict[int, dict[str, dict]]]:
-    """Returns (summary, subscene_summaries, per_object_collision) where per_object_collision[oid][kind] = {collision_paths, checked_paths}."""
+) -> tuple[dict, list[dict], dict[int, dict[str, dict]], dict[int, dict[int, dict[str, dict]]]]:
+    """Returns (summary, subscene_summaries, per_object_collision, per_subscene_object_collision)."""
     summary = _default_collision_summary("ok")
     subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
     per_object_collision: dict[int, dict[str, dict]] = {}  # oid -> kind -> {collision_paths, checked_paths}
+    per_subscene_object_collision: dict[int, dict[int, dict[str, dict]]] = {}
     bag_path = out_dir / f"collision_judgement_{side}.bag"
     manage_out_bag = False
     write_state = {"last_percent": -1}
@@ -1887,19 +1922,19 @@ def _build_collision_for_side(
             summary[kind]["detail"] = "rosbag not available"
             for sub in subscene_summaries:
                 sub["collision"][kind]["detail"] = summary[kind]["detail"]
-        return summary, subscene_summaries, per_object_collision
+        return summary, subscene_summaries, per_object_collision, per_subscene_object_collision
     if not result_bag.exists():
         for kind in COLLISION_KINDS:
             summary[kind]["detail"] = f"result bag missing: {result_bag}"
             for sub in subscene_summaries:
                 sub["collision"][kind]["detail"] = summary[kind]["detail"]
-        return summary, subscene_summaries, per_object_collision
+        return summary, subscene_summaries, per_object_collision, per_subscene_object_collision
     if not observed_bag.exists():
         for kind in COLLISION_KINDS:
             summary[kind]["detail"] = f"observed bag missing: {observed_bag}"
             for sub in subscene_summaries:
                 sub["collision"][kind]["detail"] = summary[kind]["detail"]
-        return summary, subscene_summaries, per_object_collision
+        return summary, subscene_summaries, per_object_collision, per_subscene_object_collision
     else:
         cache = scene_cache or _build_scene_eval_cache(
             result_bag=result_bag,
@@ -1960,12 +1995,14 @@ def _build_collision_for_side(
                     continue
                 ref_t = context["ref_t"]
                 predicted_objs_by_group = context["predicted_objs_by_group"]
+                predicted_vsl_ids_by_group = context.get("predicted_vsl_ids_by_group", {})
+                subscene_index = find_subscene_index(_to_nsec(ref_t), scene_timing)
 
                 # VSL objects are not collision-judged, but must be exported as no-collision targets.
                 vsl_safe_indices = {g: defaultdict(list) for g in VALIDATION_GROUPS}
                 for group in VALIDATION_GROUPS:
                     for oid, pred_entry in predicted_objs_by_group[group].items():
-                        if not _is_vsl_id(oid):
+                        if oid not in predicted_vsl_ids_by_group.get(group, set()):
                             continue
                         for path_idx, _ in enumerate(pred_entry.get("path_caches", [])):
                             vsl_safe_indices[group][oid].append(path_idx)
@@ -1988,7 +2025,7 @@ def _build_collision_for_side(
 
                 for group in VALIDATION_GROUPS:
                     for oid, pred_entry in predicted_objs_by_group[group].items():
-                        if _is_ego_id(oid) or _is_vsl_id(oid):
+                        if _is_ego_id(oid) or oid in predicted_vsl_ids_by_group.get(group, set()):
                             continue
                         pred_dims = pred_entry.get("dims", (4.0, 1.8))
                         for path_idx, pred_path_cache in enumerate(pred_entry.get("path_caches", [])):
@@ -2032,7 +2069,7 @@ def _build_collision_for_side(
                         # Per-object collision for common-object aggregation
                         for group in VALIDATION_GROUPS:
                             for oid in set(pred_collision_indices[kind][group].keys()) | set(pred_safe_indices[kind][group].keys()):
-                                if _is_ego_id(oid) or _is_vsl_id(oid):
+                                if _is_ego_id(oid) or oid in predicted_vsl_ids_by_group.get(group, set()):
                                     continue
                                 c = len(pred_collision_indices[kind][group].get(oid, []))
                                 s = len(pred_safe_indices[kind][group].get(oid, []))
@@ -2041,6 +2078,15 @@ def _build_collision_for_side(
                                     per_object_collision[oid_int] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
                                 per_object_collision[oid_int][kind]["collision_paths"] += c
                                 per_object_collision[oid_int][kind]["checked_paths"] += c + s
+                                if subscene_index is not None:
+                                    sub_idx = int(subscene_index)
+                                    if sub_idx not in per_subscene_object_collision:
+                                        per_subscene_object_collision[sub_idx] = {}
+                                    subscene_map = per_subscene_object_collision[sub_idx]
+                                    if oid_int not in subscene_map:
+                                        subscene_map[oid_int] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                                    subscene_map[oid_int][kind]["collision_paths"] += c
+                                    subscene_map[oid_int][kind]["checked_paths"] += c + s
 
                     for group in VALIDATION_GROUPS:
                         for status in COLLISION_GROUPED_STATUSES:
@@ -2132,7 +2178,7 @@ def _build_collision_for_side(
     elif manage_out_bag and not bag_path.exists():
         bag_path.write_bytes(b"")
 
-    return summary, subscene_summaries, per_object_collision
+    return summary, subscene_summaries, per_object_collision, per_subscene_object_collision
 
 
 def _build_validation_for_side_threshold(
@@ -2151,10 +2197,11 @@ def _build_validation_for_side_threshold(
     scene_cache: dict | None = None,
     out_bag=None,
     chunk_label: str = "",
-) -> tuple[dict, list[dict], dict[int, dict]]:
-    """Returns (summary, subscene_summaries, per_object) where per_object[oid] = {ok, total} for this horizon/threshold."""
+) -> tuple[dict, list[dict], dict[int, dict], dict[int, dict[int, dict]]]:
+    """Returns (summary, subscene_summaries, per_object, per_subscene_object)."""
     summary = _default_threshold_summary("ok")
     per_object: dict[int, dict] = {}
+    per_subscene_object: dict[int, dict[int, dict]] = {}
     log_key = _validation_log_key(side, horizon, threshold)
     subscene_summaries = _build_subscene_side_summaries(scene_timing, "ok")
 
@@ -2162,17 +2209,17 @@ def _build_validation_for_side_threshold(
         summary["detail"] = "rosbag not available"
         for sub in subscene_summaries:
             sub[horizon][threshold]["detail"] = summary["detail"]
-        return summary, subscene_summaries, per_object
+        return summary, subscene_summaries, per_object, per_subscene_object
     if not result_bag.exists():
         summary["detail"] = f"result bag missing: {result_bag}"
         for sub in subscene_summaries:
             sub[horizon][threshold]["detail"] = summary["detail"]
-        return summary, subscene_summaries, per_object
+        return summary, subscene_summaries, per_object, per_subscene_object
     if not observed_bag.exists():
         summary["detail"] = f"observed bag missing: {observed_bag}"
         for sub in subscene_summaries:
             sub[horizon][threshold]["detail"] = summary["detail"]
-        return summary, subscene_summaries, per_object
+        return summary, subscene_summaries, per_object, per_subscene_object
     else:
         cache = scene_cache or _build_scene_eval_cache(
             result_bag=result_bag,
@@ -2238,6 +2285,18 @@ def _build_validation_for_side_threshold(
                             per_object[oid_int] = {"ok": 0, "total": 0}
                         per_object[oid_int]["ok"] += int(po.get("ok", 0))
                         per_object[oid_int]["total"] += int(po.get("total", 0))
+                    subscene_index = find_subscene_index(_to_nsec(ref_t), scene_timing)
+                    if subscene_index is not None:
+                        sub_idx = int(subscene_index)
+                        if sub_idx not in per_subscene_object:
+                            per_subscene_object[sub_idx] = {}
+                        subscene_map = per_subscene_object[sub_idx]
+                        for oid, po in (metric_plan.get("per_object") or {}).items():
+                            oid_int = int(oid)
+                            if oid_int not in subscene_map:
+                                subscene_map[oid_int] = {"ok": 0, "total": 0}
+                            subscene_map[oid_int]["ok"] += int(po.get("ok", 0))
+                            subscene_map[oid_int]["total"] += int(po.get("total", 0))
                     sub_summary = _subscene_summary_for_stamp(_to_nsec(ref_t), scene_timing, subscene_summaries)
                     if sub_summary is not None:
                         sub_summary[horizon][threshold]["total"] += int(metric_plan.get("total", 0))
@@ -2299,7 +2358,7 @@ def _build_validation_for_side_threshold(
         else:
             sub_summary["rate"] = 0.0
 
-    return summary, subscene_summaries, per_object
+    return summary, subscene_summaries, per_object, per_subscene_object
 
 
 def evaluate_validation_for_side(
@@ -2323,6 +2382,8 @@ def evaluate_validation_for_side(
         }
     summary["collision"] = _default_collision_summary("ok")
     per_object_validation: dict[int, dict[str, dict[str, dict]]] = {}
+    per_subscene_object_validation: dict[int, dict[int, dict[str, dict[str, dict]]]] = {}
+    per_subscene_object_collision: dict[int, dict[int, dict[str, dict]]] = {}
     validation_bag_path = out_dir / f"validation_{side}.bag"
     collision_bag_path = out_dir / f"collision_judgement_{side}.bag"
     for stale_path in (validation_bag_path, collision_bag_path):
@@ -2332,6 +2393,10 @@ def evaluate_validation_for_side(
         summary["evaluated_object_ids"] = []
         summary["per_object_validation"] = {}
         summary["per_object_collision"] = {}
+        for sub in summary.get("subscenes", []):
+            sub["evaluated_object_ids"] = []
+            sub["per_object_validation"] = {}
+            sub["per_object_collision"] = {}
 
     if not HAS_ROSBAG:
         detail = "rosbag not available"
@@ -2394,7 +2459,12 @@ def evaluate_validation_for_side(
                     max_t = float(window_cfg.get("max_t", 5.0))
                     other_max_t = float(window_cfg.get("other_max_t", max_t))
                     for threshold in VALIDATION_THRESHOLDS:
-                        chunk_summary, chunk_subscene_threshold_summaries, chunk_per_object = _build_validation_for_side_threshold(
+                        (
+                            chunk_summary,
+                            chunk_subscene_threshold_summaries,
+                            chunk_per_object,
+                            chunk_per_subscene_object,
+                        ) = _build_validation_for_side_threshold(
                             rel=rel,
                             out_dir=out_dir,
                             side=side,
@@ -2424,6 +2494,20 @@ def evaluate_validation_for_side(
                                 }
                             per_object_validation[oid][horizon][threshold]["ok"] += int(po.get("ok", 0))
                             per_object_validation[oid][horizon][threshold]["total"] += int(po.get("total", 0))
+                        for sub_idx, sub_per_object in (chunk_per_subscene_object or {}).items():
+                            sub_idx_int = int(sub_idx)
+                            if sub_idx_int not in per_subscene_object_validation:
+                                per_subscene_object_validation[sub_idx_int] = {}
+                            subscene_map = per_subscene_object_validation[sub_idx_int]
+                            for oid, po in (sub_per_object or {}).items():
+                                oid_int = int(oid)
+                                if oid_int not in subscene_map:
+                                    subscene_map[oid_int] = {
+                                        h: {t: {"ok": 0, "total": 0} for t in VALIDATION_THRESHOLDS}
+                                        for h in VALIDATION_HORIZONS
+                                    }
+                                subscene_map[oid_int][horizon][threshold]["ok"] += int(po.get("ok", 0))
+                                subscene_map[oid_int][horizon][threshold]["total"] += int(po.get("total", 0))
                         for idx, sub in enumerate(chunk_subscene_threshold_summaries):
                             if idx < len(summary["subscenes"]):
                                 dst = summary["subscenes"][idx][horizon][threshold]
@@ -2433,7 +2517,12 @@ def evaluate_validation_for_side(
                                 if dst.get("detail") == "not_evaluated" and src.get("detail") not in (None, "ok", "not_evaluated"):
                                     dst["detail"] = src.get("detail")
 
-                chunk_collision_summary, chunk_collision_subscenes, chunk_per_object_collision = _build_collision_for_side(
+                (
+                    chunk_collision_summary,
+                    chunk_collision_subscenes,
+                    chunk_per_object_collision,
+                    chunk_per_subscene_object_collision,
+                ) = _build_collision_for_side(
                     rel=rel,
                     out_dir=out_dir,
                     side=side,
@@ -2452,6 +2541,18 @@ def evaluate_validation_for_side(
                     for kind in COLLISION_KINDS:
                         per_object_collision[oid][kind]["collision_paths"] += int(kind_d.get(kind, {}).get("collision_paths", 0))
                         per_object_collision[oid][kind]["checked_paths"] += int(kind_d.get(kind, {}).get("checked_paths", 0))
+                for sub_idx, sub_kind_d in (chunk_per_subscene_object_collision or {}).items():
+                    sub_idx_int = int(sub_idx)
+                    if sub_idx_int not in per_subscene_object_collision:
+                        per_subscene_object_collision[sub_idx_int] = {}
+                    subscene_map = per_subscene_object_collision[sub_idx_int]
+                    for oid, kind_d in (sub_kind_d or {}).items():
+                        oid_int = int(oid)
+                        if oid_int not in subscene_map:
+                            subscene_map[oid_int] = {k: {"collision_paths": 0, "checked_paths": 0} for k in COLLISION_KINDS}
+                        for kind in COLLISION_KINDS:
+                            subscene_map[oid_int][kind]["collision_paths"] += int(kind_d.get(kind, {}).get("collision_paths", 0))
+                            subscene_map[oid_int][kind]["checked_paths"] += int(kind_d.get(kind, {}).get("checked_paths", 0))
                 for kind in COLLISION_KINDS:
                     dst = summary["collision"][kind]
                     src = chunk_collision_summary.get(kind, {})
@@ -2526,6 +2627,23 @@ def evaluate_validation_for_side(
         str(oid): {kind: per_object_collision[oid][kind] for kind in COLLISION_KINDS}
         for oid in sorted(per_object_collision.keys())
     }
+    for idx, sub in enumerate(summary["subscenes"]):
+        sub_idx = int(sub.get("index", idx) or idx)
+        sub_per_object_validation = per_subscene_object_validation.get(sub_idx, {})
+        sub_evaluated_object_ids = sorted(sub_per_object_validation.keys())
+        sub["evaluated_object_ids"] = sub_evaluated_object_ids
+        sub["per_object_validation"] = {
+            str(oid): {
+                h: {t: sub_per_object_validation[oid][h][t] for t in VALIDATION_THRESHOLDS}
+                for h in VALIDATION_HORIZONS
+            }
+            for oid in sub_evaluated_object_ids
+        }
+        sub_per_object_collision = per_subscene_object_collision.get(sub_idx, {})
+        sub["per_object_collision"] = {
+            str(oid): {kind: sub_per_object_collision[oid][kind] for kind in COLLISION_KINDS}
+            for oid in sorted(sub_per_object_collision.keys())
+        }
     return summary
 
 

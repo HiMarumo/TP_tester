@@ -782,9 +782,11 @@ def summarize_dt_values(dt_values: list[float]) -> dict:
     else:
         status = "valid"
     max_dt = max(dt_values) if dt_values else None
+    mean_dt = (sum(dt_values) / float(len(dt_values))) if dt_values else None
     return {
         "dt_status": status,
         "dt_max": "-" if max_dt is None else str(max_dt),
+        "dt_mean": "-" if mean_dt is None else str(mean_dt),
         "sample_count": len(dt_values),
     }
 

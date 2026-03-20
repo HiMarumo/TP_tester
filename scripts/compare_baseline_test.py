@@ -74,6 +74,7 @@ LANE_SOURCES = ("along", "opposite", "crossing")
 OBJECT_PATH_SOURCES = ("along", "opposite", "crossing", "other", "base")
 VSL_SOURCES = ("along", "opposite", "crossing")
 PATH_COMPARE_SOURCES = ("along", "opposite", "crossing", "other")
+TRAFFIC_SOURCES = ("base",)
 
 LANE_TOPIC_TO_SOURCE = {
     "/trajectory_predictor/multi_lane_ids_set": "along",
@@ -100,11 +101,29 @@ GROUP_TO_WM_SUFFIX = {
 # VSL-related object IDs (from trajectory_predictor_data_type.h / core)
 VSL_STOPLINE_ID = 500001
 VSL_CROSSING_MIN = 500100
-VSL_ONCOMING_MIN = 500200
+
+def _is_vsl_object_id(object_id: int) -> bool:
+    return int(object_id) in (1, VSL_STOPLINE_ID) or int(object_id) >= VSL_CROSSING_MIN
 
 
-def _is_vsl_id(obj_id: int) -> bool:
-    return obj_id == VSL_STOPLINE_ID or obj_id >= VSL_CROSSING_MIN
+def _is_vsl_like_shape(obj) -> bool:
+    base_obj = getattr(obj, "object", obj)
+    dims = getattr(base_obj, "dimensions", None)
+    length = max(0.0, float(getattr(dims, "x", 0.0) or 0.0)) if dims is not None else 0.0
+    width = max(0.0, float(getattr(dims, "y", 0.0) or 0.0)) if dims is not None else 0.0
+    return (length <= 0.2) and (width >= 2.0)
+
+
+def _has_vsl_debug_keyword(obj) -> bool:
+    base_obj = getattr(obj, "object", obj)
+    text = str(getattr(base_obj, "debug_info", "") or "").lower()
+    return ("vsl" in text) or ("stopline" in text)
+
+
+def _is_vsl_object(obj) -> bool:
+    base_obj = getattr(obj, "object", obj)
+    oid = int(getattr(base_obj, "object_id", -1))
+    return _is_vsl_object_id(oid) or _is_vsl_like_shape(base_obj) or _has_vsl_debug_keyword(base_obj)
 
 
 def _strip_validation_ns(topic: str) -> str:
@@ -362,8 +381,7 @@ def _vsl_pose_signature_from_obj(obj):
     o = getattr(obj, "object", None)
     if o is None:
         return None
-    oid = int(getattr(o, "object_id", -1))
-    if not _is_vsl_id(oid):
+    if not _is_vsl_object(o):
         return None
     pose = getattr(o, "pose", None)
     if pose is None:
@@ -984,12 +1002,14 @@ def _empty_direct_compare_result(rel: str) -> dict:
             "vsl": {k: False for k in VSL_SOURCES},
             "object_ids": {k: False for k in OBJECT_PATH_SOURCES},
             "path": {k: False for k in OBJECT_PATH_SOURCES},
+            "traffic": {k: False for k in TRAFFIC_SOURCES},
         },
         "diff_counts_by_source": {
             "lane": {k: 0 for k in LANE_SOURCES},
             "vsl": {k: 0 for k in VSL_SOURCES},
             "object_ids": {k: 0 for k in OBJECT_PATH_SOURCES},
             "path": {k: 0 for k in OBJECT_PATH_SOURCES},
+            "traffic": {k: 0 for k in TRAFFIC_SOURCES},
         },
     }
 
@@ -1036,8 +1056,29 @@ def _load_dt_summary(path: Path) -> dict | None:
 def _merge_dt_summary_into_result(result: dict, side: str, summary: dict | None) -> None:
     if not isinstance(summary, dict):
         return
-    result[f"dt_status_{side}"] = str(summary.get("dt_status") or result.get(f"dt_status_{side}") or "valid")
-    result[f"dt_max_{side}"] = str(summary.get("dt_max") or result.get(f"dt_max_{side}") or "-")
+    status = summary.get("dt_status")
+    if status not in (None, ""):
+        result[f"dt_status_{side}"] = str(status)
+    else:
+        result[f"dt_status_{side}"] = str(result.get(f"dt_status_{side}") or "valid")
+
+    dt_max = summary.get("dt_max")
+    if dt_max not in (None, ""):
+        result[f"dt_max_{side}"] = str(dt_max)
+    else:
+        result[f"dt_max_{side}"] = str(result.get(f"dt_max_{side}") or "-")
+
+    dt_mean = summary.get("dt_mean")
+    if dt_mean not in (None, ""):
+        result[f"dt_mean_{side}"] = str(dt_mean)
+    else:
+        result[f"dt_mean_{side}"] = str(result.get(f"dt_mean_{side}") or "-")
+
+    try:
+        sample_count = max(0, int(summary.get("sample_count", 0) or 0))
+    except Exception:
+        sample_count = 0
+    result[f"dt_sample_count_{side}"] = sample_count
 
     sub_by_index: dict[int, dict] = {}
     for idx, sub in enumerate(result.get("subscenes", []) or []):
@@ -1052,8 +1093,16 @@ def _merge_dt_summary_into_result(result: dict, side: str, summary: dict | None)
         sub = sub_by_index.get(sub_idx)
         if sub is None:
             continue
-        sub[f"dt_status_{side}"] = str(sub_summary.get("dt_status") or "valid")
-        sub[f"dt_max_{side}"] = str(sub_summary.get("dt_max") or "-")
+        sub_status = sub_summary.get("dt_status")
+        sub[f"dt_status_{side}"] = str(sub_status) if sub_status not in (None, "") else "valid"
+        sub_max = sub_summary.get("dt_max")
+        sub[f"dt_max_{side}"] = str(sub_max) if sub_max not in (None, "") else "-"
+        sub_mean = sub_summary.get("dt_mean")
+        sub[f"dt_mean_{side}"] = str(sub_mean) if sub_mean not in (None, "") else "-"
+        try:
+            sub[f"dt_sample_count_{side}"] = max(0, int(sub_summary.get("sample_count", 0) or 0))
+        except Exception:
+            sub[f"dt_sample_count_{side}"] = 0
 
 
 def compare_one(
@@ -1447,9 +1496,13 @@ def compare_one(
             if traffic_features["baseline"][stamp]["signature"] != traffic_features["test"][stamp]["signature"]:
                 result["path_and_traffic_detail"] += f"traffic_light_state at stamp {stamp} differs. "
                 traffic_ok = False
+                result["diff_by_source"]["traffic"]["base"] = True
+                result["diff_counts_by_source"]["traffic"]["base"] += 1
                 sub = _subscene_entry_for_stamp(stamp)
                 if sub is not None:
                     sub["traffic_ok"] = False
+                    sub["diff_by_source"]["traffic"]["base"] = True
+                    sub["diff_counts_by_source"]["traffic"]["base"] += 1
             _tick_compare_progress()
 
         if not use_full_cache:
@@ -2370,13 +2423,15 @@ def main() -> int:
             "valid"
         )
         _read_dt = lambda p: _normalize_dt(p.read_text().strip()) if p.exists() else "valid"
-        _read_dt_max = lambda p: p.read_text().strip() if p.exists() else "-"
+        _read_dt_value = lambda p: p.read_text().strip() if p.exists() else "-"
         baseline_dt_summary = _load_dt_summary(baseline_root / rel / "dt_summary.json")
         test_dt_summary = _load_dt_summary(test_results_root / rel / "dt_summary.json")
         res["dt_status_baseline"] = _read_dt(baseline_root / rel / "dt_status")
         res["dt_status_test"] = _read_dt(test_results_root / rel / "dt_status")
-        res["dt_max_baseline"] = _read_dt_max(baseline_root / rel / "dt_max")
-        res["dt_max_test"] = _read_dt_max(test_results_root / rel / "dt_max")
+        res["dt_max_baseline"] = _read_dt_value(baseline_root / rel / "dt_max")
+        res["dt_max_test"] = _read_dt_value(test_results_root / rel / "dt_max")
+        res["dt_mean_baseline"] = _read_dt_value(baseline_root / rel / "dt_mean")
+        res["dt_mean_test"] = _read_dt_value(test_results_root / rel / "dt_mean")
         _merge_dt_summary_into_result(res, "baseline", baseline_dt_summary)
         _merge_dt_summary_into_result(res, "test", test_dt_summary)
         out_dir = test_results_root / rel
@@ -2436,7 +2491,14 @@ def main() -> int:
         rt_t = _normalize_dt(res.get("dt_status_test") or "valid")
         max_b = res.get("dt_max_baseline") or "-"
         max_t = res.get("dt_max_test") or "-"
-        print(f"[compare] {rel}: {valid_str}  {status}{suffix}{cat_str}  segfault: baseline={seg_b} test={seg_t}  runtime: baseline={rt_b} ({max_b}) test={rt_t} ({max_t})")
+        mean_b = res.get("dt_mean_baseline") or "-"
+        mean_t = res.get("dt_mean_test") or "-"
+        print(
+            f"[compare] {rel}: {valid_str}  {status}{suffix}{cat_str}  "
+            f"segfault: baseline={seg_b} test={seg_t}  "
+            f"runtime: baseline={rt_b} (max={max_b}, mean={mean_b}) "
+            f"test={rt_t} (max={max_t}, mean={mean_t})"
+        )
         # 詳細は TP_VERBOSE_COMPARE=1 のときだけ stderr に表示
         if not res["overall_ok"] and os.environ.get("TP_VERBOSE_COMPARE") in ("1", "true", "yes"):
             for key in ("lane_ids_detail", "vsl_detail", "object_ids_detail", "path_and_traffic_detail"):

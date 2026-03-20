@@ -163,8 +163,11 @@ def main() -> int:
                 return rc
 
     if args.compare or args.compare_only:
-        if _run_script(root, "compare_baseline_test.py", "comparison") != 0:
+        compare_rc = _run_script(root, "compare_baseline_test.py", "comparison")
+        if compare_rc not in (0, 1):
             return 1
+        if compare_rc == 1:
+            print("[evaluation] comparison found changed scenes; continuing to aggregation.")
         if _run_script(root, "aggregate_comparison_results.py", "aggregation") != 0:
             return 1
 

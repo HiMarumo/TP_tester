@@ -46,10 +46,11 @@ from PyQt5.QtWidgets import (
     QStyleOptionComboBox,
     QStylePainter,
     QStyle,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QEventLoop, QTimer
 from PyQt5.QtGui import QColor, QBrush, QPalette, QTextDocument, QAbstractTextDocumentLayout
 
 
@@ -78,12 +79,14 @@ DIFF_CATEGORY_ROWS = (
     ("object_ids", "Object IDs"),
     ("path", "Path"),
     ("vsl", "VSL"),
+    ("traffic", "Traffic"),
 )
 DIFF_SUPPORTED_SOURCES = {
     "lane": {"along", "crossing", "opposite"},
     "object_ids": {"along", "opposite", "crossing", "other", "base"},
     "path": {"along", "opposite", "crossing", "other", "base"},
     "vsl": {"along", "opposite", "crossing"},
+    "traffic": {"base"},
 }
 SOURCE_ALIASES = {
     "oncoming": "opposite",
@@ -319,39 +322,27 @@ def _dt_status_display(status: str | None) -> str:
 def _has_dt_fields(comp: dict | None) -> bool:
     if not isinstance(comp, dict):
         return False
-    return ("dt_status_baseline" in comp) and ("dt_status_test" in comp)
+    return "dt_status_test" in comp
 
 
 def _dt_summary_text(comp: dict | None) -> str:
     if not _has_dt_fields(comp):
         return "-"
-    sb = _dt_status_display(comp.get("dt_status_baseline"))
     st = _dt_status_display(comp.get("dt_status_test"))
-    if sb == "invalid" or st == "invalid":
+    if st == "invalid":
         dt_status_label = "Invalid"
-    elif sb == "warning" or st == "warning":
+    elif st == "warning":
         dt_status_label = "Warning"
     else:
         dt_status_label = "Valid"
-    max_b = comp.get("dt_max_baseline") or "-"
-    max_t = comp.get("dt_max_test") or "-"
-    try:
-        max_val = max_b if max_b != "-" and (max_t == "-" or float(max_b) >= float(max_t)) else max_t
-    except (ValueError, TypeError):
-        max_val = max_b if max_b != "-" else max_t
+    max_val = comp.get("dt_max_test") or "-"
     if max_val == "-":
         return dt_status_label
     return f"{dt_status_label} ({max_val})"
 
 
 def _dt_detail_text(comp: dict | None) -> str:
-    if not _has_dt_fields(comp):
-        return "-"
-    dt_b = _dt_status_display(comp.get("dt_status_baseline"))
-    dt_t = _dt_status_display(comp.get("dt_status_test"))
-    dt_max_b = comp.get("dt_max_baseline") or "-"
-    dt_max_t = comp.get("dt_max_test") or "-"
-    return f"B:{dt_b}({dt_max_b}) / T:{dt_t}({dt_max_t})"
+    return _dt_summary_text(comp)
 
 
 def _summary_state(comp: dict | None) -> str | None:
@@ -457,18 +448,17 @@ def _collision_mark(comp: dict | None) -> str:
     collision = comp.get("collision", {})
     if not isinstance(collision, dict):
         return "-"
+    side_collision = collision.get("test", {})
+    if not isinstance(side_collision, dict):
+        return "-"
     found = False
-    for side in VALIDATION_SIDES:
-        side_collision = collision.get(side, {})
-        if not isinstance(side_collision, dict):
+    for kind in COLLISION_KINDS:
+        node = _collision_kind_node(side_collision, kind)
+        if not isinstance(node, dict):
             continue
-        for kind in COLLISION_KINDS:
-            node = _collision_kind_node(side_collision, kind)
-            if not isinstance(node, dict):
-                continue
-            found = True
-            if bool(node.get("has_collision", False)):
-                return "×"
+        found = True
+        if bool(node.get("has_collision", False)):
+            return "×"
     if found:
         return "○"
     return "-"
@@ -527,8 +517,38 @@ def _collision_state_stats(node: dict | None) -> tuple[str, QColor | None]:
         return "-", None
     has_collision = bool(node.get("has_collision", False))
     if has_collision:
+        try:
+            collision_paths = max(0, int(node.get("collision_paths", 0) or 0))
+        except Exception:
+            collision_paths = 0
+        if collision_paths > 0:
+            return f"Collision ({collision_paths})", COLOR_RED
         return "Collision", COLOR_RED
     return "Safe", COLOR_GREEN
+
+
+def _dt_status_cell(status: str | None, dt_max: object) -> tuple[str, QColor | None]:
+    s = _dt_status_display(status)
+    if s == "invalid":
+        label = "Invalid"
+        color = COLOR_RED
+    elif s == "warning":
+        label = "Warning"
+        color = COLOR_ORANGE
+    else:
+        label = "Valid"
+        color = COLOR_GREEN
+    max_text = dt_max if dt_max not in (None, "", "-") else "-"
+    if max_text == "-":
+        return label, color
+    return f"{label} ({max_text})", color
+
+
+def _dt_mean_cell(value: object) -> tuple[str, QColor | None]:
+    mean = _to_float_or_none(value)
+    if mean is None:
+        return "-", None
+    return f"{mean:.1f}", None
 
 
 def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QColor | None, QColor | None]]:
@@ -540,16 +560,34 @@ def _validation_summary_rows(comp: dict | None) -> list[tuple[str, str, str, QCo
     collision = comp.get("collision", {}) if isinstance(comp, dict) else {}
     collision_baseline = collision.get("baseline", {}) if isinstance(collision, dict) else {}
     collision_test = collision.get("test", {}) if isinstance(collision, dict) else {}
-    collision_baseline_common = collision.get("baseline_common", {}) if isinstance(collision, dict) else {}
-    collision_test_common = collision.get("test_common", {}) if isinstance(collision, dict) else {}
     rows: list[tuple[str, str, str, QColor | None, QColor | None]] = []
+    if isinstance(comp, dict):
+        dt_b_text, dt_b_color = _dt_status_cell(comp.get("dt_status_baseline"), comp.get("dt_max_baseline"))
+        dt_t_text, dt_t_color = _dt_status_cell(comp.get("dt_status_test"), comp.get("dt_max_test"))
+        dt_mean_b_text, _ = _dt_mean_cell(comp.get("dt_mean_baseline"))
+        dt_mean_t_text, _ = _dt_mean_cell(comp.get("dt_mean_test"))
+        dt_mean_b = _to_float_or_none(comp.get("dt_mean_baseline"))
+        dt_mean_t = _to_float_or_none(comp.get("dt_mean_test"))
+        dt_mean_b_color = None
+        dt_mean_t_color = None
+        if dt_mean_b is not None and dt_mean_t is not None and abs(dt_mean_b - dt_mean_t) > 1e-9:
+            if dt_mean_b < dt_mean_t:
+                dt_mean_b_color = COLOR_GREEN
+                dt_mean_t_color = COLOR_RED
+            else:
+                dt_mean_b_color = COLOR_RED
+                dt_mean_t_color = COLOR_GREEN
+    else:
+        dt_b_text, dt_b_color = "-", None
+        dt_t_text, dt_t_color = "-", None
+        dt_mean_b_text, dt_mean_b_color = "-", None
+        dt_mean_t_text, dt_mean_t_color = "-", None
+    rows.append(("DT status", dt_b_text, dt_t_text, dt_b_color, dt_t_color))
+    rows.append(("DT mean", dt_mean_b_text, dt_mean_t_text, dt_mean_b_color, dt_mean_t_color))
     # Common-object rows first when available (baseline_common/test_common from aggregate)
+    # Collision(common) is intentionally omitted because collision common-axis is not meaningful.
     has_common = isinstance(baseline_common, dict) and isinstance(test_common, dict)
     if has_common:
-        for kind in COLLISION_KINDS:
-            b_text, b_color = _collision_state_stats(_collision_kind_node(collision_baseline_common, kind))
-            t_text, t_color = _collision_state_stats(_collision_kind_node(collision_test_common, kind))
-            rows.append((f"{kind}-collision (common)", b_text, t_text, b_color, t_color))
         for horizon, threshold in VALIDATION_SUMMARY_ROWS:
             b_node = _validation_metric_node(baseline_common, horizon, threshold)
             t_node = _validation_metric_node(test_common, horizon, threshold)
@@ -647,7 +685,23 @@ def _extract_diff_maps(comp: dict | None):
                 except Exception:
                     continue
 
+    # Backward compatibility:
+    # old comparison.json may not have traffic diff-by-source, so derive from traffic_ok/detail.
+    def _apply_traffic_fallback() -> None:
+        if by_source["traffic"]["base"]:
+            return
+        if bool(comp.get("traffic_ok", True)):
+            return
+        by_source["traffic"]["base"] = True
+        detail = str(comp.get("path_and_traffic_detail") or "")
+        hit = re.findall(r"traffic_light_state\s+at\s+stamp", detail, flags=re.IGNORECASE)
+        if hit:
+            counts["traffic"]["base"] = max(counts["traffic"]["base"], len(hit))
+        else:
+            counts["traffic"]["base"] = max(counts["traffic"]["base"], 1)
+
     if isinstance(raw_by_source, dict):
+        _apply_traffic_fallback()
         return by_source, counts
 
     lane_sources = _extract_sources(comp.get("lane_ids_detail", ""), LANE_SOURCE_PATTERNS)
@@ -685,6 +739,7 @@ def _extract_diff_maps(comp: dict | None):
         for src in DIFF_SUPPORTED_SOURCES["object_ids"]:
             by_source["object_ids"][src] = True
 
+    _apply_traffic_fallback()
     return by_source, counts
 
 
@@ -804,9 +859,14 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
     dt_rank_test = 0
     dt_max_baseline = None
     dt_max_test = None
+    dt_mean_weighted_sum_baseline = 0.0
+    dt_mean_weighted_sum_test = 0.0
+    dt_mean_weight_baseline = 0
+    dt_mean_weight_test = 0
     diff_by_source = _empty_diff_map(False)
     diff_counts_by_source = _empty_diff_map(0)
 
+    validation_sides = VALIDATION_SIDES + ("baseline_common", "test_common")
     validation = {
         side: {
             horizon: {
@@ -815,8 +875,9 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
             }
             for horizon in VALIDATION_SUMMARY_HORIZONS
         }
-        for side in VALIDATION_SIDES
+        for side in validation_sides
     }
+    collision_sides = VALIDATION_SIDES + ("baseline_common", "test_common")
     collision = {
         side: {
             kind: {
@@ -827,7 +888,7 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
             }
             for kind in COLLISION_KINDS
         }
-        for side in VALIDATION_SIDES
+        for side in collision_sides
     }
 
     for comp in comps:
@@ -853,6 +914,18 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
             dt_max_baseline = max_b
         if max_t is not None and (dt_max_test is None or max_t > dt_max_test):
             dt_max_test = max_t
+        mean_b = _to_float_or_none(comp.get("dt_mean_baseline"))
+        mean_t = _to_float_or_none(comp.get("dt_mean_test"))
+        cnt_b = _to_int_nonneg(comp.get("dt_sample_count_baseline"), 0)
+        cnt_t = _to_int_nonneg(comp.get("dt_sample_count_test"), 0)
+        if mean_b is not None:
+            if cnt_b > 0:
+                dt_mean_weighted_sum_baseline += mean_b * float(cnt_b)
+                dt_mean_weight_baseline += cnt_b
+        if mean_t is not None:
+            if cnt_t > 0:
+                dt_mean_weighted_sum_test += mean_t * float(cnt_t)
+                dt_mean_weight_test += cnt_t
 
         comp_diff_map, comp_diff_counts = _extract_diff_maps(comp)
         for cat, _label in DIFF_CATEGORY_ROWS:
@@ -861,7 +934,7 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                 diff_counts_by_source[cat][src] += _to_int_nonneg(comp_diff_counts.get(cat, {}).get(src, 0), 0)
 
         comp_validation = comp.get("validation", {})
-        for side in VALIDATION_SIDES:
+        for side in validation_sides:
             side_validation = comp_validation.get(side, {}) if isinstance(comp_validation, dict) else {}
             for horizon in VALIDATION_SUMMARY_HORIZONS:
                 for threshold in VALIDATION_THRESHOLDS:
@@ -870,7 +943,7 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                     validation[side][horizon][threshold]["ok"] += ok
                     validation[side][horizon][threshold]["total"] += total_cnt
         comp_collision = comp.get("collision", {})
-        for side in VALIDATION_SIDES:
+        for side in collision_sides:
             side_collision = comp_collision.get(side, {}) if isinstance(comp_collision, dict) else {}
             for kind in COLLISION_KINDS:
                 node = _collision_kind_node(side_collision, kind)
@@ -882,7 +955,7 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
                 collision[side][kind]["collision_paths"] += _to_int_nonneg(node.get("collision_paths"), 0)
                 collision[side][kind]["checked_paths"] += _to_int_nonneg(node.get("checked_paths"), 0)
 
-    for side in VALIDATION_SIDES:
+    for side in validation_sides:
         for horizon in VALIDATION_SUMMARY_HORIZONS:
             for threshold in VALIDATION_THRESHOLDS:
                 node = validation[side][horizon][threshold]
@@ -905,6 +978,18 @@ def _aggregate_comparison(rows: list[tuple[str, Path, dict | None]]) -> dict | N
         "dt_status_test": _dt_status_from_rank(dt_rank_test),
         "dt_max_baseline": "-" if dt_max_baseline is None else dt_max_baseline,
         "dt_max_test": "-" if dt_max_test is None else dt_max_test,
+        "dt_mean_baseline": (
+            dt_mean_weighted_sum_baseline / float(dt_mean_weight_baseline)
+            if dt_mean_weight_baseline > 0
+            else "-"
+        ),
+        "dt_mean_test": (
+            dt_mean_weighted_sum_test / float(dt_mean_weight_test)
+            if dt_mean_weight_test > 0
+            else "-"
+        ),
+        "dt_sample_count_baseline": dt_mean_weight_baseline,
+        "dt_sample_count_test": dt_mean_weight_test,
         "diff_by_source": diff_by_source,
         "diff_counts_by_source": diff_counts_by_source,
         "validation": validation,
@@ -948,6 +1033,7 @@ class ViewerAppPyQt(QMainWindow):
         self.viewer_embed = None
         self._play_finished_timer = None
         self._play_paused = False
+        self._play_preparing = False
         self._playing_rel = None
         self._playing_subscene_index = None
         self._play_start_time = None
@@ -964,6 +1050,7 @@ class ViewerAppPyQt(QMainWindow):
         self._build_ui()
         self._refresh_list()
         QTimer.singleShot(0, self._update_validation_table_column_widths)
+        QTimer.singleShot(0, self._sync_diff_table_height)
         QTimer.singleShot(0, self._launch_viewer)
 
     @staticmethod
@@ -1058,7 +1145,7 @@ class ViewerAppPyQt(QMainWindow):
         # Metric は固定幅、Baseline/Test は残り幅を固定比率で配分する。
         self.validation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.validation_table.verticalHeader().setVisible(False)
-        self.validation_table.setMaximumHeight(240)
+        self.validation_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         viewer_host_layout.addWidget(self.validation_table)
         viewer_host_layout.addWidget(QLabel("Diff matrix"))
         self.diff_table = QTableWidget()
@@ -1069,8 +1156,13 @@ class ViewerAppPyQt(QMainWindow):
         self.diff_table.setSelectionMode(QTableWidget.NoSelection)
         self.diff_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.diff_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.diff_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.diff_table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.diff_table.setWordWrap(False)
+        self.diff_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.diff_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         viewer_host_layout.addWidget(self.diff_table)
+        viewer_host_layout.setStretch(1, 1)
+        viewer_host_layout.setStretch(3, 0)
         self.viewer_status = QLabel("Viewer: Launching...")
         self.viewer_status.setWordWrap(True)
         viewer_host_layout.addWidget(self.viewer_status)
@@ -1102,14 +1194,17 @@ class ViewerAppPyQt(QMainWindow):
 
         btn_layout = QHBoxLayout()
         self.btn_play = QPushButton("Play")
+        self.btn_play.setFocusPolicy(Qt.NoFocus)
         self.btn_play.clicked.connect(self._play)
         self.btn_play.setEnabled(False)
         btn_layout.addWidget(self.btn_play)
         self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setFocusPolicy(Qt.NoFocus)
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._on_stop_or_resume)
         btn_layout.addWidget(self.btn_stop)
         self.btn_end_play = QPushButton("End playback")
+        self.btn_end_play.setFocusPolicy(Qt.NoFocus)
         self.btn_end_play.clicked.connect(self._end_playback)
         self.btn_end_play.setEnabled(False)
         btn_layout.addWidget(self.btn_end_play)
@@ -1151,14 +1246,14 @@ class ViewerAppPyQt(QMainWindow):
                 color = COLOR_GREEN
             elif lower == "yes":
                 color = COLOR_RED
+            elif lower.startswith("invalid") or "invalid" in lower:
+                color = COLOR_RED
+            elif lower.startswith("warning") or "warning" in lower:
+                color = COLOR_ORANGE
             elif lower.startswith("valid") or "valid" in lower:
                 color = COLOR_GREEN
             elif lower.startswith("normal") or ("normal" in lower and "warning" not in lower and "invalid" not in lower):
                 color = COLOR_GREEN
-            elif lower.startswith("warning") or "warning" in lower:
-                color = COLOR_ORANGE
-            elif lower.startswith("invalid") or "invalid" in lower:
-                color = COLOR_RED
         if color is not None:
             item.setForeground(color)
 
@@ -1171,6 +1266,7 @@ class ViewerAppPyQt(QMainWindow):
                 item.setTextAlignment(Qt.AlignCenter)
                 self._set_status_color(item)
                 self.diff_table.setItem(r, c, item)
+        self._sync_diff_table_height()
 
     def _set_diff_table_no_data(self):
         for r, (_cat, _label) in enumerate(DIFF_CATEGORY_ROWS):
@@ -1179,6 +1275,38 @@ class ViewerAppPyQt(QMainWindow):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignCenter)
                 self.diff_table.setItem(r, c, item)
+        self._sync_diff_table_height()
+
+    def _sync_diff_table_height(self):
+        if self.diff_table.rowCount() != len(DIFF_CATEGORY_ROWS):
+            self.diff_table.setRowCount(len(DIFF_CATEGORY_ROWS))
+            self.diff_table.setVerticalHeaderLabels([label for _key, label in DIFF_CATEGORY_ROWS])
+        row_height = max(20, int(self.diff_table.fontMetrics().height()) + 6)
+        self.diff_table.verticalHeader().setDefaultSectionSize(row_height)
+        for row in range(self.diff_table.rowCount()):
+            self.diff_table.setRowHeight(row, row_height)
+        self.diff_table.viewport().update()
+        self.diff_table.doItemsLayout()
+        header_h = self.diff_table.horizontalHeader().height() if self.diff_table.horizontalHeader().isVisible() else 0
+        rows_h = 0
+        if self.diff_table.rowCount() > 0:
+            last = self.diff_table.rowCount() - 1
+            last_top = self.diff_table.rowViewportPosition(last)
+            last_h = self.diff_table.rowHeight(last)
+            if last_top >= 0 and last_h > 0:
+                rows_h = last_top + last_h
+        if rows_h <= 0:
+            for row in range(self.diff_table.rowCount()):
+                rows_h += max(row_height, self.diff_table.rowHeight(row), self.diff_table.sizeHintForRow(row))
+        grid_h = 1 if self.diff_table.showGrid() else 0
+        height = self.diff_table.frameWidth() * 2
+        height += header_h + rows_h + grid_h
+        # Style-dependent rounding余白で最下段が欠けるのを防ぐ。
+        height += max(2, self.diff_table.frameWidth())
+        if self.diff_table.horizontalScrollBar().isVisible():
+            height += self.diff_table.horizontalScrollBar().height()
+        self.diff_table.setMinimumHeight(height)
+        self.diff_table.setMaximumHeight(height)
 
     def _set_validation_table_rows(self, rows: list[tuple[str, str, str, QColor | None, QColor | None]]):
         self.validation_table.setRowCount(len(rows))
@@ -1549,6 +1677,7 @@ class ViewerAppPyQt(QMainWindow):
                 elif text == STATUS_UNCHANGED:
                     item.setForeground(STATUS_COLOR[STATUS_UNCHANGED])
                 self.diff_table.setItem(r, c, item)
+        self._sync_diff_table_height()
 
         valid = comp.get("valid_frames") if comp else None
         total = comp.get("total_frames") if comp else None
@@ -1748,6 +1877,9 @@ class ViewerAppPyQt(QMainWindow):
         return str(rel) if rel else None
 
     def _refresh_play_button_enabled(self):
+        if self._play_preparing:
+            self.btn_play.setEnabled(False)
+            return
         if self.play_proc and self.play_proc.poll() is None:
             self.btn_play.setEnabled(False)
             return
@@ -1759,10 +1891,23 @@ class ViewerAppPyQt(QMainWindow):
         if not rel or not row_data:
             QMessageBox.warning(self, "Play", "Select a non-overall data row first.")
             return
+        if self._play_preparing:
+            return
+        if self._play_finished_timer and self._play_finished_timer.isActive():
+            self._play_finished_timer.stop()
+        row_data_snapshot = dict(row_data)
+        self._play_preparing = True
         self.btn_play.setText("Preparing...")
         self.btn_play.setEnabled(False)
-        QApplication.processEvents()  # 即座に描画し、準備中は押せないように見せる（連打防止）
-        self._stop()
+        # Reflect disabled/text state before blocking prep calls.
+        self.btn_play.repaint()
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        QTimer.singleShot(120, lambda rd=row_data_snapshot, r=rel: self._play_impl(rd, r))
+
+    def _play_impl(self, row_data: dict, rel: str):
+        if not self._play_preparing:
+            return
+        self._stop(reset_ui=False)
         self.current_rel = rel
         self.current_subscene_index = row_data.get("subscene_index") if row_data.get("is_subscene") else None
         set_viewer_rosparams(self.settings)
@@ -1782,8 +1927,7 @@ class ViewerAppPyQt(QMainWindow):
         diff_baseline_bag = out_dir / "diff_baseline.bag"
         diff_test_bag = out_dir / "diff_test.bag"
         if not baseline_bag.exists():
-            self.btn_play.setText("Play")
-            self._refresh_play_button_enabled()
+            self._set_stopped_state()
             QMessageBox.warning(self, "Play", f"Baseline bag not found: {baseline_bag}")
             return
         # どのモードで再生開始しても常に全 bag を再生し、表示側でモード切り替えだけする
@@ -1865,6 +2009,7 @@ class ViewerAppPyQt(QMainWindow):
             return
         self._play_start_time = time.monotonic()
         self._play_paused = False
+        self._play_preparing = False
         self.btn_play.setEnabled(False)
         self.btn_play.setText("Playing...")
         self.btn_stop.setEnabled(True)
@@ -1876,6 +2021,8 @@ class ViewerAppPyQt(QMainWindow):
         self._play_finished_timer.start(500)
 
     def _check_play_finished(self):
+        if self._play_preparing and not self.play_proc:
+            return
         if not self.play_proc:
             self._play_finished_timer.stop()
             self._set_stopped_state()
@@ -1901,6 +2048,7 @@ class ViewerAppPyQt(QMainWindow):
                 self._set_stopped_state()
 
     def _set_stopped_state(self):
+        self._play_preparing = False
         self._playing_rel = None
         self._playing_subscene_index = None
         self.btn_play.setText("Play")
@@ -1960,7 +2108,7 @@ class ViewerAppPyQt(QMainWindow):
         else:
             self._play()
 
-    def _stop(self):
+    def _stop(self, reset_ui: bool = True):
         """再生プロセスを終了（新規 Play や終了時に使用）。"""
         self._play_paused = False
         if self.play_proc and self.play_proc.poll() is None:
@@ -1968,7 +2116,14 @@ class ViewerAppPyQt(QMainWindow):
             self.play_proc = None
         if self._play_finished_timer and self._play_finished_timer.isActive():
             self._play_finished_timer.stop()
-        self._set_stopped_state()
+        if reset_ui:
+            self._set_stopped_state()
+        else:
+            self._playing_rel = None
+            self._playing_subscene_index = None
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("Stop")
+            self.btn_end_play.setEnabled(False)
 
     def closeEvent(self, event):
         self._stop()
@@ -1977,9 +2132,15 @@ class ViewerAppPyQt(QMainWindow):
             self.viewer_proc = None
         event.accept()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._sync_diff_table_height)
+        QTimer.singleShot(50, self._sync_diff_table_height)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._update_validation_table_column_widths()
+        self._sync_diff_table_height()
 
 
 def main() -> int:
