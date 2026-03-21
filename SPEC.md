@@ -1,5 +1,40 @@
 # TP_tester SPEC
 
+## 0. 再整理ガイド（追補）
+この節は「読む順番」を明示するための追補であり、後続の本文仕様は削除せずそのまま保持する。
+
+### 0.1 読み方
+- 実行手順を追いたい場合:
+  1. `3. 設定・パス・トピック`
+  2. `4. 生成物（scene単位）`
+  3. `5. 実行フロー`
+  4. `6. 比較評価仕様`
+  5. `7. 比較/集約 JSON 構造`
+  6. `9. Viewer GUI 仕様` / `10. 描画モード仕様`
+- 評価ロジックだけを確認したい場合:
+  - `11. observed予測妥当性評価（validation）`
+  - `12. dt / segfault の仕様`
+
+### 0.2 章マップ
+- Part A（基本仕様）: `1`〜`4`
+- Part B（実行パイプライン）: `5`
+- Part C（比較・集約）: `6`〜`8`
+- Part D（Viewer・描画）: `9`〜`10`
+- Part E（評価ロジック）: `11`〜`12`
+- Part F（運用）: `13`〜`14`
+
+### 0.3 逆引き
+- 「なぜ Changed になったか」: `6.2` / `6.3` / `8`
+- 「comparison.json のキー定義」: `7.1` / `7.2`
+- 「subscene と common 集計」: `5.2` / `5.3.3` / `7.2` / `9.7`
+- 「Viewer の表示列・トグル・Play 挙動」: `9.1`〜`9.6`
+- 「display mode ごとの描画差」: `10.1`〜`10.3`
+- 「validation/collision の評価式」: `11.2`〜`11.6`
+
+---
+
+## Part A. 基本仕様
+
 ## 1. 目的と適用範囲
 このドキュメントは、`TP_tester` の現行実装（`scripts/*.py` と `TrajectoryPredictorViewer_validation`）に基づく仕様を定義する。
 
@@ -109,6 +144,8 @@
 - `test_results/<rel>/dt_summary.json`
 
 ---
+
+## Part B. 実行パイプライン
 
 ## 5. 実行フロー
 
@@ -339,6 +376,8 @@
 
 ---
 
+## Part C. 比較・集約
+
 ## 6. 比較評価仕様 (`scripts/compare_baseline_test.py`)
 
 ## 6.1 スタンプ整列
@@ -565,6 +604,8 @@ path_and_traffic_ok = path_ok and traffic_ok
 - 各 topic で stamp 欠落時は空メッセージを補完する。
 
 ---
+
+## Part D. Viewer・描画
 
 ## 9. Viewer GUI 仕様 (`scripts/viewer_app.py`)
 
@@ -820,6 +861,8 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
 
 ---
 
+## Part E. 評価ロジック
+
 ## 11. observed予測妥当性評価（validation）
 - 実装: `scripts/evaluate_observed_validation.py`
 - baseline側は `run_baseline.py` 実行中に生成し、test側は `run_test.py` 実行中に生成する。
@@ -991,6 +1034,8 @@ subscene子行の再生は、上記bag集合に対して `-s <start_offset_sec>`
 - compare で `segfault_baseline/test` として取り込む。
 
 ---
+
+## Part F. 運用
 
 ## 13. 既知の注意点
 1. 比較ロジックは重複stampを「後勝ち」で潰すため、重複stamp挙動は結果へ影響する。
